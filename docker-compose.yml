@@ -1,0 +1,44 @@
+# docker-compose.yml
+# Starts PostgreSQL + the FastAPI backend together.
+# Usage: docker-compose up -d
+
+version: "3.9"
+
+services:
+
+  db:
+    image: postgres:16-alpine
+    container_name: damanat_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: damanat
+      POSTGRES_PASSWORD: damanat
+      POSTGRES_DB: damanat_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U damanat" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: .
+    container_name: damanat_backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    environment:
+      DATABASE_URL: postgresql://damanat:damanat@db:5432/damanat_db
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 2
+
+volumes:
+  db_data:
