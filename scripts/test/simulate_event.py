@@ -6,7 +6,7 @@ import requests
 import json
 from datetime import datetime
 
-BACKEND_URL = "http://192.168.1.50:8080/api/v1/events/camera"
+BACKEND_URL = "http://localhost:8080/api/v1/events/camera"
 
 XML_TEMPLATES = {
     "fielddetection": """<?xml version="1.0" encoding="utf-8"?>

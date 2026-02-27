@@ -50,11 +50,15 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
     root = ET.fromstring(xml_str)
 
     def find(tag):
-        el = root.find(f"{{{NS}}}{tag}") or root.find(tag)
+        el = root.find(f"{{{NS}}}{tag}")
+        if el is None:
+            el = root.find(tag)
         return el.text.strip() if el is not None and el.text else None
 
     def find_in(parent, tag):
-        el = parent.find(f"{{{NS}}}{tag}") or parent.find(tag)
+        el = parent.find(f"{{{NS}}}{tag}")
+        if el is None:
+            el = parent.find(tag)
         return el.text.strip() if el is not None and el.text else None
 
     trigger_time = datetime.utcnow()

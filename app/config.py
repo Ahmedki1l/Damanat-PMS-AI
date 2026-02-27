@@ -13,27 +13,31 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql://damanat:damanat@localhost:5432/damanat_db"
 
     # ── Network ───────────────────────────────────────────────────────────
-    BACKEND_IP: str = "192.168.1.50"
+    BACKEND_IP: str = "5.5.5.3"
     BACKEND_PORT: int = 8080
 
     # ── Security ──────────────────────────────────────────────────────────
     API_KEY: Optional[str] = None   # Set in .env to enable auth on API endpoints
 
     # ── Cameras ───────────────────────────────────────────────────────────
+    # Phase 1 — Active
     CAMERAS: dict = {
-        "CAM-01":    {"ip": "192.168.1.101", "user": "admin", "password": "CHANGE_ME", "phase": 1},
-        "CAM-02":    {"ip": "192.168.1.102", "user": "admin", "password": "CHANGE_ME", "phase": 1},
-        "CAM-03":    {"ip": "192.168.1.103", "user": "admin", "password": "CHANGE_ME", "phase": 1},
-        "CAM-ENTRY": {"ip": "192.168.1.104", "user": "admin", "password": "CHANGE_ME", "phase": 2, "gate": "entry"},
-        "CAM-EXIT":  {"ip": "192.168.1.105", "user": "admin", "password": "CHANGE_ME", "phase": 2, "gate": "exit"},
+        "CAM-04":  {"ip": "10.1.13.63", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B1-PARKING"},
+        "CAM-02":  {"ip": "10.1.13.20", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "GF-WAITING"},
+        "CAM-35":  {"ip": "10.1.13.54", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B1-DATA CENTER"},
+        # Phase 2 — Uncomment when ANPR cameras are installed
+        # "CAM-ENTRY": {"ip": "x.x.x.x", "user": "kloudspot", "password": "Kloud@123", "phase": 2, "gate": "entry"},
+        # "CAM-EXIT":  {"ip": "x.x.x.x", "user": "kloudspot", "password": "Kloud@123", "phase": 2, "gate": "exit"},
     }
 
     CAMERA_IP_MAP: dict = {
-        "192.168.1.101": "CAM-01",
-        "192.168.1.102": "CAM-02",
-        "192.168.1.103": "CAM-03",
-        "192.168.1.104": "CAM-ENTRY",
-        "192.168.1.105": "CAM-EXIT",
+        # Phase 1
+        "10.1.13.63": "CAM-04",
+        "10.1.13.20": "CAM-02",
+        "10.1.13.54": "CAM-35",
+        # Phase 2 — Uncomment when ANPR cameras are installed
+        # "x.x.x.x": "CAM-ENTRY",
+        # "x.x.x.x": "CAM-EXIT",
     }
 
     # ── Thresholds ────────────────────────────────────────────────────────
