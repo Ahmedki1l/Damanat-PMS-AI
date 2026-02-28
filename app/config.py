@@ -20,37 +20,38 @@ class Settings(BaseSettings):
     API_KEY: Optional[str] = None   # Set in .env to enable auth on API endpoints
 
     # ── Camera Credentials ────────────────────────────────────────────────
+    # The values below are generic DEFAULTS. Real data is loaded from .env.
     CAMERA_USER: str = "admin"
-    CAM_01_IP: str = "192.168.1.101"
-    CAM_01_PASSWORD: str = "CHANGE_ME"
-    CAM_02_IP: str = "192.168.1.102"
+    CAM_02_IP: str = "0.0.0.0"
     CAM_02_PASSWORD: str = "CHANGE_ME"
-    CAM_03_IP: str = "192.168.1.103"
-    CAM_03_PASSWORD: str = "CHANGE_ME"
-    CAM_ENTRY_IP: str = "192.168.1.104"
+    CAM_04_IP: str = "0.0.0.0"
+    CAM_04_PASSWORD: str = "CHANGE_ME"
+    CAM_35_IP: str = "0.0.0.0"
+    CAM_35_PASSWORD: str = "CHANGE_ME"
+    CAM_ENTRY_IP: str = "0.0.0.0"
     CAM_ENTRY_PASSWORD: str = "CHANGE_ME"
-    CAM_EXIT_IP: str = "192.168.1.105"
+    CAM_EXIT_IP: str = "0.0.0.0"
     CAM_EXIT_PASSWORD: str = "CHANGE_ME"
 
     # ── Cameras ───────────────────────────────────────────────────────────
     @property
     def CAMERAS(self) -> dict:
         return {
-            "CAM-01":    {"ip": self.CAM_01_IP, "user": self.CAMERA_USER, "password": self.CAM_01_PASSWORD, "phase": 1},
             "CAM-02":    {"ip": self.CAM_02_IP, "user": self.CAMERA_USER, "password": self.CAM_02_PASSWORD, "phase": 1},
-            "CAM-03":    {"ip": self.CAM_03_IP, "user": self.CAMERA_USER, "password": self.CAM_03_PASSWORD, "phase": 1},
-            "CAM-ENTRY": {"ip": self.CAM_ENTRY_IP, "user": self.CAMERA_USER, "password": self.CAM_ENTRY_PASSWORD, "phase": 2, "gate": "entry"},
-            "CAM-EXIT":  {"ip": self.CAM_EXIT_IP, "user": self.CAMERA_USER, "password": self.CAM_EXIT_PASSWORD, "phase": 2, "gate": "exit"},
+            "CAM-04":    {"ip": self.CAM_04_IP, "user": self.CAMERA_USER, "password": self.CAM_04_PASSWORD, "phase": 1},
+            "CAM-35":    {"ip": self.CAM_35_IP, "user": self.CAMERA_USER, "password": self.CAM_35_PASSWORD, "phase": 1},
+            #"CAM-ENTRY": {"ip": self.CAM_ENTRY_IP, "user": self.CAMERA_USER, "password": self.CAM_ENTRY_PASSWORD, "phase": 2, "gate": "entry"},
+            #"CAM-EXIT":  {"ip": self.CAM_EXIT_IP, "user": self.CAMERA_USER, "password": self.CAM_EXIT_PASSWORD, "phase": 2, "gate": "exit"},
         }
 
     @property
     def CAMERA_IP_MAP(self) -> dict:
         return {
-            self.CAM_01_IP: "CAM-01",
             self.CAM_02_IP: "CAM-02",
-            self.CAM_03_IP: "CAM-03",
-            self.CAM_ENTRY_IP: "CAM-ENTRY",
-            self.CAM_EXIT_IP: "CAM-EXIT",
+            self.CAM_04_IP: "CAM-04",
+            self.CAM_35_IP: "CAM-35",
+            #self.CAM_ENTRY_IP: "CAM-ENTRY",
+            #self.CAM_EXIT_IP: "CAM-EXIT",
         }
 
     # ── Thresholds ────────────────────────────────────────────────────────
