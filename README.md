@@ -17,6 +17,7 @@ Edge AI Cameras (Hikvision) → HTTP Push (LAN) → FastAPI Backend → PostgreS
 - **Event-Driven** — Cameras push events; no polling needed
 - **No Backend AI** — All AI processing on camera edge; backend reacts to events
 - **Phased Delivery** — Phase 2 components are pre-built and activated when ANPR cameras arrive
+- **Camera Polling** — Instead of waiting for cameras to push HTTP webhooks (which requires network access from cameras to this machine), this service connects TO the cameras and listens on their alertStream endpoint in real-time.
 
 ## 📷 Camera Inventory
 
