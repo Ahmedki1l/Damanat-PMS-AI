@@ -19,6 +19,7 @@ Edge AI Cameras (Hikvision) → HTTP Push (LAN) → FastAPI Backend → PostgreS
 - **Phased Delivery** — Phase 2 components are pre-built and activated when ANPR cameras arrive
 - **Camera Polling** — Instead of waiting for cameras to push HTTP webhooks (which requires network access from cameras to this machine), this service connects TO the cameras and listens on their alertStream endpoint in real-time.
 
+
 ## 📷 Camera Inventory
 
 | Camera ID | Model | IP | Phase | Purpose |
