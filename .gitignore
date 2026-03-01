@@ -31,3 +31,6 @@ Thumbs.db
 
 # Docker
 docker-compose.override.yml
+
+# Detection images
+detection_images/

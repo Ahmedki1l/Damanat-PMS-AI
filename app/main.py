@@ -108,10 +108,10 @@ async def startup():
     logger.info(f"🌐 Listening on http://{settings.BACKEND_IP}:{settings.BACKEND_PORT}")
     logger.info("📖 API docs at /docs")
 
-    # Stop pulling events from cameras via ISAPI alertStream (Temporarily disabled for webhook testing)
-    # from app.services.camera_poller import start_camera_polling
-    # asyncio.create_task(start_camera_polling(settings.CAMERAS))
-    # logger.info("📡 Camera polling started (pull mode)")
+    # Start pulling events from cameras via ISAPI alertStream
+    from app.services.camera_poller import start_camera_polling
+    asyncio.create_task(start_camera_polling(settings.CAMERAS))
+    logger.info("📡 Camera polling started (pull mode)")
 
 
 @app.on_event("shutdown")
