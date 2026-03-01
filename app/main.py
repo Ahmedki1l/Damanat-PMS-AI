@@ -8,11 +8,12 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from app.routers import events, occupancy, violations, intrusion, health
+from app.routers import events, occupancy, violations, intrusion, health, alerts
 from app.database import create_tables
 from app.config import settings
 from app.utils.logger import get_logger
 import time
+import asyncio
 
 # Phase 2 routers — uncomment when ANPR cameras are installed
 # from app.routers import entry_exit, parking_stats, vehicles
@@ -46,7 +47,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
     """
     async def dispatch(self, request: Request, call_next):
         # Always allow camera webhook and health check without auth
-        open_paths = {"/api/v1/events/camera", "/api/v1/health", "/docs", "/redoc", "/openapi.json"}
+        open_paths = {"/api/v1/events/camera", "/api/v1/health", "/docs", "/redoc", "/openapi.json", "/api/v1/alerts"}
         if request.url.path in open_paths or not settings.API_KEY:
             return await call_next(request)
 
@@ -89,6 +90,7 @@ app.include_router(occupancy.router,  prefix="/api/v1", tags=["🅿️  Occupanc
 app.include_router(violations.router, prefix="/api/v1", tags=["🚨 Violations — UC5"])
 app.include_router(intrusion.router,  prefix="/api/v1", tags=["🔒 Intrusion — UC6"])
 app.include_router(health.router,     prefix="/api/v1", tags=["💚 Health"])
+app.include_router(alerts.router,     prefix="/api/v1", tags=["🔔 Alerts"])
 
 # Phase 2 — uncomment when ANPR cameras are installed
 # app.include_router(entry_exit.router,    prefix="/api/v1", tags=["🚗 Entry/Exit — UC1"])
@@ -105,6 +107,11 @@ async def startup():
     logger.info(f"📡 Cameras configured: {list(settings.CAMERAS.keys())}")
     logger.info(f"🌐 Listening on http://{settings.BACKEND_IP}:{settings.BACKEND_PORT}")
     logger.info("📖 API docs at /docs")
+
+    # Stop pulling events from cameras via ISAPI alertStream (Temporarily disabled for webhook testing)
+    # from app.services.camera_poller import start_camera_polling
+    # asyncio.create_task(start_camera_polling(settings.CAMERAS))
+    # logger.info("📡 Camera polling started (pull mode)")
 
 
 @app.on_event("shutdown")

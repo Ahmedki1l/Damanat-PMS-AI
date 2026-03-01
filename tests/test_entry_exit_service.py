@@ -58,4 +58,5 @@ class TestEntryExitService:
         with patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock) as mock_alert:
             await handle_anpr_event(make_anpr_event(), db)
             mock_alert.assert_called_once()
-            assert "Unregistered" in mock_alert.call_args[1].get("description", mock_alert.call_args[0][-1])
+            kwargs = mock_alert.call_args[1]
+            assert "Unregistered" in kwargs.get("description", "")

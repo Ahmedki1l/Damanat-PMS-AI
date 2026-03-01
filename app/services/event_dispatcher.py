@@ -13,6 +13,7 @@ logger = get_logger(__name__)
 
 async def dispatch_event(event: ParsedCameraEvent, db: Session):
     is_vehicle = event.detection_target in ("vehicle", None)
+    is_human = event.detection_target in ("human", None)
 
     # ── PHASE 1 ───────────────────────────────────────────────────────────
     # UC3: Occupancy — region entrance/exit (CAM-03 only)
@@ -20,7 +21,11 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
         await handle_occupancy_event(event, db)
 
     # UC5: Violation alerts
-    if event.event_type in ("fielddetection", "linedetection", "regionEntrance") and is_vehicle:
+    # fielddetection / regionEntrance / VMD → vehicles only
+    if event.event_type in ("fielddetection", "regionEntrance") and is_vehicle:
+        await handle_violation_event(event, db)
+    # linedetection → vehicles OR humans (some cameras detect staff crossing lines)
+    if event.event_type == "linedetection" and (is_vehicle or is_human):
         await handle_violation_event(event, db)
 
     # UC6: Intrusion detection

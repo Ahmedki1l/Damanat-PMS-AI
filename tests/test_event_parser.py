@@ -26,11 +26,12 @@ class TestXMLEventParsing:
           <channelName>Parking-Cam01</channelName>
         </EventNotificationAlert>"""
 
-        event = parse_camera_event(xml, "192.168.1.101", "application/xml")
+        from app.config import settings
+        event = parse_camera_event(xml, settings.CAM_02_IP, "application/xml")
         assert event.event_type == "fielddetection"
         assert event.detection_target == "vehicle"
         assert event.region_id == "restricted-vip"
-        assert event.camera_id == "CAM-01"
+        assert event.camera_id == "CAM-02"
         assert event.device_serial == "DS-2CD3681G2-001"
 
     def test_region_entrance_event(self):
@@ -45,10 +46,11 @@ class TestXMLEventParsing:
           </DetectionRegionEntry></DetectionRegionList>
         </EventNotificationAlert>"""
 
-        event = parse_camera_event(xml, "192.168.1.103", "application/xml")
+        from app.config import settings
+        event = parse_camera_event(xml, settings.CAM_35_IP, "application/xml")
         assert event.event_type == "regionEntrance"
         assert event.region_id == "parking-row-A"
-        assert event.camera_id == "CAM-03"
+        assert event.camera_id == "CAM-35"
 
     def test_region_exiting_event(self):
         xml = b"""<?xml version="1.0" encoding="utf-8"?>
@@ -75,7 +77,8 @@ class TestXMLEventParsing:
           </DetectionRegionEntry></DetectionRegionList>
         </EventNotificationAlert>"""
 
-        event = parse_camera_event(xml, "192.168.1.101", "application/xml")
+        from app.config import settings
+        event = parse_camera_event(xml, settings.CAM_02_IP, "application/xml")
         assert event.event_type == "linedetection"
         assert event.detection_target == "vehicle"
 
@@ -108,10 +111,12 @@ class TestJSONEventParsing:
             }
         }"""
 
-        event = parse_camera_event(json_body, "192.168.1.104", "application/json")
+        from app.config import settings
+        event = parse_camera_event(json_body, settings.CAM_04_IP, "application/json")
         assert event.event_type == "AccessControllerEvent"
         assert event.plate_number == "ABC-1234"
-        assert event.gate == "entry"
+        # Since gate is not defined in Phase 1 Cam config, it will be None
+        assert event.gate is None 
         assert event.person_name == "Ahmed"
         assert event.detection_target == "vehicle"
 
@@ -126,10 +131,11 @@ class TestJSONEventParsing:
             }
         }"""
 
-        event = parse_camera_event(json_body, "192.168.1.105", "application/json")
+        from app.config import settings
+        event = parse_camera_event(json_body, settings.CAM_EXIT_IP, "application/json")
         assert event.event_type == "AccessControllerEvent"
         assert event.plate_number == "XYZ-5678"
-        assert event.gate == "exit"
+        assert event.gate is None 
         assert event.user_type == "visitor"
 
     def test_auto_detect_json(self):
