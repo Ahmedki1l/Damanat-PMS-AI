@@ -72,3 +72,4 @@ def list_events(limit: int = 50, camera_id: str = None, event_type: str = None,
     if event_type:
         q = q.filter(CameraEvent.event_type == event_type)
     return q.order_by(CameraEvent.created_at.desc()).limit(limit).all()
+

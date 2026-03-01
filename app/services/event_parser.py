@@ -13,7 +13,11 @@ from app.config import settings
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
-NS = "http://www.isapi.org/ver20/XMLSchema"
+# Support both common Hikvision/ISAPI namespaces
+NAMESPACES = [
+    "http://www.isapi.org/ver20/XMLSchema",
+    "http://www.hikvision.com/ver20/XMLSchema"
+]
 
 
 @dataclass
@@ -21,7 +25,7 @@ class ParsedCameraEvent:
     camera_id: str
     device_serial: str
     channel_id: int
-    event_type: str          # fielddetection | linedetection | regionEntrance | regionExiting | AccessControllerEvent
+    event_type: str          # fielddetection | linedetection | regionEntrance | regionExiting | VMD | AccessControllerEvent
     detection_target: Optional[str]  # vehicle | human | others (Phase 1)
     region_id: Optional[str]
     channel_name: Optional[str]
@@ -50,11 +54,17 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
     root = ET.fromstring(xml_str)
 
     def find(tag):
-        el = root.find(f"{{{NS}}}{tag}") or root.find(tag)
+        for ns in NAMESPACES:
+            el = root.find(f"{{{ns}}}{tag}")
+            if el is not None: return el.text.strip() if el.text else None
+        el = root.find(tag)
         return el.text.strip() if el is not None and el.text else None
 
     def find_in(parent, tag):
-        el = parent.find(f"{{{NS}}}{tag}") or parent.find(tag)
+        for ns in NAMESPACES:
+            el = parent.find(f"{{{ns}}}{tag}")
+            if el is not None: return el.text.strip() if el.text else None
+        el = parent.find(tag)
         return el.text.strip() if el is not None and el.text else None
 
     trigger_time = datetime.utcnow()
@@ -66,9 +76,21 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
             pass
 
     region_id, detection_target = None, None
-    region_list = root.find(f"{{{NS}}}DetectionRegionList") or root.find("DetectionRegionList")
+    region_list = None
+    for ns in NAMESPACES:
+        region_list = root.find(f"{{{ns}}}DetectionRegionList")
+        if region_list is not None: break
+    if region_list is None:
+        region_list = root.find("DetectionRegionList")
+
     if region_list is not None:
-        entry = region_list.find(f"{{{NS}}}DetectionRegionEntry") or region_list.find("DetectionRegionEntry")
+        entry = None
+        for ns in NAMESPACES:
+            entry = region_list.find(f"{{{ns}}}DetectionRegionEntry")
+            if entry is not None: break
+        if entry is None:
+            entry = region_list.find("DetectionRegionEntry")
+
         if entry is not None:
             region_id = find_in(entry, "regionID")
             detection_target = find_in(entry, "detectionTarget")
