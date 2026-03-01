@@ -13,46 +13,32 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql://damanat:damanat@localhost:5432/damanat_db"
 
     # ── Network ───────────────────────────────────────────────────────────
-    BACKEND_IP: str = "192.168.1.50"
+    BACKEND_IP: str = "5.5.5.3"
     BACKEND_PORT: int = 8080
 
     # ── Security ──────────────────────────────────────────────────────────
     API_KEY: Optional[str] = None   # Set in .env to enable auth on API endpoints
 
-    # ── Camera Credentials ────────────────────────────────────────────────
-    # The values below are generic DEFAULTS. Real data is loaded from .env.
-    CAMERA_USER: str = "admin"
-    CAM_02_IP: str = "0.0.0.0"
-    CAM_02_PASSWORD: str = "CHANGE_ME"
-    CAM_04_IP: str = "0.0.0.0"
-    CAM_04_PASSWORD: str = "CHANGE_ME"
-    CAM_35_IP: str = "0.0.0.0"
-    CAM_35_PASSWORD: str = "CHANGE_ME"
-    CAM_ENTRY_IP: str = "0.0.0.0"
-    CAM_ENTRY_PASSWORD: str = "CHANGE_ME"
-    CAM_EXIT_IP: str = "0.0.0.0"
-    CAM_EXIT_PASSWORD: str = "CHANGE_ME"
-
     # ── Cameras ───────────────────────────────────────────────────────────
-    @property
-    def CAMERAS(self) -> dict:
-        return {
-            "CAM-02":    {"ip": self.CAM_02_IP, "user": self.CAMERA_USER, "password": self.CAM_02_PASSWORD, "phase": 1},
-            "CAM-04":    {"ip": self.CAM_04_IP, "user": self.CAMERA_USER, "password": self.CAM_04_PASSWORD, "phase": 1},
-            "CAM-35":    {"ip": self.CAM_35_IP, "user": self.CAMERA_USER, "password": self.CAM_35_PASSWORD, "phase": 1},
-            #"CAM-ENTRY": {"ip": self.CAM_ENTRY_IP, "user": self.CAMERA_USER, "password": self.CAM_ENTRY_PASSWORD, "phase": 2, "gate": "entry"},
-            #"CAM-EXIT":  {"ip": self.CAM_EXIT_IP, "user": self.CAMERA_USER, "password": self.CAM_EXIT_PASSWORD, "phase": 2, "gate": "exit"},
-        }
+    # Phase 1 — Active
+    CAMERAS: dict = {
+        "CAM-04":  {"ip": "10.1.13.63", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B1-PARKING"},
+        "CAM-02":  {"ip": "10.1.13.20", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "GF-WAITING"},
+        "CAM-35":  {"ip": "10.1.13.54", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B1-DATA CENTER"},
+        # Phase 2 — Uncomment when ANPR cameras are installed
+        # "CAM-ENTRY": {"ip": "x.x.x.x", "user": "kloudspot", "password": "Kloud@123", "phase": 2, "gate": "entry"},
+        # "CAM-EXIT":  {"ip": "x.x.x.x", "user": "kloudspot", "password": "Kloud@123", "phase": 2, "gate": "exit"},
+    }
 
-    @property
-    def CAMERA_IP_MAP(self) -> dict:
-        return {
-            self.CAM_02_IP: "CAM-02",
-            self.CAM_04_IP: "CAM-04",
-            self.CAM_35_IP: "CAM-35",
-            #self.CAM_ENTRY_IP: "CAM-ENTRY",
-            #self.CAM_EXIT_IP: "CAM-EXIT",
-        }
+    CAMERA_IP_MAP: dict = {
+        # Phase 1
+        "10.1.13.63": "CAM-04",
+        "10.1.13.20": "CAM-02",
+        "10.1.13.54": "CAM-35",
+        # Phase 2 — Uncomment when ANPR cameras are installed
+        # "x.x.x.x": "CAM-ENTRY",
+        # "x.x.x.x": "CAM-EXIT",
+    }
 
     # ── Thresholds ────────────────────────────────────────────────────────
     OCCUPANCY_ALERT_THRESHOLD: float = 0.90     # Alert at 90% full
