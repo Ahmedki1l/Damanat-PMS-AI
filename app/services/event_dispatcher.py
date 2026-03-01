@@ -27,7 +27,7 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
         await handle_violation_event(event, db)
     # linedetection → vehicles OR humans (some cameras detect staff crossing lines)
     if event.event_type == "linedetection" and (is_vehicle or is_human):
-        await handle_violation_event(event, db)
+        await handle_violation_event(event, db) 
 
     # UC6: Intrusion detection
     if event.event_type in ("fielddetection", "regionEntrance", "VMD") and is_vehicle:
