@@ -17,10 +17,13 @@ class CameraEvent(Base):
     device_serial = Column(String(100))
     channel_id = Column(Integer)
     event_type = Column(String(100), nullable=False, index=True)
+    event_state = Column(String(20))          # active | inactive
+    event_description = Column(String(200))   # human-readable, e.g. "Motion alarm"
     detection_target = Column(String(50))
     region_id = Column(String(100))
     channel_name = Column(String(100))
     trigger_time = Column(DateTime)
+    snapshot_path = Column(String(500))        # path to saved snapshot image
     raw_payload = Column(Text)
     created_at = Column(DateTime, nullable=False, index=True)
 
