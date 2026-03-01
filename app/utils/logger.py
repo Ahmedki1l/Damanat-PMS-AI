@@ -8,7 +8,9 @@ import logging
 import os
 from logging.handlers import RotatingFileHandler
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+from app.config import settings
+
+LOG_LEVEL = settings.LOG_LEVEL.upper()
 LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 

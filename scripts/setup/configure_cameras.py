@@ -49,9 +49,9 @@ EVENT_TRIGGER_XML = """<?xml version="1.0" encoding="UTF-8"?>
 
 # Phase 1 event types to enable on each camera
 PHASE1_EVENTS = {
-    "CAM-01": [("1", "fielddetection"), ("2", "linedetection")],
-    "CAM-02": [("1", "fielddetection"), ("2", "linedetection")],
-    "CAM-03": [("1", "regionEntrance"), ("2", "regionExiting"), ("3", "fielddetection")],
+    "CAM-02": [("1", "fielddetection"), ("2", "linedetection"), ("3", "VMD")],
+    "CAM-04": [("1", "fielddetection"), ("2", "linedetection"), ("3", "VMD")],
+    "CAM-35": [("1", "regionEntrance"), ("2", "regionExiting"), ("3", "fielddetection"), ("4", "VMD")],
 }
 
 # Phase 2 ANPR event types

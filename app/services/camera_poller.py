@@ -81,6 +81,7 @@ async def _poll_camera(cam_id: str, cam: dict):
 async def _handle_event(xml_bytes: bytes, cam_id: str, cam_ip: str):
     """Parse and dispatch a single XML event from the stream."""
     try:
+        logger.debug(f"🔍 RAW XML from {cam_id}:\n{xml_bytes.decode('utf-8', errors='replace')}")
         event = parse_camera_event(xml_bytes, cam_ip, "application/xml")
         logger.info(
             f"📥 {cam_id} | type={event.event_type} "
