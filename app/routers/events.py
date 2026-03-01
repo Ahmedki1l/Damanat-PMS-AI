@@ -34,7 +34,12 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
 
         # Parse into unified ParsedCameraEvent (handles XML and JSON)
         event = parse_camera_event(raw_body, camera_ip, content_type)
-        logger.info(f"Parsed: type={event.event_type} target={event.detection_target} zone={event.region_id} plate={event.plate_number}")
+        logger.info(
+            f"Parsed: type={event.event_type} state={event.event_state} "
+            f"desc={event.event_description} target={event.detection_target} "
+            f"zone={event.region_id} plate={event.plate_number} "
+            f"snap={event.snapshot_path}"
+        )
 
         # Persist raw event
         from app.models.camera_event import CameraEvent
@@ -43,11 +48,14 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
             device_serial=event.device_serial,
             channel_id=event.channel_id,
             event_type=event.event_type,
+            event_state=event.event_state,
+            event_description=event.event_description,
             detection_target=event.detection_target,
             region_id=event.region_id,
             channel_name=event.channel_name,
             trigger_time=event.trigger_time,
-            raw_payload=raw_body.decode("utf-8", errors="replace"),
+            snapshot_path=event.snapshot_path,
+            raw_payload=event.raw_xml,
             created_at=datetime.utcnow(),
         ))
         db.commit()

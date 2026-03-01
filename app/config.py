@@ -29,7 +29,7 @@ class Settings(BaseSettings):
         # "CAM-ENTRY": {"ip": "x.x.x.x", "user": "kloudspot", "password": "Kloud@123", "phase": 2, "gate": "entry"},
         # "CAM-EXIT":  {"ip": "x.x.x.x", "user": "kloudspot", "password": "Kloud@123", "phase": 2, "gate": "exit"},
     }
-
+    
     CAMERA_IP_MAP: dict = {
         # Phase 1
         "10.1.13.63": "CAM-04",
