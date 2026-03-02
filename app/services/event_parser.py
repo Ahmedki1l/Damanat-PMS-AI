@@ -86,69 +86,37 @@ def _split_multipart(raw_body: bytes, content_type: str) -> list[dict]:
     return result
 
 
-def _extract_from_multipart(raw_body: bytes, content_type: str, camera_id: str = "") -> Tuple[bytes, Optional[str]]:
-    """
-    Extract the XML/JSON payload and save any image attachment.
-    Returns (xml_or_json_bytes, snapshot_path_or_none).
-    """
+def _extract_from_multipart(raw_body: bytes, content_type: str) -> bytes:
+    """Extract the XML/JSON payload from a multipart body. Image parts are skipped."""
     parts = _split_multipart(raw_body, content_type)
-    xml_body = None
-    snapshot_path = None
 
     for p in parts:
         ct = p["content_type"]
-        # Text/XML/JSON part → the event payload
         if any(t in ct for t in ("text/xml", "application/xml", "application/json", "text/plain")):
-            xml_body = p["body"]
-            logger.debug(f"Extracted multipart XML/JSON part ({len(xml_body)} bytes)")
+            logger.debug(f"Extracted multipart XML/JSON part ({len(p['body'])} bytes)")
+            return p["body"]
 
-        # Image part → save to disk
-        elif any(t in ct for t in ("image/jpeg", "image/png", "image/")):
-            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-            ext = "jpg" if "jpeg" in ct else "png" if "png" in ct else "jpg"
-            filename = p.get("filename") or f"snap_{camera_id}_{timestamp}.{ext}"
-            filepath = os.path.join(SNAPSHOT_DIR, filename)
-            try:
-                with open(filepath, "wb") as f:
-                    f.write(p["body"])
-                snapshot_path = filepath
-                logger.info(f"[SNAPSHOT] Saved multipart image: {filename} ({len(p['body'])} bytes)")
-            except Exception as e:
-                logger.error(f"[SNAPSHOT] Failed to save {filename}: {e}")
+    # Fallback: first part's body
+    if parts:
+        logger.debug(f"Multipart fallback: first part ({len(parts[0]['body'])} bytes)")
+        return parts[0]["body"]
 
-    if xml_body is None:
-        # Fallback: use the first part's body
-        if parts:
-            xml_body = parts[0]["body"]
-            logger.debug(f"Multipart fallback: first part ({len(xml_body)} bytes)")
-        else:
-            logger.warning("Could not extract any part from multipart body")
-            xml_body = raw_body
-
-    return xml_body, snapshot_path
+    logger.warning("Could not extract any part from multipart body")
+    return raw_body
 
 
 def parse_camera_event(raw_body: bytes, camera_ip: str, content_type: str = "") -> ParsedCameraEvent:
     """Auto-detect format and parse accordingly."""
-    snapshot_path = None
-
-    # Handle multipart/form-data: extract the XML/JSON payload + save image
+    # Handle multipart/form-data: extract only the XML/JSON payload
     if "multipart" in content_type.lower():
-        camera_id = settings.CAMERA_IP_MAP.get(camera_ip, f"UNKNOWN-{camera_ip}")
         logger.debug("Multipart payload detected, extracting content part")
-        raw_body, snapshot_path = _extract_from_multipart(raw_body, content_type, camera_id)
+        raw_body = _extract_from_multipart(raw_body, content_type)
 
     is_json = "json" in content_type.lower() or raw_body.lstrip()[:1] == b"{"
     if is_json:
-        event = _parse_json_event(raw_body, camera_ip)
+        return _parse_json_event(raw_body, camera_ip)
     else:
-        event = _parse_xml_event(raw_body, camera_ip)
-
-    # Attach snapshot from multipart (if any)
-    if snapshot_path:
-        event.snapshot_path = snapshot_path
-
-    return event
+        return _parse_xml_event(raw_body, camera_ip)
 
 
 def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
