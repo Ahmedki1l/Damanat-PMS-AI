@@ -48,7 +48,8 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         # Always allow camera webhook and health check without auth
         open_paths = {"/api/v1/events/camera", "/api/v1/health", "/docs", "/redoc", "/openapi.json", "/api/v1/alerts"}
-        if request.url.path in open_paths or not settings.API_KEY:
+        open_prefixes = ("/api/v1/intrusions", "/api/v1/violations")
+        if request.url.path in open_paths or request.url.path.startswith(open_prefixes) or not settings.API_KEY:
             return await call_next(request)
 
         api_key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
