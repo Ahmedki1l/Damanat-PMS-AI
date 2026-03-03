@@ -114,10 +114,13 @@ def configure_camera(cam_id: str, cam: dict, events: list):
 
     # Step 2: Enable each smart detection rule via GET → patch → PUT
     for event_type in events:
-        endpoint = SMART_EVENT_ENDPOINT.get(event_type)
-        if not endpoint:
-            print(f"  ⚠️  No endpoint defined for {event_type}, skipping")
+        # AccessControllerEvent (ANPR) doesn't need ISAPI enabling —
+        # the camera pushes directly when it reads a plate. HTTP host (Step 1) is enough.
+        if event_type == "AccessControllerEvent":
+            print(f"  ℹ️  {event_type}: push-only (HTTP host set above is sufficient)")
             continue
+
+        endpoint = SMART_EVENT_ENDPOINT.get(event_type)
 
         print(f"  → Enabling event: {event_type}")
         try:
