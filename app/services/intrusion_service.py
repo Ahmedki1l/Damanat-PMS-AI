@@ -16,13 +16,27 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-MONITORED_INTRUSION_ZONES = {"emergency-exit", "staff-only-area", "after-hours-zone"}
+# Maps the camera's numeric regionID (1, 2, 3, 4) → logical zone name.
+# These numbers come from the camera's Field Detection / Region Entrance rules
+# and cannot be renamed on the camera UI — so we translate them here.
+REGION_ID_TO_ZONE = {
+    "1": "emergency-exit",
+    "2": "staff-only-area",
+    "3": "after-hours-zone",
+}
+
+MONITORED_INTRUSION_ZONES = set(REGION_ID_TO_ZONE.values())
 
 
 async def handle_intrusion_event(event: ParsedCameraEvent, db: Session):
-    zone_id = event.region_id or f"{event.camera_id}-field"
-    if zone_id not in MONITORED_INTRUSION_ZONES and event.region_id is not None:
-        return
+    # Translate numeric regionID → zone name; fall back to camera-field default
+    raw_region = event.region_id
+    zone_id = REGION_ID_TO_ZONE.get(raw_region) if raw_region else None
+    if zone_id is None:
+        if raw_region is not None:
+            # Received a region we don't monitor — ignore silently
+            return
+        zone_id = f"{event.camera_id}-field"  # VMD / fielddetection with no region
 
     cooldown = timedelta(seconds=settings.INTRUSION_COOLDOWN_SECONDS)
     recent = db.query(Alert).filter(
