@@ -26,8 +26,8 @@ class Settings(BaseSettings):
         "CAM-02":  {"ip": "10.1.13.20", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "GF-WAITING"},
         "CAM-35":  {"ip": "10.1.13.54", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B1-DATA CENTER"},
         # Phase 2 — Uncomment when ANPR cameras are installed
-        # "CAM-ENTRY": {"ip": "x.x.x.x", "user": "kloudspot", "password": "Kloud@123", "phase": 2, "gate": "entry"},
-        # "CAM-EXIT":  {"ip": "x.x.x.x", "user": "kloudspot", "password": "Kloud@123", "phase": 2, "gate": "exit"},
+        "CAM-ENTRY": {"ip": "10.1.13.100", "user": "kloudspott", "password": "Kloudspot@321", "phase": 2, "gate": "entry"},
+        "CAM-EXIT":  {"ip": "10.1.13.101", "user": "kloudspot", "password": "Kloudspot@321", "phase": 2, "gate": "exit"},
     }
     
     CAMERA_IP_MAP: dict = {
@@ -36,8 +36,8 @@ class Settings(BaseSettings):
         "10.1.13.20": "CAM-02",
         "10.1.13.54": "CAM-35",
         # Phase 2 — Uncomment when ANPR cameras are installed
-        # "x.x.x.x": "CAM-ENTRY",
-        # "x.x.x.x": "CAM-EXIT",
+        "10.1.13.100": "CAM-ENTRY",
+        "10.1.13.101": "CAM-EXIT",
     }
 
     # ── Thresholds ────────────────────────────────────────────────────────
