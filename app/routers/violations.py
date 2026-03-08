@@ -13,12 +13,12 @@ router = APIRouter()
 
 
 @router.get("/violations", response_model=list[AlertOut], summary="UC5 — List violation alerts")
-def get_violations(limit: int = 50, is_resolved: bool = None, db: Session = Depends(get_db)):
+def get_violations(limit: int = 50, offset: int = 0, is_resolved: bool = None, db: Session = Depends(get_db)):
     """Returns violation alerts, newest first. Filter by is_resolved (true or false)."""
     q = db.query(Alert).filter(Alert.alert_type == "violation")
     if is_resolved is not None:
         q = q.filter(Alert.is_resolved == is_resolved)
-    return q.order_by(Alert.triggered_at.desc()).limit(limit).all()
+    return q.order_by(Alert.triggered_at.desc()).offset(offset).limit(limit).all()
 
 
 @router.put("/violations/{alert_id}/resolve", response_model=ResolveResponse, summary="UC5 — Resolve a violation")

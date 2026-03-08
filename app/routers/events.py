@@ -71,7 +71,7 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
 
 
 @router.get("/events", response_model=list[CameraEventOut], summary="List raw camera events")
-def list_events(limit: int = 50, camera_id: str = None, event_type: str = None,
+def list_events(limit: int = 50, offset: int = 0, camera_id: str = None, event_type: str = None,
                 db: Session = Depends(get_db)):
     """Returns raw event log with optional camera_id and event_type filters."""
     from app.models.camera_event import CameraEvent
@@ -80,5 +80,5 @@ def list_events(limit: int = 50, camera_id: str = None, event_type: str = None,
         q = q.filter(CameraEvent.camera_id == camera_id)
     if event_type:
         q = q.filter(CameraEvent.event_type == event_type)
-    return q.order_by(CameraEvent.created_at.desc()).limit(limit).all()
+    return q.order_by(CameraEvent.created_at.desc()).offset(offset).limit(limit).all()
 

@@ -14,12 +14,12 @@ router = APIRouter()
 
 
 @router.get("/entry-exit", response_model=list[EntryExitLogOut], summary="UC1 — Get entry/exit log")
-def get_entry_exit_log(limit: int = 50, gate: str = None, db: Session = Depends(get_db)):
+def get_entry_exit_log(limit: int = 50, offset: int = 0, gate: str = None, db: Session = Depends(get_db)):
     """Returns chronological entry/exit events with plate, type, and time."""
     q = db.query(EntryExitLog)
     if gate:
         q = q.filter(EntryExitLog.gate == gate)
-    return q.order_by(EntryExitLog.event_time.desc()).limit(limit).all()
+    return q.order_by(EntryExitLog.event_time.desc()).offset(offset).limit(limit).all()
 
 
 @router.get("/entry-exit/count/today", response_model=TodayCountResponse, summary="UC1 — Today's vehicle count")
