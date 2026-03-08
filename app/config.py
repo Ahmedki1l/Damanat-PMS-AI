@@ -20,12 +20,51 @@ class Settings(BaseSettings):
     # ── Security ──────────────────────────────────────────────────────────
     API_KEY: Optional[str] = None   # Set in .env to enable auth on API endpoints
 
-    # ── Camera credentials (read from .env) ───────────────────────────────
-    # Phase 1
+    # ── Phase 1 Camera credentials (read from .env) ──────────────────────
     CAM_04_IP: str = ""
     CAM_04_USER: str = ""
     CAM_04_PASSWORD: str = ""
     CAM_04_NAME: str = "B1-PARKING"
+
+    CAM_05_IP: str = ""
+    CAM_05_USER: str = ""
+    CAM_05_PASSWORD: str = ""
+    CAM_05_NAME: str = "B1-PARKING"
+
+    CAM_06_IP: str = ""
+    CAM_06_USER: str = ""
+    CAM_06_PASSWORD: str = ""
+    CAM_06_NAME: str = "B1-PARKING"
+
+    CAM_07_IP: str = ""
+    CAM_07_USER: str = ""
+    CAM_07_PASSWORD: str = ""
+    CAM_07_NAME: str = "B1-PARKING"
+
+    CAM_09_IP: str = ""
+    CAM_09_USER: str = ""
+    CAM_09_PASSWORD: str = ""
+    CAM_09_NAME: str = "B2-PARKING"
+
+    CAM_11_IP: str = ""
+    CAM_11_USER: str = ""
+    CAM_11_PASSWORD: str = ""
+    CAM_11_NAME: str = "B2-PARKING"
+
+    CAM_12_IP: str = ""
+    CAM_12_USER: str = ""
+    CAM_12_PASSWORD: str = ""
+    CAM_12_NAME: str = "B2-PARKING"
+
+    CAM_13_IP: str = ""
+    CAM_13_USER: str = ""
+    CAM_13_PASSWORD: str = ""
+    CAM_13_NAME: str = "B2-PARKING"
+
+    CAM_14_IP: str = ""
+    CAM_14_USER: str = ""
+    CAM_14_PASSWORD: str = ""
+    CAM_14_NAME: str = "B2-PARKING"
 
     CAM_02_IP: str = ""
     CAM_02_USER: str = ""
@@ -37,7 +76,7 @@ class Settings(BaseSettings):
     CAM_35_PASSWORD: str = ""
     CAM_35_NAME: str = "B1-DATA CENTER"
 
-    # Phase 2 — ANPR cameras
+    # ── Phase 2 — ANPR cameras ───────────────────────────────────────────
     CAM_ENTRY_IP: str = ""
     CAM_ENTRY_USER: str = ""
     CAM_ENTRY_PASSWORD: str = ""
@@ -61,6 +100,14 @@ class Settings(BaseSettings):
         # Phase 1 cameras
         phase1_cams = {
             "CAM-04": (self.CAM_04_IP, self.CAM_04_USER, self.CAM_04_PASSWORD, self.CAM_04_NAME),
+            "CAM-05": (self.CAM_05_IP, self.CAM_05_USER, self.CAM_05_PASSWORD, self.CAM_05_NAME),
+            "CAM-06": (self.CAM_06_IP, self.CAM_06_USER, self.CAM_06_PASSWORD, self.CAM_06_NAME),
+            "CAM-07": (self.CAM_07_IP, self.CAM_07_USER, self.CAM_07_PASSWORD, self.CAM_07_NAME),
+            "CAM-09": (self.CAM_09_IP, self.CAM_09_USER, self.CAM_09_PASSWORD, self.CAM_09_NAME),
+            "CAM-11": (self.CAM_11_IP, self.CAM_11_USER, self.CAM_11_PASSWORD, self.CAM_11_NAME),
+            "CAM-12": (self.CAM_12_IP, self.CAM_12_USER, self.CAM_12_PASSWORD, self.CAM_12_NAME),
+            "CAM-13": (self.CAM_13_IP, self.CAM_13_USER, self.CAM_13_PASSWORD, self.CAM_13_NAME),
+            "CAM-14": (self.CAM_14_IP, self.CAM_14_USER, self.CAM_14_PASSWORD, self.CAM_14_NAME),
             "CAM-02": (self.CAM_02_IP, self.CAM_02_USER, self.CAM_02_PASSWORD, self.CAM_02_NAME),
             "CAM-35": (self.CAM_35_IP, self.CAM_35_USER, self.CAM_35_PASSWORD, self.CAM_35_NAME),
         }

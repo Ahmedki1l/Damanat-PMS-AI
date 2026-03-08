@@ -135,7 +135,7 @@ class TestJSONEventParsing:
         event = parse_camera_event(json_body, settings.CAM_EXIT_IP, "application/json")
         assert event.event_type == "AccessControllerEvent"
         assert event.plate_number == "XYZ-5678"
-        assert event.gate is None 
+        assert event.gate == "exit"
         assert event.user_type == "visitor"
 
     def test_auto_detect_json(self):
