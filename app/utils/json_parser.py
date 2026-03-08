@@ -6,13 +6,18 @@ ANPR cameras send AccessControllerEvent as JSON.
 
 import json
 from typing import Optional, Any
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def safe_parse_json(raw_body: bytes) -> Optional[dict]:
     """Parse JSON bytes safely. Returns None on error."""
     try:
         return json.loads(raw_body.decode("utf-8", errors="replace"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        snippet = raw_body[:200].decode("utf-8", errors="replace")
+        logger.warning(f"JSON parse failed: {e} | payload start: {snippet}")
         return None
 
 

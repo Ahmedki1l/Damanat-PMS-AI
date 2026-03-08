@@ -6,6 +6,9 @@ All Phase 1 cameras send EventNotificationAlert v2.0 XML.
 
 import xml.etree.ElementTree as ET
 from typing import Optional
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 NS = "http://www.isapi.org/ver20/XMLSchema"
 
@@ -54,5 +57,7 @@ def safe_parse_xml(raw_body: bytes) -> Optional[ET.Element]:
     """Parse XML bytes safely. Returns None on parse error."""
     try:
         return ET.fromstring(raw_body.decode("utf-8", errors="replace"))
-    except ET.ParseError:
+    except ET.ParseError as e:
+        snippet = raw_body[:200].decode("utf-8", errors="replace")
+        logger.warning(f"XML parse failed: {e} | payload start: {snippet}")
         return None
