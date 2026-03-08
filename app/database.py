@@ -50,10 +50,40 @@ def create_tables():
 
 
 def run_migrations():
-    """Run Alembic migrations to bring the database up to date."""
+    """Run Alembic migrations using the app's existing engine.
+
+    Runs migrations directly on the app engine instead of letting env.py
+    create a separate engine, which avoids blocking issues in async startup.
+    The migration itself is idempotent (checks for existing tables).
+    """
     from alembic.config import Config
     from alembic import command
+    from alembic.runtime.migration import MigrationContext
+    from alembic.runtime.environment import EnvironmentContext
+    from alembic.script import ScriptDirectory
     import os
 
     alembic_cfg = Config(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
-    command.upgrade(alembic_cfg, "head")
+    script = ScriptDirectory.from_config(alembic_cfg)
+
+    with engine.connect() as conn:
+        context = MigrationContext.configure(conn)
+        current_rev = context.get_current_revision()
+        head_rev = script.get_current_head()
+
+        if current_rev == head_rev:
+            return  # Already at head, nothing to do
+
+        # Run upgrade within this connection
+        def do_upgrade(rev, context):
+            return script._upgrade_revs(head_rev, rev)
+
+        with EnvironmentContext(alembic_cfg, script, fn=do_upgrade) as env_ctx:
+            env_ctx.configure(
+                connection=conn,
+                target_metadata=Base.metadata,
+            )
+            with env_ctx.begin_transaction():
+                env_ctx.run_migrations()
+
+        conn.commit()
