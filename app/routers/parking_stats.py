@@ -6,12 +6,13 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.database import get_db
 from app.models.entry_exit_log import EntryExitLog
+from app.schemas.responses import ParkingTimeResponse, DailyStatsResponse
 from datetime import date
 
 router = APIRouter()
 
 
-@router.get("/stats/parking-time", summary="UC2 — Average parking duration")
+@router.get("/stats/parking-time", response_model=ParkingTimeResponse, summary="UC2 — Average parking duration")
 def get_avg_parking_time(target_date: str = None, db: Session = Depends(get_db)):
     """
     Returns average parking duration in minutes for a given date.
@@ -32,7 +33,7 @@ def get_avg_parking_time(target_date: str = None, db: Session = Depends(get_db))
     }
 
 
-@router.get("/stats/daily", summary="UC2 — Daily vehicle count summary")
+@router.get("/stats/daily", response_model=DailyStatsResponse, summary="UC2 — Daily vehicle count summary")
 def get_daily_stats(target_date: str = None, db: Session = Depends(get_db)):
     """Returns total vehicles in/out and average parking time per day."""
     target = target_date or str(date.today())

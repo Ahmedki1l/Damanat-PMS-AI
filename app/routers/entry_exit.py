@@ -7,6 +7,7 @@ from sqlalchemy import func
 from app.database import get_db
 from app.models.entry_exit_log import EntryExitLog
 from app.schemas.entry_exit_log import EntryExitLogOut
+from app.schemas.responses import TodayCountResponse
 from datetime import datetime, date
 
 router = APIRouter()
@@ -21,7 +22,7 @@ def get_entry_exit_log(limit: int = 50, gate: str = None, db: Session = Depends(
     return q.order_by(EntryExitLog.event_time.desc()).limit(limit).all()
 
 
-@router.get("/entry-exit/count/today", summary="UC1 — Today's vehicle count")
+@router.get("/entry-exit/count/today", response_model=TodayCountResponse, summary="UC1 — Today's vehicle count")
 def get_today_counts(db: Session = Depends(get_db)):
     """Returns total entries and exits for today."""
     today = date.today()

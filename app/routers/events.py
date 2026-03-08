@@ -11,13 +11,15 @@ from datetime import datetime
 from app.database import get_db
 from app.services.event_parser import parse_camera_event
 from app.services.event_dispatcher import dispatch_event
+from app.schemas.responses import EventResponse
+from app.schemas.camera_event import CameraEventOut
 from app.utils.logger import get_logger
 
 router = APIRouter()
 logger = get_logger(__name__)
 
 
-@router.post("/events/camera", summary="Camera webhook — receives all events")
+@router.post("/events/camera", response_model=EventResponse, summary="Camera webhook — receives all events")
 async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
     """
     Single entry point for ALL camera events (Phase 1 + Phase 2).
@@ -68,7 +70,7 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
         return {"status": "error", "detail": str(e)}  # Still return 200
 
 
-@router.get("/events", summary="List raw camera events")
+@router.get("/events", response_model=list[CameraEventOut], summary="List raw camera events")
 def list_events(limit: int = 50, camera_id: str = None, event_type: str = None,
                 db: Session = Depends(get_db)):
     """Returns raw event log with optional camera_id and event_type filters."""

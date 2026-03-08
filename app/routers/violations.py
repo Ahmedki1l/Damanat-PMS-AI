@@ -7,6 +7,7 @@ from datetime import datetime
 from app.database import get_db
 from app.models.alert import Alert
 from app.schemas.alert import AlertOut
+from app.schemas.responses import ResolveResponse
 
 router = APIRouter()
 
@@ -20,7 +21,7 @@ def get_violations(limit: int = 50, is_resolved: bool = None, db: Session = Depe
     return q.order_by(Alert.triggered_at.desc()).limit(limit).all()
 
 
-@router.put("/violations/{alert_id}/resolve", summary="UC5 — Resolve a violation")
+@router.put("/violations/{alert_id}/resolve", response_model=ResolveResponse, summary="UC5 — Resolve a violation")
 def resolve_violation(alert_id: int, db: Session = Depends(get_db)):
     """Mark a violation alert as resolved."""
     alert = db.query(Alert).filter(Alert.id == alert_id, Alert.alert_type == "violation").first()

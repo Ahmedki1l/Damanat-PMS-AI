@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.vehicle import Vehicle
 from app.schemas.vehicle import VehicleCreate, VehicleOut
+from app.schemas.responses import VehicleActionResponse, VehicleLookupResponse
 from datetime import datetime
 
 router = APIRouter()
@@ -19,7 +20,7 @@ def list_vehicles(vehicle_type: str = None, db: Session = Depends(get_db)):
     return q.all()
 
 
-@router.post("/vehicles", summary="UC4 — Register a new vehicle")
+@router.post("/vehicles", response_model=VehicleActionResponse, summary="UC4 — Register a new vehicle")
 def register_vehicle(body: VehicleCreate, db: Session = Depends(get_db)):
     """Register an employee or visitor vehicle by plate number."""
     existing = db.query(Vehicle).filter(Vehicle.plate_number == body.plate_number).first()
@@ -39,7 +40,7 @@ def register_vehicle(body: VehicleCreate, db: Session = Depends(get_db)):
     return {"status": "registered", "plate": body.plate_number}
 
 
-@router.delete("/vehicles/{plate}", summary="UC4 — Remove a vehicle")
+@router.delete("/vehicles/{plate}", response_model=VehicleActionResponse, summary="UC4 — Remove a vehicle")
 def remove_vehicle(plate: str, db: Session = Depends(get_db)):
     vehicle = db.query(Vehicle).filter(Vehicle.plate_number == plate).first()
     if not vehicle:
@@ -49,7 +50,7 @@ def remove_vehicle(plate: str, db: Session = Depends(get_db)):
     return {"status": "removed", "plate": plate}
 
 
-@router.get("/vehicles/lookup/{plate}", summary="UC4 — Look up a plate number")
+@router.get("/vehicles/lookup/{plate}", response_model=VehicleLookupResponse, summary="UC4 — Look up a plate number")
 def lookup_vehicle(plate: str, db: Session = Depends(get_db)):
     vehicle = db.query(Vehicle).filter(Vehicle.plate_number == plate).first()
     if not vehicle:
