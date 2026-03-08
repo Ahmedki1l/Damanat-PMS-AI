@@ -69,7 +69,18 @@ def _patch_detection_xml(xml_text: str) -> str:
 PHASE1_EVENTS = {
     "CAM-02": ["fielddetection", "linedetection", "VMD"],
     "CAM-04": ["fielddetection", "linedetection", "VMD"],
-    "CAM-35": ["fielddetection","linedetection" ,"VMD"], 
+    #"CAM-35": ["fielddetection", "linedetection", "VMD"],
+    "CAM-12": ["fielddetection", "linedetection", "VMD"],
+    "CAM-13": ["fielddetection", "linedetection", "VMD"],
+    "CAM-14": ["fielddetection", "linedetection", "VMD"],
+    "CAM-11": ["fielddetection", "linedetection", "VMD"],
+    "CAM-10": ["fielddetection", "linedetection", "VMD"],
+    "CAM-09": ["fielddetection", "linedetection", "VMD"],
+    #"CAM-08": ["fielddetection", "linedetection", "VMD"],
+    "CAM-07": ["fielddetection", "linedetection", "VMD"],
+    "CAM-06": ["fielddetection", "linedetection", "VMD"],
+    "CAM-05": ["fielddetection", "linedetection", "VMD"],
+    #"CAM-03": ["fielddetection", "linedetection", "VMD"],
 }
 
 # Phase 2 ANPR event types
