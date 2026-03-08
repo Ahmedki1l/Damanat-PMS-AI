@@ -38,7 +38,7 @@ class TestEntryExitService:
             await handle_anpr_event(make_anpr_event(), db)
 
         db.add.assert_called_once()
-        db.commit.assert_called()
+        # db.commit() is now called by the dispatcher, not individual services
 
     @pytest.mark.asyncio
     async def test_no_plate_skipped(self):
