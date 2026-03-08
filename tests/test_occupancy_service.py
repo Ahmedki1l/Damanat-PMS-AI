@@ -36,7 +36,7 @@ class TestOccupancyService:
             await handle_occupancy_event(make_event(), db)
 
         db.add.assert_called_once()
-        db.commit.assert_called()
+        # db.commit() is now called by the dispatcher, not individual services
 
     @pytest.mark.asyncio
     async def test_entrance_increments_count(self):

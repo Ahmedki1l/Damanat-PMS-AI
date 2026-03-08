@@ -7,6 +7,7 @@ from datetime import datetime
 from app.database import get_db
 from app.models.zone_occupancy import ZoneOccupancy
 from app.schemas.zone_occupancy import ZoneOccupancyOut, ZoneCapacityUpdate
+from app.schemas.responses import ZoneCapacityResponse, ZoneResetResponse
 
 router = APIRouter()
 
@@ -32,7 +33,7 @@ def get_zone_occupancy(zone_id: str, db: Session = Depends(get_db)):
     return zone
 
 
-@router.put("/occupancy/{zone_id}/capacity", summary="Set max capacity for a zone")
+@router.put("/occupancy/{zone_id}/capacity", response_model=ZoneCapacityResponse, summary="Set max capacity for a zone")
 def set_zone_capacity(zone_id: str, body: ZoneCapacityUpdate, db: Session = Depends(get_db)):
     """
     Update the maximum vehicle capacity for a zone.
@@ -50,7 +51,7 @@ def set_zone_capacity(zone_id: str, body: ZoneCapacityUpdate, db: Session = Depe
     return {"zone_id": zone_id, "max_capacity": body.max_capacity, "status": "updated"}
 
 
-@router.put("/occupancy/{zone_id}/reset", summary="Reset zone count to zero")
+@router.put("/occupancy/{zone_id}/reset", response_model=ZoneResetResponse, summary="Reset zone count to zero")
 def reset_zone_count(zone_id: str, db: Session = Depends(get_db)):
     """Manually reset zone vehicle count. Use after system restart or miscounts."""
     zone = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id == zone_id).first()

@@ -11,12 +11,13 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.database import get_db
 from app.config import settings
+from app.schemas.responses import HealthResponse
 from datetime import datetime
 
 router = APIRouter()
 
 
-@router.get("/health", summary="System health check")
+@router.get("/health", response_model=HealthResponse, summary="System health check")
 def health_check(db: Session = Depends(get_db)):
     """
     Returns:

@@ -1,4 +1,4 @@
-# app/schemas/vehicle.py  🔜 Phase 2
+# app/schemas/vehicle.py
 from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional
@@ -12,13 +12,13 @@ class VehicleCreate(BaseModel):
     notes: Optional[str] = None
 
 
-class VehicleOut(BaseModel):
+class VehicleResponse(BaseModel):
     id: int
     plate_number: str
     owner_name: str
     vehicle_type: str
     employee_id: Optional[str]
-    is_registered: int
+    is_registered: bool
     registered_at: Optional[datetime]
     notes: Optional[str]
 

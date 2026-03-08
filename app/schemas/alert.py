@@ -11,7 +11,7 @@ class AlertOut(BaseModel):
     zone_id: Optional[str]
     event_type: Optional[str]
     description: Optional[str]
-    is_resolved: int
+    is_resolved: bool
     triggered_at: datetime
     resolved_at: Optional[datetime]
 

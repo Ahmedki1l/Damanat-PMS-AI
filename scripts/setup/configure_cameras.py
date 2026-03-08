@@ -33,60 +33,31 @@ HTTP_HOST_XML = """<?xml version="1.0" encoding="UTF-8"?>
   <httpAuthenticationMethod>none</httpAuthenticationMethod>
 </HttpHostNotification>"""
 
-# Maps event type name → ISAPI Smart Detection endpoint (channel 1)
-SMART_EVENT_ENDPOINT = {
-    "fielddetection":  "/ISAPI/Smart/FieldDetection/1",
-    "linedetection":   "/ISAPI/Smart/LineDetection/1",
-    "regionEntrance":  "/ISAPI/Smart/RegionEntrance/1",
-    "regionExiting":   "/ISAPI/Smart/RegionExiting/1",
-    "VMD":             "/ISAPI/System/Video/inputs/channels/1/motionDetection",
-}
-
-import xml.etree.ElementTree as ET
-import re as _re
-
-
-def _patch_detection_xml(xml_text: str) -> str:
-    """Enable the detection rule and set detectionTarget to vehicle."""
-    # Normalise namespace prefix so we can do simple regex replacements
-    xml_out = _re.sub(r"<enabled>.*?</enabled>", "<enabled>true</enabled>", xml_text, flags=_re.S)
-    # Set / insert detectionTarget = vehicle
-    if "<detectionTarget>" in xml_out:
-        xml_out = _re.sub(r"<detectionTarget>.*?</detectionTarget>",
-                          "<detectionTarget>vehicle</detectionTarget>",
-                          xml_out, flags=_re.S)
-    else:
-        # Insert after <enabled>true</enabled>
-        xml_out = xml_out.replace(
-            "<enabled>true</enabled>",
-            "<enabled>true</enabled>\n  <detectionTarget>vehicle</detectionTarget>",
-            1,
-        )
-    return xml_out
+EVENT_TRIGGER_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<EventTrigger version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
+  <id>{event_id}</id>
+  <eventType>{event_type}</eventType>
+  <EventTriggerNotificationList>
+    <EventTriggerNotification>
+      <id>1</id>
+      <notificationMethod>HTTP</notificationMethod>
+      <notificationRecurrence>beginning</notificationRecurrence>
+    </EventTriggerNotification>
+  </EventTriggerNotificationList>
+</EventTrigger>"""
 
 
 # Phase 1 event types to enable on each camera
 PHASE1_EVENTS = {
-    "CAM-02": ["fielddetection", "linedetection", "VMD"],
-    "CAM-04": ["fielddetection", "linedetection", "VMD"],
-    #"CAM-35": ["fielddetection", "linedetection", "VMD"],
-    "CAM-12": ["fielddetection", "linedetection", "VMD"],
-    "CAM-13": ["fielddetection", "linedetection", "VMD"],
-    "CAM-14": ["fielddetection", "linedetection", "VMD"],
-    "CAM-11": ["fielddetection", "linedetection", "VMD"],
-    "CAM-10": ["fielddetection", "linedetection", "VMD"],
-    "CAM-09": ["fielddetection", "linedetection", "VMD"],
-    #"CAM-08": ["fielddetection", "linedetection", "VMD"],
-    "CAM-07": ["fielddetection", "linedetection", "VMD"],
-    "CAM-06": ["fielddetection", "linedetection", "VMD"],
-    "CAM-05": ["fielddetection", "linedetection", "VMD"],
-    #"CAM-03": ["fielddetection", "linedetection", "VMD"],
+    "CAM-02": [("1", "fielddetection"), ("2", "linedetection"), ("3", "VMD")],
+    "CAM-04": [("1", "fielddetection"), ("2", "linedetection"), ("3", "VMD")],
+    "CAM-35": [("1", "regionEntrance"), ("2", "regionExiting"), ("3", "fielddetection"), ("4", "VMD")],
 }
 
 # Phase 2 ANPR event types
 PHASE2_EVENTS = {
-    "CAM-ENTRY": ["AccessControllerEvent"],
-    "CAM-EXIT":  ["AccessControllerEvent"],
+    "CAM-ENTRY": [("1", "AccessControllerEvent")],
+    "CAM-EXIT":  [("1", "AccessControllerEvent")],
 }
 
 
@@ -123,46 +94,22 @@ def configure_camera(cam_id: str, cam: dict, events: list):
         print(f"  ❌ Failed: {e}")
         return
 
-    # Step 2: Enable each smart detection rule via GET → patch → PUT
-    for event_type in events:
-        # AccessControllerEvent (ANPR) doesn't need ISAPI enabling —
-        # the camera pushes directly when it reads a plate. HTTP host (Step 1) is enough.
-        if event_type == "AccessControllerEvent":
-            print(f"  ℹ️  {event_type}: push-only (HTTP host set above is sufficient)")
-            continue
-
-        endpoint = SMART_EVENT_ENDPOINT.get(event_type)
-
+    # Step 2: Enable event triggers
+    for event_id, event_type in events:
         print(f"  → Enabling event: {event_type}")
         try:
-            # GET current config from camera
-            get_resp = requests.get(
-                f"{base}{endpoint}",
-                auth=auth,
-                headers={"Accept": "application/xml"},
-                timeout=10,
-            )
-            if get_resp.status_code != 200:
-                print(f"  ⚠️  {event_type} GET failed: {get_resp.status_code}")
-                print(f"      {get_resp.text[:200]}")
-                continue
-
-            # Patch: enable=true, detectionTarget=vehicle
-            patched_xml = _patch_detection_xml(get_resp.text)
-
-            # PUT patched config back
-            put_resp = requests.put(
-                f"{base}{endpoint}",
-                data=patched_xml.encode("utf-8"),
+            xml = EVENT_TRIGGER_XML.format(event_id=event_id, event_type=event_type)
+            resp = requests.put(
+                f"{base}/ISAPI/Event/triggers/{event_type}-1",
+                data=xml.encode("utf-8"),
                 auth=auth,
                 headers={"Content-Type": "application/xml"},
                 timeout=10,
             )
-            if put_resp.status_code == 200:
-                print(f"  ✅ {event_type} enabled (vehicle target)")
+            if resp.status_code == 200:
+                print(f"  ✅ {event_type} enabled")
             else:
-                print(f"  ⚠️  {event_type} PUT: {put_resp.status_code}")
-                print(f"      {put_resp.text[:200]}")
+                print(f"  ⚠️  {event_type}: {resp.status_code}")
         except Exception as e:
             print(f"  ❌ {event_type} failed: {e}")
 

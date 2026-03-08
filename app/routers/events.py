@@ -11,13 +11,15 @@ from datetime import datetime
 from app.database import get_db
 from app.services.event_parser import parse_camera_event
 from app.services.event_dispatcher import dispatch_event
+from app.schemas.responses import EventResponse
+from app.schemas.camera_event import CameraEventOut
 from app.utils.logger import get_logger
 
 router = APIRouter()
 logger = get_logger(__name__)
 
 
-@router.post("/events/camera", summary="Camera webhook — receives all events")
+@router.post("/events/camera", response_model=EventResponse, summary="Camera webhook — receives all events")
 async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
     """
     Single entry point for ALL camera events (Phase 1 + Phase 2).
@@ -41,7 +43,7 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
             f"snap={event.snapshot_path}"
         )
 
-        # Persist raw event
+        # Persist raw event (committed by dispatch_event transaction)
         from app.models.camera_event import CameraEvent
         db.add(CameraEvent(
             camera_id=event.camera_id,
@@ -58,9 +60,8 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
             raw_payload=event.raw_xml,
             created_at=datetime.utcnow(),
         ))
-        db.commit()
 
-        # Dispatch to correct use-case handlers
+        # Dispatch to handlers — commits raw event + all handler changes atomically
         await dispatch_event(event, db)
         return {"status": "ok", "event_type": event.event_type}
 
@@ -69,8 +70,8 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
         return {"status": "error", "detail": str(e)}  # Still return 200
 
 
-@router.get("/events", summary="List raw camera events")
-def list_events(limit: int = 50, camera_id: str = None, event_type: str = None,
+@router.get("/events", response_model=list[CameraEventOut], summary="List raw camera events")
+def list_events(limit: int = 50, offset: int = 0, camera_id: str = None, event_type: str = None,
                 db: Session = Depends(get_db)):
     """Returns raw event log with optional camera_id and event_type filters."""
     from app.models.camera_event import CameraEvent
@@ -79,5 +80,5 @@ def list_events(limit: int = 50, camera_id: str = None, event_type: str = None,
         q = q.filter(CameraEvent.camera_id == camera_id)
     if event_type:
         q = q.filter(CameraEvent.event_type == event_type)
-    return q.order_by(CameraEvent.created_at.desc()).limit(limit).all()
+    return q.order_by(CameraEvent.created_at.desc()).offset(offset).limit(limit).all()
 

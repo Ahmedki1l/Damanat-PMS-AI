@@ -77,7 +77,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
 ```bash
 # Start everything (DB + Backend)
 docker-compose up -d
-
+docker-compose up -d db
+docker-compose down -v
 # View logs
 docker-compose logs -f backend
 ```

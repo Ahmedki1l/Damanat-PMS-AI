@@ -21,8 +21,13 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
     zone_id = event.region_id or f"{event.camera_id}-default"
     zone = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id == zone_id).first()
     if not zone:
+        logger.warning(
+            f"[UC3] Auto-creating zone '{zone_id}' with default capacity "
+            f"{settings.DEFAULT_ZONE_CAPACITY}. Set capacity via PUT /occupancy/{zone_id}/capacity"
+        )
         zone = ZoneOccupancy(zone_id=zone_id, camera_id=event.camera_id,
-                             current_count=0, max_capacity=10, last_updated=datetime.utcnow())
+                             current_count=0, max_capacity=settings.DEFAULT_ZONE_CAPACITY,
+                             last_updated=datetime.utcnow())
         db.add(zone)
 
     if event.event_type == "regionEntrance":
@@ -31,7 +36,6 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
         zone.current_count = max(0, zone.current_count - 1)
 
     zone.last_updated = datetime.utcnow()
-    db.commit()
     logger.info(f"[UC3] {zone_id}: {zone.current_count}/{zone.max_capacity}")
 
     if zone.max_capacity and (zone.current_count / zone.max_capacity) >= settings.OCCUPANCY_ALERT_THRESHOLD:

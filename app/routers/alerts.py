@@ -11,8 +11,9 @@ router = APIRouter()
 @router.get("/alerts", response_model=list[AlertOut], summary="All alerts — filterable by type")
 def get_all_alerts(
     alert_type: Optional[str] = None,
-    is_resolved: Optional[int] = None,
+    is_resolved: Optional[bool] = None,
     limit: int = 50,
+    offset: int = 0,
     db: Session = Depends(get_db)
 ):
     """Combined alerts endpoint. Filter by alert_type or is_resolved."""
@@ -21,4 +22,4 @@ def get_all_alerts(
         q = q.filter(Alert.alert_type == alert_type)
     if is_resolved is not None:
         q = q.filter(Alert.is_resolved == is_resolved)
-    return q.order_by(Alert.triggered_at.desc()).limit(limit).all()
+    return q.order_by(Alert.triggered_at.desc()).offset(offset).limit(limit).all()

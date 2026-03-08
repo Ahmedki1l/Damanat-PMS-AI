@@ -1,27 +1,28 @@
 # app/routers/entry_exit.py
-"""UC1: Entry/Exit Counting endpoints (Phase 2)"""
+"""UC1: Entry/Exit Counting endpoints."""
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.database import get_db
 from app.models.entry_exit_log import EntryExitLog
-from app.schemas.entry_exit_log import EntryExitLogOut
-from datetime import datetime, date
+from app.schemas.entry_exit_log import EntryExitLogResponse
+from app.schemas.responses import TodayCountResponse
+from datetime import date
 
 router = APIRouter()
 
 
-@router.get("/entry-exit", response_model=list[EntryExitLogOut], summary="UC1 — Get entry/exit log")
-def get_entry_exit_log(limit: int = 50, gate: str = None, db: Session = Depends(get_db)):
+@router.get("/entry-exit", response_model=list[EntryExitLogResponse], summary="UC1 — Get entry/exit log")
+def get_entry_exit_log(limit: int = 50, offset: int = 0, gate: str = None, db: Session = Depends(get_db)):
     """Returns chronological entry/exit events with plate, type, and time."""
     q = db.query(EntryExitLog)
     if gate:
         q = q.filter(EntryExitLog.gate == gate)
-    return q.order_by(EntryExitLog.event_time.desc()).limit(limit).all()
+    return q.order_by(EntryExitLog.event_time.desc()).offset(offset).limit(limit).all()
 
 
-@router.get("/entry-exit/count/today", summary="UC1 — Today's vehicle count")
+@router.get("/entry-exit/count/today", response_model=TodayCountResponse, summary="UC1 — Today's vehicle count")
 def get_today_counts(db: Session = Depends(get_db)):
     """Returns total entries and exits for today."""
     today = date.today()
