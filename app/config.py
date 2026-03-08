@@ -37,14 +37,16 @@ class Settings(BaseSettings):
     CAM_35_PASSWORD: str = ""
     CAM_35_NAME: str = "B1-DATA CENTER"
 
-    # Phase 2 — Set these in .env when ANPR cameras are installed
+    # Phase 2 — ANPR cameras
     CAM_ENTRY_IP: str = ""
     CAM_ENTRY_USER: str = ""
     CAM_ENTRY_PASSWORD: str = ""
+    CAM_ENTRY_NAME: str = "ENTRY-GATE"
 
     CAM_EXIT_IP: str = ""
     CAM_EXIT_USER: str = ""
     CAM_EXIT_PASSWORD: str = ""
+    CAM_EXIT_NAME: str = "EXIT-GATE"
 
     # ── Derived camera dicts (built from env vars above) ──────────────────
     CAMERAS: dict = {}
@@ -74,14 +76,16 @@ class Settings(BaseSettings):
         if self.CAM_ENTRY_IP:
             cameras["CAM-ENTRY"] = {
                 "ip": self.CAM_ENTRY_IP, "user": self.CAM_ENTRY_USER,
-                "password": self.CAM_ENTRY_PASSWORD, "phase": 2, "gate": "entry",
+                "password": self.CAM_ENTRY_PASSWORD, "phase": 2,
+                "gate": "entry", "name": self.CAM_ENTRY_NAME,
             }
             ip_map[self.CAM_ENTRY_IP] = "CAM-ENTRY"
 
         if self.CAM_EXIT_IP:
             cameras["CAM-EXIT"] = {
                 "ip": self.CAM_EXIT_IP, "user": self.CAM_EXIT_USER,
-                "password": self.CAM_EXIT_PASSWORD, "phase": 2, "gate": "exit",
+                "password": self.CAM_EXIT_PASSWORD, "phase": 2,
+                "gate": "exit", "name": self.CAM_EXIT_NAME,
             }
             ip_map[self.CAM_EXIT_IP] = "CAM-EXIT"
 

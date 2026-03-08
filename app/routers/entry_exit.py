@@ -1,19 +1,19 @@
 # app/routers/entry_exit.py
-"""UC1: Entry/Exit Counting endpoints (Phase 2)"""
+"""UC1: Entry/Exit Counting endpoints."""
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.database import get_db
 from app.models.entry_exit_log import EntryExitLog
-from app.schemas.entry_exit_log import EntryExitLogOut
+from app.schemas.entry_exit_log import EntryExitLogResponse
 from app.schemas.responses import TodayCountResponse
-from datetime import datetime, date
+from datetime import date
 
 router = APIRouter()
 
 
-@router.get("/entry-exit", response_model=list[EntryExitLogOut], summary="UC1 — Get entry/exit log")
+@router.get("/entry-exit", response_model=list[EntryExitLogResponse], summary="UC1 — Get entry/exit log")
 def get_entry_exit_log(limit: int = 50, offset: int = 0, gate: str = None, db: Session = Depends(get_db)):
     """Returns chronological entry/exit events with plate, type, and time."""
     q = db.query(EntryExitLog)

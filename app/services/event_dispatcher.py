@@ -5,6 +5,7 @@ from app.services.event_parser import ParsedCameraEvent
 from app.services.occupancy_service import handle_occupancy_event
 from app.services.violation_service import handle_violation_event, RESTRICTED_ZONES, ALWAYS_VIOLATION_EVENTS
 from app.services.intrusion_service import handle_intrusion_event, MONITORED_INTRUSION_ZONES
+from app.services.entry_exit_service import handle_anpr_event
 from app.services.snapshot_service import fetch_snapshot
 from app.utils.logger import get_logger
 from sqlalchemy.orm import Session
@@ -35,8 +36,11 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
                 await handle_intrusion_event(event, db)
             elif zone_id in RESTRICTED_ZONES:
                 await handle_violation_event(event, db)
+            elif event.event_type == "VMD" and not event.region_id:
+                # VMD with no zone is generic motion — log and skip
+                logger.info(f"VMD motion event from {event.camera_id}, no zone — skipping handlers")
             elif not event.region_id:
-                # No zone info — fire both (services will self-filter)
+                # Non-VMD with no zone info — fire both (services will self-filter)
                 await handle_violation_event(event, db)
                 await handle_intrusion_event(event, db)
 
@@ -47,11 +51,7 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
         # ── PHASE 2 ───────────────────────────────────────────────────────────
         # UC1 + UC2 + UC4: ANPR gate events
         if event.event_type == "AccessControllerEvent" and event.plate_number:
-            try:
-                from app.services.entry_exit_service import handle_anpr_event
-                await handle_anpr_event(event, db)
-            except ImportError:
-                logger.warning("entry_exit_service not yet implemented (Phase 2 pending)")
+            await handle_anpr_event(event, db)
 
         # Commit all handler changes as a single transaction
         db.commit()
