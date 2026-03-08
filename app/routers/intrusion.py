@@ -30,6 +30,20 @@ def get_intrusions(
     return q.order_by(Alert.triggered_at.desc()).limit(limit).all()
 
 
+@router.put("/intrusions/resolve-all", summary="UC6 — Resolve all active intrusions")
+def resolve_all_intrusions(db: Session = Depends(get_db)):
+    """Mark all active intrusion alerts as resolved."""
+    updated_count = db.query(Alert).filter(
+        Alert.alert_type == "intrusion",
+        Alert.is_resolved == 0
+    ).update(
+        {"is_resolved": 1, "resolved_at": datetime.utcnow()},
+        synchronize_session=False
+    )
+    db.commit()
+    return {"status": "resolved", "count": updated_count}
+
+
 @router.put("/intrusions/{alert_id}/resolve", summary="UC6 — Resolve an intrusion alert")
 def resolve_intrusion(alert_id: int, db: Session = Depends(get_db)):
     """Mark an intrusion alert as resolved."""

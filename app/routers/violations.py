@@ -30,3 +30,17 @@ def resolve_violation(alert_id: int, db: Session = Depends(get_db)):
     alert.resolved_at = datetime.utcnow()
     db.commit()
     return {"id": alert_id, "status": "resolved"}
+
+
+@router.put("/violations/resolve-all", summary="UC5 — Resolve all active violations")
+def resolve_all_violations(db: Session = Depends(get_db)):
+    """Mark all active violation alerts as resolved."""
+    updated_count = db.query(Alert).filter(
+        Alert.alert_type == "violation",
+        Alert.is_resolved == 0
+    ).update(
+        {"is_resolved": 1, "resolved_at": datetime.utcnow()},
+        synchronize_session=False
+    )
+    db.commit()
+    return {"status": "resolved", "count": updated_count}
