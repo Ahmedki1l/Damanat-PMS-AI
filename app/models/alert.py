@@ -4,7 +4,7 @@ Alerts table — stores all generated alerts (occupancy, violation, intrusion, u
 Used by violation_service, intrusion_service, occupancy_service, and entry_exit_service.
 """
 
-from sqlalchemy import Column, Integer, String, DateTime, Text
+from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean
 from app.database import Base
 
 
@@ -17,7 +17,7 @@ class Alert(Base):
     zone_id = Column(String(100))
     event_type = Column(String(100))
     description = Column(Text)
-    is_resolved = Column(Integer, default=0, nullable=False)
+    is_resolved = Column(Boolean, default=False, nullable=False)
     triggered_at = Column(DateTime, nullable=False, index=True)
     resolved_at = Column(DateTime)
 

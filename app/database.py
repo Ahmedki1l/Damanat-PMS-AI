@@ -36,6 +36,7 @@ def create_tables():
     """
     Creates all DB tables on startup. Safe to call multiple times.
     Import all models here so SQLAlchemy knows about them.
+    Kept for scripts (init_db.py) that don't need full Alembic.
     """
     # Phase 1 models
     from app.models.camera_event import CameraEvent       # noqa
@@ -46,3 +47,13 @@ def create_tables():
     from app.models.entry_exit_log import EntryExitLog     # noqa
 
     Base.metadata.create_all(bind=engine)
+
+
+def run_migrations():
+    """Run Alembic migrations to bring the database up to date."""
+    from alembic.config import Config
+    from alembic import command
+    import os
+
+    alembic_cfg = Config(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
+    command.upgrade(alembic_cfg, "head")

@@ -11,7 +11,7 @@ router = APIRouter()
 @router.get("/alerts", response_model=list[AlertOut], summary="All alerts — filterable by type")
 def get_all_alerts(
     alert_type: Optional[str] = None,
-    is_resolved: Optional[int] = None,
+    is_resolved: Optional[bool] = None,
     limit: int = 50,
     db: Session = Depends(get_db)
 ):

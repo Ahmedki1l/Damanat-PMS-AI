@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from app.routers import events, occupancy, violations, intrusion, health, alerts
-from app.database import create_tables
+from app.database import run_migrations
 from app.config import settings
 from app.utils.logger import get_logger
 import time
@@ -102,8 +102,8 @@ app.include_router(alerts.router,     prefix="/api/v1", tags=["🔔 Alerts"])
 @app.on_event("startup")
 async def startup():
     logger.info("🚀 Damanat Backend starting up...")
-    create_tables()
-    logger.info("✅ Database tables ready")
+    run_migrations()
+    logger.info("✅ Database migrations applied")
     logger.info(f"📡 Cameras configured: {list(settings.CAMERAS.keys())}")
     logger.info(f"🌐 Listening on http://{settings.BACKEND_IP}:{settings.BACKEND_PORT}")
     logger.info("📖 API docs at /docs")

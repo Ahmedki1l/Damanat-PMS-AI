@@ -17,5 +17,5 @@ async def create_alert(db, alert_type, camera_id, zone_id, event_type, descripti
     """Create an alert record. Caller is responsible for committing the transaction."""
     db.add(Alert(alert_type=alert_type, camera_id=camera_id, zone_id=zone_id,
                  event_type=event_type, description=description,
-                 is_resolved=0, triggered_at=datetime.utcnow()))
+                 is_resolved=False, triggered_at=datetime.utcnow()))
     logger.warning(f"[ALERT][{alert_type.upper()}] {description}")
