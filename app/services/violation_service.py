@@ -15,16 +15,28 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-RESTRICTED_ZONES = {"restricted-vip", "no-parking-zone", "emergency-exit", "loading-bay"}
-ALWAYS_VIOLATION_EVENTS = {"linedetection"}
+
+def _get_restricted_zones() -> set:
+    return set(z.strip() for z in settings.RESTRICTED_ZONES.split(",") if z.strip())
+
+
+def _get_always_violation_events() -> set:
+    return set(e.strip() for e in settings.ALWAYS_VIOLATION_EVENTS.split(",") if e.strip())
+
+
+# Module-level aliases for dispatcher import
+RESTRICTED_ZONES = _get_restricted_zones()
+ALWAYS_VIOLATION_EVENTS = _get_always_violation_events()
 
 
 async def handle_violation_event(event: ParsedCameraEvent, db: Session):
     zone_id = event.region_id or "unknown-zone"
-    if zone_id not in RESTRICTED_ZONES and event.event_type not in ALWAYS_VIOLATION_EVENTS:
+    restricted = _get_restricted_zones()
+    always_events = _get_always_violation_events()
+    if zone_id not in restricted and event.event_type not in always_events:
         return
 
-    cooldown = timedelta(seconds=settings.INTRUSION_COOLDOWN_SECONDS)
+    cooldown = timedelta(seconds=settings.VIOLATION_COOLDOWN_SECONDS)
     recent = db.query(Alert).filter(
         Alert.zone_id == zone_id, Alert.alert_type == "violation",
         Alert.triggered_at >= datetime.utcnow() - cooldown

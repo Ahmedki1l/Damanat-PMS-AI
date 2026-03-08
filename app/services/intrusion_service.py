@@ -16,12 +16,19 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-MONITORED_INTRUSION_ZONES = {"emergency-exit", "staff-only-area", "after-hours-zone"}
+
+def _get_monitored_zones() -> set:
+    return set(z.strip() for z in settings.MONITORED_INTRUSION_ZONES.split(",") if z.strip())
+
+
+# Module-level alias for dispatcher import
+MONITORED_INTRUSION_ZONES = _get_monitored_zones()
 
 
 async def handle_intrusion_event(event: ParsedCameraEvent, db: Session):
     zone_id = event.region_id or f"{event.camera_id}-field"
-    if zone_id not in MONITORED_INTRUSION_ZONES and event.region_id is not None:
+    monitored = _get_monitored_zones()
+    if zone_id not in monitored and event.region_id is not None:
         return
 
     cooldown = timedelta(seconds=settings.INTRUSION_COOLDOWN_SECONDS)

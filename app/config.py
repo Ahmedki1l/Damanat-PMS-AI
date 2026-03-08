@@ -89,9 +89,16 @@ class Settings(BaseSettings):
         self.CAMERA_IP_MAP = ip_map
         return self
 
+    # ── Zone configuration ───────────────────────────────────────────────
+    # Comma-separated zone IDs. Override in .env.
+    RESTRICTED_ZONES: str = "restricted-vip,no-parking-zone,emergency-exit,loading-bay"
+    MONITORED_INTRUSION_ZONES: str = "emergency-exit,staff-only-area,after-hours-zone"
+    ALWAYS_VIOLATION_EVENTS: str = "linedetection"
+
     # ── Thresholds ────────────────────────────────────────────────────────
     OCCUPANCY_ALERT_THRESHOLD: float = 0.90     # Alert at 90% full
     INTRUSION_COOLDOWN_SECONDS: int = 30         # Suppress re-alerts within 30s
+    VIOLATION_COOLDOWN_SECONDS: int = 30         # Suppress re-alerts within 30s
 
     # ── Logging ───────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
