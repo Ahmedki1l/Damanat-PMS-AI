@@ -105,7 +105,7 @@ async def _handle_event(xml_bytes: bytes, cam_id: str, cam_ip: str):
                 raw_payload=xml_bytes.decode("utf-8", errors="replace"),
                 created_at=datetime.utcnow(),
             ))
-            db.commit()
+            # dispatch_event commits raw event + handler changes atomically
             await dispatch_event(event, db)
         finally:
             db.close()

@@ -41,7 +41,7 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
             f"snap={event.snapshot_path}"
         )
 
-        # Persist raw event
+        # Persist raw event (committed by dispatch_event transaction)
         from app.models.camera_event import CameraEvent
         db.add(CameraEvent(
             camera_id=event.camera_id,
@@ -58,9 +58,8 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
             raw_payload=event.raw_xml,
             created_at=datetime.utcnow(),
         ))
-        db.commit()
 
-        # Dispatch to correct use-case handlers
+        # Dispatch to handlers — commits raw event + all handler changes atomically
         await dispatch_event(event, db)
         return {"status": "ok", "event_type": event.event_type}
 

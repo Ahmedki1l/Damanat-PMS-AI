@@ -31,7 +31,6 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
         zone.current_count = max(0, zone.current_count - 1)
 
     zone.last_updated = datetime.utcnow()
-    db.commit()
     logger.info(f"[UC3] {zone_id}: {zone.current_count}/{zone.max_capacity}")
 
     if zone.max_capacity and (zone.current_count / zone.max_capacity) >= settings.OCCUPANCY_ALERT_THRESHOLD:

@@ -13,35 +13,51 @@ logger = get_logger(__name__)
 
 
 async def dispatch_event(event: ParsedCameraEvent, db: Session):
-    is_vehicle = event.detection_target in ("vehicle", None)
-    is_human = event.detection_target in ("human", None)
+    """
+    Route event to handlers and commit as a single transaction.
+    On any handler failure, rolls back all changes from this dispatch cycle.
+    """
+    try:
+        is_vehicle = event.detection_target in ("vehicle", None)
+        is_human = event.detection_target in ("human", None)
 
-    # ── PHASE 1 ───────────────────────────────────────────────────────────
-    # UC3: Occupancy — region entrance/exit (CAM-03 only)
-    if event.event_type in ("regionEntrance", "regionExiting"):
-        await handle_occupancy_event(event, db)
+        # ── PHASE 1 ───────────────────────────────────────────────────────────
+        # UC3: Occupancy — region entrance/exit (CAM-03 only)
+        if event.event_type in ("regionEntrance", "regionExiting"):
+            await handle_occupancy_event(event, db)
 
-    # UC5: Violation alerts
-    # fielddetection / regionEntrance / VMD → vehicles only
-    if event.event_type in ("fielddetection", "regionEntrance", "VMD") and is_vehicle:
-        await handle_violation_event(event, db)
-    # linedetection → vehicles OR humans (some cameras detect staff crossing lines)
-    if event.event_type == "linedetection" and (is_vehicle or is_human):
-        await handle_violation_event(event, db) 
+        # UC5: Violation alerts
+        # fielddetection / regionEntrance / VMD → vehicles only
+        if event.event_type in ("fielddetection", "regionEntrance", "VMD") and is_vehicle:
+            await handle_violation_event(event, db)
+        # linedetection → vehicles OR humans (some cameras detect staff crossing lines)
+        if event.event_type == "linedetection" and (is_vehicle or is_human):
+            await handle_violation_event(event, db)
 
-    # UC6: Intrusion detection
-    if event.event_type in ("fielddetection", "regionEntrance", "VMD") and is_vehicle:
-        await handle_intrusion_event(event, db)
+        # UC6: Intrusion detection
+        if event.event_type in ("fielddetection", "regionEntrance", "VMD") and is_vehicle:
+            await handle_intrusion_event(event, db)
 
-    # 📸 Snapshot — fetch image from camera on any detection event
+        # ── PHASE 2 ───────────────────────────────────────────────────────────
+        # UC1 + UC2 + UC4: ANPR gate events
+        if event.event_type == "AccessControllerEvent" and event.plate_number:
+            try:
+                from app.services.entry_exit_service import handle_anpr_event
+                await handle_anpr_event(event, db)
+            except ImportError:
+                logger.warning("entry_exit_service not yet implemented (Phase 2 pending)")
+
+        # Commit all handler changes as a single transaction
+        db.commit()
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Dispatch failed, transaction rolled back: {e}", exc_info=True)
+        raise
+
+    # Snapshot fetch is fire-and-forget (no DB changes), runs outside transaction
     if event.event_type in ("fielddetection", "linedetection", "regionEntrance", "VMD"):
-        await fetch_snapshot(event.camera_id, event.event_type)    
-
-    # ── PHASE 2 ───────────────────────────────────────────────────────────
-    # UC1 + UC2 + UC4: ANPR gate events
-    if event.event_type == "AccessControllerEvent" and event.plate_number:
         try:
-            from app.services.entry_exit_service import handle_anpr_event
-            await handle_anpr_event(event, db)
-        except ImportError:
-            logger.warning("entry_exit_service not yet implemented (Phase 2 pending)")
+            await fetch_snapshot(event.camera_id, event.event_type)
+        except Exception as e:
+            logger.warning(f"Snapshot fetch failed for {event.camera_id}: {e}")

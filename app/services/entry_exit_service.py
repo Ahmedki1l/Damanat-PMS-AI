@@ -82,4 +82,3 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         )
 
     db.add(log_entry)
-    db.commit()
