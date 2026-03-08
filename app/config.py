@@ -97,6 +97,7 @@ class Settings(BaseSettings):
 
     # ── Thresholds ────────────────────────────────────────────────────────
     OCCUPANCY_ALERT_THRESHOLD: float = 0.90     # Alert at 90% full
+    DEFAULT_ZONE_CAPACITY: int = 50             # Default max_capacity for auto-created zones
     INTRUSION_COOLDOWN_SECONDS: int = 30         # Suppress re-alerts within 30s
     VIOLATION_COOLDOWN_SECONDS: int = 30         # Suppress re-alerts within 30s
 
