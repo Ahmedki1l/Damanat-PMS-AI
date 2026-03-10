@@ -1,12 +1,8 @@
-<<<<<<< HEAD
 # app/services/intrusion_service.py
 """
 UC6: Intrusion Detection
-Events: fielddetection, regionEntrance — vehicle only
-Note: Cannot verify plate identity without ANPR (Phase 2).
-      Authorization check by plate is added in Phase 2 via entry_exit_service.
-
-Zone slots from cameras are resolved via resolve_zone() using ZONE_MAPPING in app/zone_config.py.
+Events: fielddetection, regionEntrance — vehicle only.
+Handles zone resolution and alert cooldowns.
 """
 
 from datetime import datetime, timedelta
@@ -20,78 +16,54 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Structured list of zones that trigger intrusion alerts
 MONITORED_INTRUSION_ZONES = {
     ZoneNames.Intrusion.EMERGENCY_EXIT,
     ZoneNames.Intrusion.STAFF_ONLY_AREA,
     ZoneNames.Intrusion.AFTER_HOURS_ZONE,
 }
 
-
 async def handle_intrusion_event(event: ParsedCameraEvent, db: Session):
+    """
+    Processes smart events to detect unauthorized vehicle presence.
+    Uses resolve_zone to map camera IDs to specific logical areas.
+    """
+    # 1. Resolve logical zone from camera config
     zone_id = resolve_zone(event.camera_id, event.region_id)
 
+    # Fallback: if no specific region is mapped, use a generic field-of-view ID
     if zone_id is None:
         if event.region_id is not None:
+            # If it's a specific region but not in our mapping, ignore it
             return
         zone_id = f"{event.camera_id}-field"
 
+    # 2. Filter: Only process zones explicitly listed as monitored
     if zone_id not in MONITORED_INTRUSION_ZONES and not zone_id.endswith("-field"):
         return
 
-    cooldown = timedelta(seconds=settings.INTRUSION_COOLDOWN_SECONDS)
-    recent = db.query(Alert).filter(
-        Alert.zone_id == zone_id, Alert.alert_type == "intrusion",
-        Alert.triggered_at >= datetime.utcnow() - cooldown
+    # 3. Cooldown Logic: Prevent spamming alerts for the same intrusion
+    cooldown_period = datetime.utcnow() - timedelta(seconds=settings.INTRUSION_COOLDOWN_SECONDS)
+    
+    recent_alert = db.query(Alert).filter(
+        Alert.zone_id == zone_id, 
+        Alert.alert_type == "intrusion",
+        Alert.triggered_at >= cooldown_period
     ).first()
-    if recent:
+
+    if recent_alert:
+        logger.debug(f"Intrusion in {zone_id} skipped due to cooldown.")
         return
 
-    desc = f"Vehicle intrusion in {zone_id} — {event.camera_id}"
-    logger.warning(f"[UC6] INTRUSION: {desc}")
-    await create_alert(db, "intrusion", event.camera_id, zone_id, event.event_type, desc)
-=======
-# app/services/intrusion_service.py
-"""
-UC6: Intrusion Detection
-Events: fielddetection, regionEntrance — vehicle only
-Note: Cannot verify plate identity without ANPR (Phase 2).
-      Authorization check by plate is added in Phase 2 via entry_exit_service.
-"""
-
-from datetime import datetime, timedelta
-from sqlalchemy.orm import Session
-from app.models.alert import Alert
-from app.services.event_parser import ParsedCameraEvent
-from app.services.alert_service import create_alert
-from app.config import settings
-from app.utils.logger import get_logger
-
-logger = get_logger(__name__)
-
-
-def _get_monitored_zones() -> set:
-    return set(z.strip() for z in settings.MONITORED_INTRUSION_ZONES.split(",") if z.strip())
-
-
-# Module-level alias for dispatcher import
-MONITORED_INTRUSION_ZONES = _get_monitored_zones()
-
-
-async def handle_intrusion_event(event: ParsedCameraEvent, db: Session):
-    zone_id = event.region_id or f"{event.camera_id}-field"
-    monitored = _get_monitored_zones()
-    if zone_id not in monitored and event.region_id is not None:
-        return
-
-    cooldown = timedelta(seconds=settings.INTRUSION_COOLDOWN_SECONDS)
-    recent = db.query(Alert).filter(
-        Alert.zone_id == zone_id, Alert.alert_type == "intrusion",
-        Alert.triggered_at >= datetime.utcnow() - cooldown
-    ).first()
-    if recent:
-        return
-
-    desc = f"Vehicle intrusion in {zone_id} — {event.camera_id}"
-    logger.warning(f"[UC6] INTRUSION: {desc}")
-    await create_alert(db, "intrusion", event.camera_id, zone_id, event.event_type, desc)
->>>>>>> origin/Amr
+    # 4. Create Alert
+    description = f"Vehicle intrusion detected in {zone_id} via {event.camera_id}"
+    logger.warning(f"[UC6] INTRUSION DETECTED: {description}")
+    
+    await create_alert(
+        db, 
+        alert_type="intrusion", 
+        camera_id=event.camera_id, 
+        zone_id=zone_id, 
+        event_type=event.event_type, 
+        description=description
+    )
