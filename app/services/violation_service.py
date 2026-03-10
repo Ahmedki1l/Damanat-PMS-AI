@@ -62,4 +62,5 @@ async def handle_violation_event(event: ParsedCameraEvent, db: Session):
     desc = (f"Line crossing in zone {zone_id}" if event.event_type == "linedetection"
             else f"Vehicle in restricted zone: {zone_id}")
     logger.warning(f"[UC5] VIOLATION: {desc}")
-    await create_alert(db, "violation", event.camera_id, zone_id, event.event_type, desc)
+    alert_zone_id = settings.CAMERA_ZONE_MAP.get(event.camera_id, zone_id)
+    await create_alert(db, "violation", event.camera_id, alert_zone_id, event.event_type, desc)

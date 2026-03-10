@@ -40,31 +40,35 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
         event = parse_camera_event(raw_body, camera_ip, content_type)
         # logger.info(f"Parsed Event: type={event.event_type} | camera={event.camera_id} | plate={event.plate_number}") # Moved to dispatcher/parser
 
-        # 2. Persist raw event log
-        # Note: We don't commit here; dispatch_event handles the transaction commit.
+        # 2. Persist raw event log (skip high-frequency VMD noise)
         from app.models.camera_event import CameraEvent
-        db.add(CameraEvent(
-            camera_id=event.camera_id,
-            device_serial=event.device_serial,
-            channel_id=event.channel_id,
-            event_type=event.event_type,
-            event_state=event.event_state,
-            event_description=event.event_description,
-            detection_target=event.detection_target,
-            region_id=event.region_id,
-            channel_name=event.channel_name,
-            trigger_time=event.trigger_time,
-            snapshot_path=event.snapshot_path,
-            raw_payload=event.raw_xml,
-            created_at=datetime.utcnow(),
-        ))
+        if event.event_type != "VMD":
+            db.add(CameraEvent(
+                camera_id=event.camera_id,
+                device_serial=event.device_serial,
+                channel_id=event.channel_id,
+                event_type=event.event_type,
+                event_state=event.event_state,
+                event_description=event.event_description,
+                detection_target=event.detection_target,
+                region_id=event.region_id,
+                channel_name=event.channel_name,
+                trigger_time=event.trigger_time,
+                snapshot_path=event.snapshot_path,
+                raw_payload=event.raw_xml,
+                created_at=datetime.utcnow(),
+            ))
 
         # 3. Dispatch to handlers (UC1 through UC6)
         await dispatch_event(event, db)
-        
+
+        # 4. Commit — router owns the transaction, not the dispatcher
+        db.commit()
+
         return {"status": "ok", "event_type": event.event_type}
 
     except Exception as e:
+        db.rollback()
         logger.error(f"Event processing error: {e}", exc_info=True)
         return {"status": "error", "detail": str(e)}
 

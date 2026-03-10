@@ -19,6 +19,8 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
     Protects UC3 and UC2 logic while maintaining teammates' UC5/UC6 work.
     """
     try:
+        logger.debug(f"[dispatch] type={event.event_type!r} camera={event.camera_id} plate={event.plate_number!r}")
+
         # VMD = Video Motion Detection: basic motion, not a Smart Event.
         # Ignore it completely per user request — fires constantly and has no zone info.
         if event.event_type == "VMD":
@@ -80,9 +82,6 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
         # Finalize any pending exits that have passed the confirmation window
         from app.services.occupancy_service import process_pending_exits
         await process_pending_exits(db)
-
-        # Finalize all database changes
-        db.commit()
 
     except Exception as e:
         db.rollback()

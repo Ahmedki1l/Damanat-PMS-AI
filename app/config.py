@@ -20,6 +20,39 @@ class Settings(BaseSettings):
     # ── Security ──────────────────────────────────────────────────────────
     API_KEY: Optional[str] = None   # Set in .env to enable auth on API endpoints
 
+    # ── Node.js Core Backend Integration ─────────────────────────────────
+    NODEBACK_URL: str = ""          # e.g. "http://localhost:3000"; empty = disabled
+    NODEBACK_SITE_ID: str = ""      # UUID of this parking site in the website backend
+    NODEBACK_SERVICE_KEY: str = ""  # X-Service-Key header value for service-to-service auth
+
+    # ── Zone UUID mappings (from Node.js backend database) ────────────────
+    # Camera ID → Zone UUID (used for alert zone_id in violation/intrusion/ANPR)
+    CAMERA_ZONE_MAP: dict = {
+        "CAM-04":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",  # B1-PARKING
+        "CAM-05":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",
+        "CAM-06":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",
+        "CAM-07":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",
+        "CAM-09":    "93651f64-fb84-4082-b51e-9477cf7c06ac",  # B2-PARKING
+        "CAM-11":    "93651f64-fb84-4082-b51e-9477cf7c06ac",
+        "CAM-12":    "93651f64-fb84-4082-b51e-9477cf7c06ac",
+        "CAM-13":    "93651f64-fb84-4082-b51e-9477cf7c06ac",
+        "CAM-14":    "93651f64-fb84-4082-b51e-9477cf7c06ac",
+        "CAM-02":    "e0a6c09c-4e69-46cb-93df-ebf26b8b8239",  # GF-WAITING
+        "CAM-ENTRY": "b17a1403-2b37-4a03-8e49-0977a1d16736",  # GF-GATES
+        "CAM-EXIT":  "b17a1403-2b37-4a03-8e49-0977a1d16736",
+        "CAM-35":    "3cde4635-7b8e-43e4-b8a8-51cf92cd4a65",  # B1-DATA CENTER
+    }
+
+    # Zone name → Zone UUID (used for occupancy HTTP push)
+    # "GARAGE-TOTAL" is intentionally excluded — Node.js handles total counts internally
+    ZONE_NAME_TO_UUID: dict = {
+        "B1-PARKING":     "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",
+        "B2-PARKING":     "93651f64-fb84-4082-b51e-9477cf7c06ac",
+        "GF-WAITING":     "e0a6c09c-4e69-46cb-93df-ebf26b8b8239",
+        "GF-GATES":       "b17a1403-2b37-4a03-8e49-0977a1d16736",
+        "B1-DATA CENTER": "3cde4635-7b8e-43e4-b8a8-51cf92cd4a65",
+    }
+
     # ── Phase 1 Camera credentials (read from .env) ──────────────────────
     CAM_03_IP: str = ""
     CAM_03_USER: str = ""

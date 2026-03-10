@@ -12,9 +12,11 @@ from sqlalchemy import text
 from app.database import get_db
 from app.config import settings
 from app.schemas.responses import HealthResponse
+from app.utils.logger import get_logger
 from datetime import datetime
 
 router = APIRouter()
+logger = get_logger(__name__)
 
 
 @router.get("/health", response_model=HealthResponse, summary="System health check")
@@ -25,12 +27,13 @@ def health_check(db: Session = Depends(get_db)):
     - Database connectivity
     - Camera reachability (ping ISAPI on each camera)
     """
+
     result = {
         "status": "ok",
         "timestamp": datetime.utcnow().isoformat(),
         "backend": "ok",
         "database": "unknown",
-        "cameras": {},
+        "cameras": list(settings.CAMERAS.keys()),
     }
 
     # Check database
@@ -41,7 +44,7 @@ def health_check(db: Session = Depends(get_db)):
         result["database"] = f"error: {str(e)}"
         result["status"] = "degraded"
 
-    # Ping each camera
+    # Ping each camera — log per-camera status but don't include in response
     for cam_id, cam in settings.CAMERAS.items():
         try:
             resp = requests.get(
@@ -49,11 +52,12 @@ def health_check(db: Session = Depends(get_db)):
                 auth=HTTPDigestAuth(cam["user"], cam["password"]),
                 timeout=3,
             )
-            result["cameras"][cam_id] = "ok" if resp.status_code == 200 else f"http_{resp.status_code}"
+            cam_status = "ok" if resp.status_code == 200 else f"http_{resp.status_code}"
         except requests.exceptions.ConnectionError:
-            result["cameras"][cam_id] = "unreachable"
+            cam_status = "unreachable"
             result["status"] = "degraded"
         except Exception as e:
-            result["cameras"][cam_id] = f"error: {str(e)}"
+            cam_status = f"error: {str(e)}"
+        logger.debug(f"[health] camera={cam_id} status={cam_status}")
 
     return result
