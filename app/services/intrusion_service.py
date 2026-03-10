@@ -1,7 +1,7 @@
 # app/services/intrusion_service.py
 """
 UC6: Intrusion Detection
-Events: fielddetection, regionEntrance — vehicle only.
+Events: fielddetection, regionEntrance - vehicle only.
 Handles zone resolution and alert cooldowns.
 """
 
@@ -23,6 +23,17 @@ MONITORED_INTRUSION_ZONES = {
     ZoneNames.Intrusion.AFTER_HOURS_ZONE,
 }
 
+
+def _parse_region_id(raw_region_id: str | None) -> int | None:
+    if raw_region_id is None:
+        return None
+    if isinstance(raw_region_id, int):
+        return raw_region_id
+    if isinstance(raw_region_id, str) and raw_region_id.strip().isdigit():
+        return int(raw_region_id.strip())
+    return None
+
+
 async def handle_intrusion_event(event: ParsedCameraEvent, db: Session):
     """
     Processes smart events to detect unauthorized vehicle presence.
@@ -30,6 +41,7 @@ async def handle_intrusion_event(event: ParsedCameraEvent, db: Session):
     """
     # 1. Resolve logical zone from camera config
     zone_id = resolve_zone(event.camera_id, event.region_id)
+    region_id = _parse_region_id(event.region_id)
 
     # Fallback: if no specific region is mapped, use a generic field-of-view ID
     if zone_id is None:
@@ -44,11 +56,11 @@ async def handle_intrusion_event(event: ParsedCameraEvent, db: Session):
 
     # 3. Cooldown Logic: Prevent spamming alerts for the same intrusion
     cooldown_period = datetime.utcnow() - timedelta(seconds=settings.INTRUSION_COOLDOWN_SECONDS)
-    
+
     recent_alert = db.query(Alert).filter(
-        Alert.zone_id == zone_id, 
+        Alert.zone_id == zone_id,
         Alert.alert_type == "intrusion",
-        Alert.triggered_at >= cooldown_period
+        Alert.triggered_at >= cooldown_period,
     ).first()
 
     if recent_alert:
@@ -58,12 +70,13 @@ async def handle_intrusion_event(event: ParsedCameraEvent, db: Session):
     # 4. Create Alert
     description = f"Vehicle intrusion detected in {zone_id} via {event.camera_id}"
     logger.warning(f"[UC6] INTRUSION DETECTED: {description}")
-    
+
     await create_alert(
-        db, 
-        alert_type="intrusion", 
-        camera_id=event.camera_id, 
-        zone_id=zone_id, 
-        event_type=event.event_type, 
-        description=description
+        db,
+        alert_type="intrusion",
+        camera_id=event.camera_id,
+        zone_id=zone_id,
+        event_type=event.event_type,
+        description=description,
+        region_id=region_id,
     )
