@@ -66,4 +66,4 @@ class HealthResponse(BaseModel):
     timestamp: str
     backend: str
     database: str
-    cameras: dict[str, str]
+    cameras: list[str]

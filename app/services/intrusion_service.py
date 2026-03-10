@@ -58,12 +58,12 @@ async def handle_intrusion_event(event: ParsedCameraEvent, db: Session):
     # 4. Create Alert
     description = f"Vehicle intrusion detected in {zone_id} via {event.camera_id}"
     logger.warning(f"[UC6] INTRUSION DETECTED: {description}")
-    
+    alert_zone_id = settings.CAMERA_ZONE_MAP.get(event.camera_id, zone_id)
     await create_alert(
-        db, 
-        alert_type="intrusion", 
-        camera_id=event.camera_id, 
-        zone_id=zone_id, 
-        event_type=event.event_type, 
-        description=description
+        db,
+        alert_type="intrusion",
+        camera_id=event.camera_id,
+        zone_id=alert_zone_id,
+        event_type=event.event_type,
+        description=description,
     )

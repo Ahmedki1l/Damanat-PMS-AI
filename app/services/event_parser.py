@@ -246,7 +246,7 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
          else:
              logger.info(f"[DEBUG-ANPR] Extracted plate: {plate_number}")
 
-    event_type = find("eventType") or "unknown"
+    event_type = find_text("eventType") or "unknown"
     camera_id = settings.CAMERA_IP_MAP.get(camera_ip, f"UNKNOWN-{camera_ip}")
 
     # ── ANPR XML debug: dump full XML so we can see the actual structure ──

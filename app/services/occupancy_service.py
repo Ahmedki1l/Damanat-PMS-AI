@@ -16,18 +16,51 @@ _pending_exits = {} # Format: {event_key: (zone_id, delta, timestamp)}
 CACHE_TTL_SECONDS = 5
 
 async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Session):
-    """Helper to update a specific zone's count atomically."""
+    """
+    Update a zone's occupancy count.
+    If NODEBACK_URL is configured: POST to Node.js and check isFull for capacity alert.
+    Fallback: write directly to local zone_occupancy table.
+    """
+    from app.utils import core_backend_client
+
+    zone_uuid = settings.ZONE_NAME_TO_UUID.get(zone_id)
+
+    if settings.NODEBACK_URL and zone_uuid:
+        # ── HTTP push to Node.js ──────────────────────────────────────────
+        if delta > 0:
+            data = await core_backend_client.notify_occupancy_entry(zone_uuid, camera_id)
+        else:
+            data = await core_backend_client.notify_occupancy_exit(zone_uuid, camera_id)
+
+        if data:
+            current = data.get("currentCount", 0)
+            max_cap = data.get("maxCapacity", 0)
+            pct = data.get("percentage", 0)
+            logger.debug(f"[UC3] {zone_id}: {current}/{max_cap} ({pct}%)")
+
+            if data.get("isFull"):
+                await create_alert(
+                    db,
+                    alert_type="capacity_exceeded",
+                    camera_id=camera_id,
+                    zone_id=zone_uuid,
+                    event_type="occupancy_update",
+                    description=f"Zone {zone_id} is full: {current}/{max_cap} (100%)",
+                )
+        return
+
+    # ── Fallback: write to local zone_occupancy table ─────────────────────
     from app.models.zone_occupancy import ZoneOccupancy
-    
+
     zone = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id == zone_id).first()
     if not zone:
         logger.info(f"[UC3] Auto-creating zone '{zone_id}'")
         zone = ZoneOccupancy(
-            zone_id=zone_id, 
+            zone_id=zone_id,
             camera_id=camera_id,
-            current_count=0, 
+            current_count=0,
             max_capacity=settings.DEFAULT_ZONE_CAPACITY,
-            last_updated=datetime.utcnow()
+            last_updated=datetime.utcnow(),
         )
         db.add(zone)
 
@@ -38,12 +71,12 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
 
     if occupancy_ratio >= settings.OCCUPANCY_ALERT_THRESHOLD:
         await create_alert(
-            db, 
-            alert_type="occupancy_full", 
-            camera_id=camera_id, 
-            zone_id=zone_id, 
+            db,
+            alert_type="capacity_exceeded",
+            camera_id=camera_id,
+            zone_id=zone_id,
             event_type="occupancy_update",
-            description=f"Zone {zone_id} is nearly full: {pct}% capacity ({zone.current_count}/{zone.max_capacity})"
+            description=f"Zone {zone_id} is nearly full: {pct}% ({zone.current_count}/{zone.max_capacity})",
         )
 
 async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
