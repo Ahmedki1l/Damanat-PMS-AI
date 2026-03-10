@@ -72,9 +72,7 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
                 await handle_violation_event(event, db)
 
         # ── PHASE 2 ───────────────────────────────────────────────────────────
-        
-        # ✅ UC1 + UC2 + UC4: ANPR gate events (Your UC2 is here)
-        # Process ANPR-specific logic (logging, unregistered alerts)
+        # UC1 + UC2 + UC4: ANPR gate events (JSON=AccessControllerEvent, XML=ANPR/vehicleMatchResult)
         if event.event_type in ("AccessControllerEvent", "ANPR", "vehicleMatchResult") and event.plate_number:
             await handle_anpr_event(event, db)
 

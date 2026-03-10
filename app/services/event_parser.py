@@ -246,6 +246,55 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
          else:
              logger.info(f"[DEBUG-ANPR] Extracted plate: {plate_number}")
 
+    event_type = find("eventType") or "unknown"
+    camera_id = settings.CAMERA_IP_MAP.get(camera_ip, f"UNKNOWN-{camera_ip}")
+
+    # ── ANPR XML debug: dump full XML so we can see the actual structure ──
+    if event_type in ("ANPR", "vehicleMatchResult"):
+        logger.warning(
+            f"[ANPR-DEBUG] camera={camera_id} ip={camera_ip} type={event_type} "
+            f"--- RAW XML START ---\n{xml_str}\n--- RAW XML END ---"
+        )
+
+    # ── ANPR XML extraction: try common Hikvision plate paths ──
+    plate_number = None
+    gate = None
+    if event_type in ("ANPR", "vehicleMatchResult"):
+        detection_target = "vehicle"
+        # Determine gate from camera config
+        cam_config = settings.CAMERAS.get(camera_id, {})
+        gate = cam_config.get("gate")
+        region_id = gate  # entry | exit
+
+        # Try all known Hikvision ANPR XML paths for plate number
+        plate_paths = [
+            # ANPR event: <ANPR><licensePlate>
+            f".//{ns}ANPR/{ns}licensePlate" if ns else ".//ANPR/licensePlate",
+            # Direct licensePlate
+            f".//{ns}licensePlate" if ns else ".//licensePlate",
+            # plateNumber (some firmware versions)
+            f".//{ns}plateNumber" if ns else ".//plateNumber",
+            # VehicleMatchResult paths
+            f".//{ns}VehicleInfo/{ns}plateNumber" if ns else ".//VehicleInfo/plateNumber",
+            f".//{ns}VehicleInfo/{ns}plate" if ns else ".//VehicleInfo/plate",
+            # AccessControllerEvent inside XML
+            f".//{ns}AccessControllerEvent/{ns}cardNo" if ns else ".//AccessControllerEvent/cardNo",
+            # Generic plate/cardNo anywhere
+            f".//{ns}cardNo" if ns else ".//cardNo",
+            f".//{ns}plate" if ns else ".//plate",
+        ]
+        for path in plate_paths:
+            el = root.find(path)
+            if el is not None and el.text and el.text.strip():
+                plate_number = el.text.strip()
+                logger.info(f"[ANPR-DEBUG] Found plate '{plate_number}' at path: {path}")
+                break
+
+        if not plate_number:
+            logger.warning(
+                f"[ANPR-DEBUG] No plate found in any known path for {event_type} from {camera_id}"
+            )
+
     return ParsedCameraEvent(
         camera_id=resolved_camera_id,
         device_serial=find_text("deviceSerial") or "unknown",
