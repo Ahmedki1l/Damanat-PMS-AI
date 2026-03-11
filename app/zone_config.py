@@ -18,6 +18,9 @@ from app.config import settings
 class ZoneNames:
     """Canonical zone-name constants - single source of truth."""
 
+    # Shared zone — not an alert trigger, used for zone resolution only
+    PARKING_AREA = "parking-area"
+
     class Violation:
         RESTRICTED_VIP  = "restricted-vip"
         NO_PARKING_ZONE = "no-parking-zone"
@@ -28,6 +31,14 @@ class ZoneNames:
         EMERGENCY_EXIT   = "emergency-exit"
         STAFF_ONLY_AREA  = "staff-only-area"
         AFTER_HOURS_ZONE = "after-hours-zone"
+
+
+# Zones that are mapped for region-slot resolution but must NEVER trigger
+# an intrusion or violation alert. Both services use explicit allow-lists,
+# so these zones are already silently dropped — this set makes it explicit.
+OBSERVATION_ONLY_ZONES: set[str] = {
+    ZoneNames.PARKING_AREA,  # normal parking rows — monitored for occupancy only
+}
 
 
 # ---------------------------------------------------------------------------
@@ -42,68 +53,108 @@ class ZoneNames:
 
 ZONE_MAPPING: dict[str, dict[str, str]] = {
 
-    # -- Violation cameras (line crossing / restricted zones) ---------------
+    # ── Violation cameras (GF / B1 / B2 entrances, exits, line-crossing) ─────
+
+    # CAM-01 · GF-ENTRANCE-INTERNAL
+    "CAM-01": {
+        "zone1": ZoneNames.Violation.RESTRICTED_VIP,
+        "zone2": ZoneNames.Violation.EMERGENCY_EXIT,
+        "zone3": ZoneNames.Violation.NO_PARKING_ZONE,
+        "zone4": ZoneNames.Violation.LOADING_BAY,
+    },
+    # CAM-02 · GF-WAITING
+    "CAM-02": {
+        "zone1": ZoneNames.Violation.NO_PARKING_ZONE,
+        "zone2": ZoneNames.Violation.RESTRICTED_VIP,
+        "zone3": ZoneNames.Violation.LOADING_BAY,
+        "zone4": ZoneNames.Violation.EMERGENCY_EXIT,
+    },
+    # CAM-03 · B1-ENTRANCE-INTERNAL
+    "CAM-03": {
+        "zone1": ZoneNames.Violation.LOADING_BAY,
+        "zone2": ZoneNames.Violation.NO_PARKING_ZONE,
+        "zone3": ZoneNames.Violation.RESTRICTED_VIP,
+        "zone4": ZoneNames.Violation.EMERGENCY_EXIT,
+    },
+    # CAM-04 · B1-PARKING (primary violation cam)
     "CAM-04": {
         "zone1": ZoneNames.Violation.RESTRICTED_VIP,
         "zone2": ZoneNames.Violation.NO_PARKING_ZONE,
         "zone3": ZoneNames.Violation.EMERGENCY_EXIT,
         "zone4": ZoneNames.Violation.LOADING_BAY,
     },
-    "CAM-02": {
-        "zone1": ZoneNames.Violation.RESTRICTED_VIP,
-        "zone2": ZoneNames.Violation.NO_PARKING_ZONE,
-        "zone3": ZoneNames.Violation.EMERGENCY_EXIT,
-        "zone4": ZoneNames.Violation.LOADING_BAY,
+    # CAM-08 · B1-EXIT-INTERNAL
+    "CAM-08": {
+        "zone1": ZoneNames.Violation.EMERGENCY_EXIT,
+        "zone2": ZoneNames.Violation.LOADING_BAY,
+        "zone3": ZoneNames.Violation.RESTRICTED_VIP,
+        "zone4": ZoneNames.Violation.NO_PARKING_ZONE,
+    },
+    # CAM-10 · B2-EXIT-INTERNAL
+    "CAM-10": {
+        "zone1": ZoneNames.Violation.NO_PARKING_ZONE,
+        "zone2": ZoneNames.Violation.EMERGENCY_EXIT,
+        "zone3": ZoneNames.Violation.LOADING_BAY,
+        "zone4": ZoneNames.Violation.RESTRICTED_VIP,
     },
 
-    # -- Intrusion cameras (field detection / after-hours zones) ------------
-    "CAM-14": {
-        "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
-        "zone2": ZoneNames.Intrusion.STAFF_ONLY_AREA,
-        "zone3": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
-        "zone4": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
-    },
-    "CAM-13": {
-        "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
-        "zone2": ZoneNames.Intrusion.STAFF_ONLY_AREA,
-        "zone3": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
-        "zone4": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
-    },
-    "CAM-12": {
-        "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
-        "zone2": ZoneNames.Intrusion.STAFF_ONLY_AREA,
-        "zone3": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
-        "zone4": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
-    },
-    "CAM-11": {
-        "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
-        "zone2": ZoneNames.Intrusion.STAFF_ONLY_AREA,
-        "zone3": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
-        "zone4": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
-    },
-    "CAM-09": {
-        "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
-        "zone2": ZoneNames.Intrusion.STAFF_ONLY_AREA,
-        "zone3": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
-        "zone4": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
-    },
-    "CAM-07": {
-        "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
-        "zone2": ZoneNames.Intrusion.STAFF_ONLY_AREA,
-        "zone3": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
-        "zone4": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
-    },
-    "CAM-06": {
-        "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
-        "zone2": ZoneNames.Intrusion.STAFF_ONLY_AREA,
-        "zone3": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
-        "zone4": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
-    },
+    # ── Intrusion cameras (B1 / B2 parking floors) ───────────────────────────
+
+    # CAM-05 · B1-PARKING
     "CAM-05": {
         "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
         "zone2": ZoneNames.Intrusion.STAFF_ONLY_AREA,
         "zone3": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
+        "zone4": ZoneNames.PARKING_AREA,
+    },
+    # CAM-06 · B1-PARKING
+    "CAM-06": {
+        "zone1": ZoneNames.Intrusion.STAFF_ONLY_AREA,
+        "zone2": ZoneNames.Intrusion.EMERGENCY_EXIT,
+        "zone3": ZoneNames.PARKING_AREA,
         "zone4": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
+    },
+    # CAM-07 · B1-PARKING
+    "CAM-07": {
+        "zone1": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
+        "zone2": ZoneNames.Intrusion.EMERGENCY_EXIT,
+        "zone3": ZoneNames.Intrusion.STAFF_ONLY_AREA,
+        "zone4": ZoneNames.PARKING_AREA,
+    },
+    # CAM-09 · B2-PARKING
+    "CAM-09": {
+        "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
+        "zone2": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
+        "zone3": ZoneNames.Intrusion.STAFF_ONLY_AREA,
+        "zone4": ZoneNames.PARKING_AREA,
+    },
+    # CAM-11 · B2-PARKING
+    "CAM-11": {
+        "zone1": ZoneNames.Intrusion.STAFF_ONLY_AREA,
+        "zone2": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
+        "zone3": ZoneNames.PARKING_AREA,
+        "zone4": ZoneNames.Intrusion.EMERGENCY_EXIT,
+    },
+    # CAM-12 · B2-PARKING
+    "CAM-12": {
+        "zone1": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
+        "zone2": ZoneNames.Intrusion.STAFF_ONLY_AREA,
+        "zone3": ZoneNames.Intrusion.EMERGENCY_EXIT,
+        "zone4": ZoneNames.PARKING_AREA,
+    },
+    # CAM-13 · B2-PARKING
+    "CAM-13": {
+        "zone1": ZoneNames.PARKING_AREA,
+        "zone2": ZoneNames.Intrusion.EMERGENCY_EXIT,
+        "zone3": ZoneNames.Intrusion.STAFF_ONLY_AREA,
+        "zone4": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
+    },
+    # CAM-14 · B2-PARKING
+    "CAM-14": {
+        "zone1": ZoneNames.Intrusion.STAFF_ONLY_AREA,
+        "zone2": ZoneNames.PARKING_AREA,
+        "zone3": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
+        "zone4": ZoneNames.Intrusion.EMERGENCY_EXIT,
     },
 }
 
