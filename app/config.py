@@ -13,6 +13,12 @@ class Settings(BaseSettings):
     # ── Database ──────────────────────────────────────────────────────────
     DATABASE_URL: str = "postgresql://damanat:damanat@localhost:5432/damanat_db"
 
+    @property
+    def db_url(self) -> str:
+        """Return DATABASE_URL with correct prefix for SQLAlchemy.
+        Render provides postgres:// — SQLAlchemy 2.0 requires postgresql://."""
+        return self.DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
     # ── Network ───────────────────────────────────────────────────────────
     BACKEND_IP: str = "5.5.5.1"
     BACKEND_PORT: int = 8080
