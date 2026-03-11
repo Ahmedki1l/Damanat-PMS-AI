@@ -19,13 +19,49 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
     Route event to handlers and commit as a single transaction.
     Protects UC3 and UC2 logic while maintaining teammates' UC5/UC6 work.
     """
-    # Fetch snapshot first so the CDN URL is available for CameraEvent + Alert records
-    SNAPSHOT_EVENT_TYPES = ("fielddetection", "linedetection", "regionEntrance", "AccessControllerEvent")
+    # Snapshot strategy (priority order):
+    # 1. If multipart detection frame was saved locally → upload to Spaces → CDN URL
+    # 2. If no multipart image → try fetching fresh snapshot from camera
+    # 3. If camera is unreachable too → leave snapshot_path as None
+    SNAPSHOT_EVENT_TYPES = (
+        "fielddetection", "linedetection", "regionEntrance",
+        "AccessControllerEvent", "vehicleMatchResult", "ANPR",
+    )
     if event.event_type in SNAPSHOT_EVENT_TYPES:
-        try:
-            event.snapshot_path = await fetch_snapshot(event.camera_id, event.event_type)
-        except Exception as e:
-            logger.warning(f"Snapshot fetch failed for {event.camera_id}: {e}")
+        # Step 1: Upload the multipart detection frame (the actual evidence) to Spaces
+        if (
+            event.snapshot_path
+            and settings.STORAGE_MODE == "spaces"
+            and not event.snapshot_path.startswith("http")
+        ):
+            try:
+                import os
+                from app.utils.spaces_client import upload_image
+                local_path = event.snapshot_path
+                if os.path.exists(local_path):
+                    with open(local_path, "rb") as _f:
+                        _image_bytes = _f.read()
+                    _filename = os.path.basename(local_path)
+                    cdn_url = upload_image(_image_bytes, _filename)
+                    if cdn_url:
+                        event.snapshot_path = cdn_url
+                        logger.info(f"[Spaces] Multipart image uploaded: {cdn_url}")
+                    else:
+                        event.snapshot_path = None  # don't store local path in DB
+                else:
+                    event.snapshot_path = None
+            except Exception as e:
+                logger.warning(f"Multipart upload to Spaces failed for {event.camera_id}: {e}")
+                event.snapshot_path = None
+
+        # Step 2: No CDN URL yet — try fetching a fresh snapshot from the camera
+        if not event.snapshot_path or not event.snapshot_path.startswith("http"):
+            try:
+                fresh = await fetch_snapshot(event.camera_id, event.event_type)
+                if fresh:
+                    event.snapshot_path = fresh
+            except Exception as e:
+                logger.warning(f"Snapshot fetch failed for {event.camera_id}: {e}")
 
     try:
         logger.debug(f"[dispatch] type={event.event_type!r} camera={event.camera_id} plate={event.plate_number!r}")

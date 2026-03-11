@@ -1,9 +1,9 @@
 """
 Phase 2: UC1 (Entry/Exit Counting), UC2 (Parking Time), and UC4 (Vehicle ID).
-Handles AccessControllerEvent from ANPR cameras.
+Handles AccessControllerEvent / vehicleMatchResult / ANPR from ANPR cameras.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from app.models.entry_exit_log import EntryExitLog
 from app.services import vehicle_service
@@ -26,6 +26,24 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
 
     if not plate:
         logger.warning(f"[Phase2] ANPR event with no plate from {event.camera_id} - skipped")
+        return
+
+    # Deduplication: the ANPR camera pushes two events per detection —
+    # one ANPR XML (multipart) and one vehicleMatchResult JSON.
+    # Suppress the second if the same plate + gate was logged within 30 seconds.
+    event_time = event.trigger_time or datetime.utcnow()
+    dedup_window = event_time - timedelta(seconds=30)
+    recent = (
+        db.query(EntryExitLog)
+        .filter(
+            EntryExitLog.plate_number == plate,
+            EntryExitLog.gate == gate,
+            EntryExitLog.event_time >= dedup_window,
+        )
+        .first()
+    )
+    if recent:
+        logger.info(f"[UC1] Duplicate suppressed for plate={plate} gate={gate} (already logged at {recent.event_time})")
         return
 
     # UC4: Resolve vehicle identity via vehicle_service
