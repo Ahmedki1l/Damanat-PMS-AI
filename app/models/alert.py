@@ -6,6 +6,7 @@ Used by violation_service, intrusion_service, occupancy_service, and entry_exit_
 
 from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean
 from app.database import Base
+from app.zone_config import resolve_zone
 
 
 class Alert(Base):
@@ -26,6 +27,10 @@ class Alert(Base):
 
     @property
     def zone_name(self):
+        if self.region_id is not None:
+            resolved = resolve_zone(self.camera_id, self.region_id)
+            if resolved:
+                return resolved
         return self.zone_id
 
     def __repr__(self):
