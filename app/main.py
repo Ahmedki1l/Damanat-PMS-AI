@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from app.routers import (
     events, occupancy, violations, intrusion, 
-    health, alerts, vehicles, entry_exit, parking_stats
+    health, alerts, vehicles, entry_exit, parking_stats, camera_filter
 )
 from app.database import create_tables 
 from app.config import settings
@@ -41,7 +41,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         open_paths = {
             "/api/v1/events/camera", "/api/v1/health", "/docs", 
-            "/redoc", "/openapi.json", "/api/v1/alerts"
+            "/redoc", "/openapi.json", "/api/v1/alerts", "/api/v1/camera-filter"
         }
         open_prefixes = ("/api/v1/intrusions", "/api/v1/violations")
         
@@ -90,6 +90,7 @@ app.include_router(violations.router,    prefix="/api/v1", tags=["🚨 Violation
 app.include_router(intrusion.router,     prefix="/api/v1", tags=["🔒 Intrusion — UC6"])
 app.include_router(health.router,        prefix="/api/v1", tags=["💚 Health"])
 app.include_router(alerts.router,        prefix="/api/v1", tags=["🔔 Alerts"])
+app.include_router(camera_filter.router, prefix="/api/v1", tags=["📷 Camera Filter"])
 
 # Phase 2 Routers (Active Now)
 app.include_router(entry_exit.router,    prefix="/api/v1", tags=["🚗 Entry/Exit — UC1"])

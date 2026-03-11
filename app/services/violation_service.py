@@ -64,3 +64,23 @@ async def handle_violation_event(event: ParsedCameraEvent, db: Session):
     logger.warning(f"[UC5] VIOLATION: {desc}")
     alert_zone_id = settings.CAMERA_ZONE_MAP.get(event.camera_id, zone_id)
     await create_alert(db, "violation", event.camera_id, alert_zone_id, event.event_type, desc)
+
+
+async def resolve_violation_on_exit(camera_id: str, zone_id: str, db: Session):
+    """Auto-resolve the latest open violation when vehicle exits the restricted zone."""
+    alert = (
+        db.query(Alert)
+        .filter(
+            Alert.camera_id == camera_id,
+            Alert.zone_id == zone_id,
+            Alert.is_resolved == False,
+        )
+        .order_by(Alert.triggered_at.desc())
+        .first()
+    )
+    if alert:
+        alert.is_resolved = True
+        alert.resolved_at = datetime.utcnow()
+        db.commit()
+        logger.info(f"[ViolationService] Auto-resolved violation {alert.id} — vehicle exited {zone_id}")
+    

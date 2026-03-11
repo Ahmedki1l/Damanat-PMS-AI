@@ -205,6 +205,7 @@ class Settings(BaseSettings):
     RESTRICTED_ZONES: str = "restricted-vip,no-parking-zone,emergency-exit,loading-bay"
     MONITORED_INTRUSION_ZONES: str = "emergency-exit,staff-only-area,after-hours-zone"
     ALWAYS_VIOLATION_EVENTS: str = "linedetection"
+    CAMERA_REGION_ZONE_MAP: str = ""  # e.g. CAM-04:0=emergency-exit;CAM-04:1=restricted-vip
 
     # ── Thresholds ────────────────────────────────────────────────────────
     OCCUPANCY_ALERT_THRESHOLD: float = 0.90
@@ -236,6 +237,9 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         extra = "ignore"
+
+    LOG_CAMERA_FILTER: str = ""
+    LOG_CAMERA_EXCLUDE: str = ""
 
 
 settings = Settings()
