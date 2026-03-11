@@ -12,15 +12,17 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 async def create_alert(
-    db: Session, 
-    alert_type: str, 
-    camera_id: str, 
-    zone_id: str, 
-    event_type: str, 
-    description: str
+    db: Session,
+    alert_type: str,
+    camera_id: str,
+    zone_id: str,
+    event_type: str,
+    description: str,
+    snapshot_path: str | None = None,
 ):
     """
-    Create an alert record in the database. 
+    Create an alert record in the database.
+    snapshot_path: CDN URL or local file path for the evidence image.
     Note: The caller (event_dispatcher) is responsible for committing the transaction.
     """
     try:
@@ -30,6 +32,7 @@ async def create_alert(
             zone_id=zone_id,
             event_type=event_type,
             description=description,
+            snapshot_path=snapshot_path,
             is_resolved=False,
             triggered_at=datetime.utcnow()
         )

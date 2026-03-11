@@ -17,6 +17,8 @@ class Alert(Base):
     zone_id = Column(String(100))
     event_type = Column(String(100))
     description = Column(Text)
+    snapshot_path = Column(Text, nullable=True)   # CDN URL (Spaces) or local path
+    is_test = Column(Boolean, default=False, nullable=False)  # True for simulated/test events
     is_resolved = Column(Boolean, default=False, nullable=False)
     triggered_at = Column(DateTime, nullable=False, index=True)
     resolved_at = Column(DateTime)

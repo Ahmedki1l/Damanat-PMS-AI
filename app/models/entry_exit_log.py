@@ -5,7 +5,7 @@ Records every vehicle entry and exit event from ANPR cameras.
 Matched pairs are used to calculate parking duration.
 """
 
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, Boolean
 from app.database import Base
 
 
@@ -20,7 +20,9 @@ class EntryExitLog(Base):
     camera_id = Column(String(50), nullable=False)
     event_time = Column(DateTime, nullable=False, index=True)
     parking_duration = Column(Integer)        # seconds (set on exit)
+    snapshot_path = Column(Text, nullable=True)  # CDN URL (Spaces) or local path
     matched_entry_id = Column(Integer, ForeignKey("entry_exit_log.id", ondelete="SET NULL"))
+    is_test = Column(Boolean, default=False, nullable=False)  # True for simulated/test events
     created_at = Column(DateTime)
 
     def __repr__(self):

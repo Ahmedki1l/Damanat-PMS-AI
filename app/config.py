@@ -236,6 +236,15 @@ class Settings(BaseSettings):
     OCCUPANCY_ENTRANCE_ZONES: List[str] = ["1"]
     OCCUPANCY_EXIT_ZONES: List[str] = ["2"]
 
+    # ── Storage ───────────────────────────────────────────────────────────
+    STORAGE_MODE: str = "local"          # "local" or "spaces"
+    DO_SPACES_KEY: str = ""
+    DO_SPACES_SECRET: str = ""
+    DO_SPACES_ENDPOINT: str = ""         # e.g. sfo3.digitaloceanspaces.com
+    DO_SPACES_BUCKET: str = ""
+    DO_SPACES_REGION: str = ""
+    DO_SPACES_CDN_URL: str = ""          # e.g. https://bucket.sfo3.cdn.digitaloceanspaces.com
+
     # ── Logging ───────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 
