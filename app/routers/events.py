@@ -40,7 +40,12 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
         event = parse_camera_event(raw_body, camera_ip, content_type)
         # logger.info(f"Parsed Event: type={event.event_type} | camera={event.camera_id} | plate={event.plate_number}") # Moved to dispatcher/parser
 
-        # 2. Persist raw event log (skip high-frequency VMD noise)
+        # 2. Dispatch to handlers (UC1–UC6) — this also fetches the snapshot
+        #    and sets event.snapshot_path before we persist records.
+        await dispatch_event(event, db)
+
+        # 3. Persist raw event log (skip high-frequency VMD noise)
+        #    Done AFTER dispatch so event.snapshot_path contains the CDN URL.
         from app.models.camera_event import CameraEvent
         if event.event_type != "VMD":
             db.add(CameraEvent(
@@ -58,9 +63,6 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
                 raw_payload=event.raw_xml,
                 created_at=datetime.utcnow(),
             ))
-
-        # 3. Dispatch to handlers (UC1 through UC6)
-        await dispatch_event(event, db)
 
         # 4. Commit — router owns the transaction, not the dispatcher
         db.commit()

@@ -5,7 +5,7 @@ Stores every event received from all cameras, regardless of type.
 Used for audit trail, debugging, and event replay.
 """
 
-from sqlalchemy import Column, Integer, String, DateTime, Text
+from sqlalchemy import Column, Integer, String, DateTime, Text, Boolean
 from app.database import Base
 
 
@@ -23,8 +23,9 @@ class CameraEvent(Base):
     region_id = Column(String(100))
     channel_name = Column(String(100))
     trigger_time = Column(DateTime)
-    snapshot_path = Column(String(500))        # path to saved snapshot image
+    snapshot_path = Column(String(500))        # CDN URL (Spaces) or local path
     raw_payload = Column(Text)
+    is_test = Column(Boolean, default=False, nullable=False)  # True for simulated/test events
     created_at = Column(DateTime, nullable=False, index=True)
 
     def __repr__(self):

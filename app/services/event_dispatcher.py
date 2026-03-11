@@ -19,6 +19,14 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
     Route event to handlers and commit as a single transaction.
     Protects UC3 and UC2 logic while maintaining teammates' UC5/UC6 work.
     """
+    # Fetch snapshot first so the CDN URL is available for CameraEvent + Alert records
+    SNAPSHOT_EVENT_TYPES = ("fielddetection", "linedetection", "regionEntrance", "AccessControllerEvent")
+    if event.event_type in SNAPSHOT_EVENT_TYPES:
+        try:
+            event.snapshot_path = await fetch_snapshot(event.camera_id, event.event_type)
+        except Exception as e:
+            logger.warning(f"Snapshot fetch failed for {event.camera_id}: {e}")
+
     try:
         logger.debug(f"[dispatch] type={event.event_type!r} camera={event.camera_id} plate={event.plate_number!r}")
 
@@ -105,10 +113,3 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
         db.rollback()
         logger.error(f"Dispatch failed, transaction rolled back: {e}", exc_info=True)
         raise
-
-    # Snapshot: Independent from DB transaction
-    if event.event_type in ("fielddetection", "linedetection", "regionEntrance", "AccessControllerEvent"):
-        try:
-            await fetch_snapshot(event.camera_id, event.event_type)
-        except Exception as e:
-            logger.warning(f"Snapshot fetch failed for {event.camera_id}: {e}")

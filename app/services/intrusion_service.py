@@ -106,5 +106,6 @@ async def handle_intrusion_event(event: ParsedCameraEvent, db: Session):
         zone_id=zone_id,
         event_type=event.event_type,
         description=description,
+        snapshot_path=event.snapshot_path,
         region_id=region_id,
     )

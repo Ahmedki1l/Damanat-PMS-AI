@@ -18,10 +18,12 @@ async def create_alert(
     zone_id: str,
     event_type: str,
     description: str,
+    snapshot_path: str | None = None,
     region_id: int | None = None,
 ):
     """
     Create an alert record in the database.
+    snapshot_path: CDN URL or local file path for the evidence image.
     Note: The caller (event_dispatcher) is responsible for committing the transaction.
     """
     try:
@@ -32,6 +34,7 @@ async def create_alert(
             region_id=region_id,
             event_type=event_type,
             description=description,
+            snapshot_path=snapshot_path,
             is_resolved=False,
             triggered_at=datetime.utcnow(),
         )

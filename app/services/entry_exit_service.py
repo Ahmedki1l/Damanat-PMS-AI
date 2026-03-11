@@ -42,6 +42,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         gate=gate,
         camera_id=event.camera_id,
         event_time=event.trigger_time or datetime.utcnow(),
+        snapshot_path=event.snapshot_path,
         created_at=datetime.utcnow(),
     )
 
@@ -87,6 +88,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
             zone_id=gate,
             event_type="AccessControllerEvent",
             description=f"Unregistered vehicle at {gate} gate: plate {plate}",
+            snapshot_path=event.snapshot_path,
         )
 
     if log_entry not in db.new:
