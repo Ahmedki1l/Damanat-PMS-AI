@@ -19,6 +19,7 @@ async def create_alert(
     event_type: str,
     description: str,
     snapshot_path: str | None = None,
+    region_id: int | None = None,
 ):
     """
     Create an alert record in the database.
@@ -30,19 +31,20 @@ async def create_alert(
             alert_type=alert_type,
             camera_id=camera_id,
             zone_id=zone_id,
+            region_id=region_id,
             event_type=event_type,
             description=description,
             snapshot_path=snapshot_path,
             is_resolved=False,
-            triggered_at=datetime.utcnow()
+            triggered_at=datetime.utcnow(),
         )
-        
+
         db.add(new_alert)
         logger.warning(f"[ALERT][{alert_type.upper()}] Cam: {camera_id} | Zone: {zone_id} | {description}")
-        
+
         # Future Expansion: Add push notifications or email triggers here
-        
+
     except Exception as e:
         logger.error(f"Failed to create alert: {e}", exc_info=True)
-        # We don't raise here to prevent the main event processing from failing 
+        # We don't raise here to prevent the main event processing from failing
         # just because the alert logging had an issue.

@@ -3,7 +3,8 @@
 
 from app.services.event_parser import ParsedCameraEvent
 from app.services.occupancy_service import handle_occupancy_event
-from app.services.violation_service import handle_violation_event, RESTRICTED_ZONES
+from app.services.violation_service import handle_violation_event, resolve_violation_on_exit, RESTRICTED_ZONES
+from app.zone_config import resolve_zone
 from app.services.intrusion_service import handle_intrusion_event, MONITORED_INTRUSION_ZONES
 from app.services.entry_exit_service import handle_anpr_event
 from app.services.snapshot_service import fetch_snapshot
@@ -36,15 +37,31 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
 
         is_gate = settings.CAMERAS.get(event.camera_id, {}).get("gate") in ("entry", "exit")
         is_occupancy_event = event.event_type in ("ANPR", "vehicleMatchResult", "AccessControllerEvent")
+        should_log = False
+    # Selective Logging: Only log gate events or smart events to reduce noise
+        include = {x.strip() for x in settings.LOG_CAMERA_FILTER.split(",") if x.strip()} if settings.LOG_CAMERA_FILTER else set()
+        exclude = {x.strip() for x in settings.LOG_CAMERA_EXCLUDE.split(",") if x.strip()} if settings.LOG_CAMERA_EXCLUDE else set()
 
-        # Selective Logging: Only log gate events or smart events to reduce noise
-        if is_gate or is_occupancy_event or event.event_type in ("fielddetection", "linedetection", "regionEntrance"):
+        if include:
+            should_log = event.camera_id in include
+        elif exclude:
+            should_log = event.camera_id not in exclude
+        else:
+            should_log = True
+
+        if should_log and (is_gate or is_occupancy_event or event.event_type in ("fielddetection", "linedetection", "regionEntrance")):
             logger.info(f"Event: type={event.event_type} | camera={event.camera_id} | plate={event.plate_number}")
+
 
         is_vehicle = event.detection_target in ("vehicle", None)
         is_human = event.detection_target in ("human", None)
+        resolved_zone = resolve_zone(event.camera_id, event.region_id)
         zone_id = event.region_id or ""
-
+        # Auto-resolve violations on exit from restricted zones
+        if event.event_type in ("regionExiting", "regionExit") and is_vehicle:
+            canonical_zone = resolved_zone or zone_id
+            if canonical_zone in RESTRICTED_ZONES:
+                await resolve_violation_on_exit(event.camera_id, canonical_zone, db)
         # ── PHASE 1 ───────────────────────────────────────────────────────────
         
         # ✅ UC3: Parking Occupancy
@@ -63,9 +80,10 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
         # ✅ UC5 & UC6: Violations and Intrusion (Teammates' Tasks)
         # Logic: Route based on zone lists to prevent double-firing
         if event.event_type in ("fielddetection", "regionEntrance") and is_vehicle:
-            if zone_id in MONITORED_INTRUSION_ZONES:
+            route_zone = resolved_zone or zone_id
+            if route_zone in MONITORED_INTRUSION_ZONES:
                 await handle_intrusion_event(event, db)
-            elif zone_id in RESTRICTED_ZONES:
+            elif route_zone in RESTRICTED_ZONES:
                 await handle_violation_event(event, db)
             elif not event.region_id:
                 # Fallback if no zone name: fire both, services will self-filter
