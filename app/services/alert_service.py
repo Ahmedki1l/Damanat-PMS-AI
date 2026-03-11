@@ -2,7 +2,6 @@
 """
 Shared alert creation service.
 Used by occupancy_service, violation_service, intrusion_service, and entry_exit_service.
-Extend here to add push notifications, SMS, email, etc.
 """
 
 from datetime import datetime
@@ -12,10 +11,37 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+async def create_alert(
+    db: Session,
+    alert_type: str,
+    camera_id: str,
+    zone_id: str,
+    event_type: str,
+    description: str,
+    region_id: int | None = None,
+):
+    """
+    Create an alert record in the database.
+    Note: The caller (event_dispatcher) is responsible for committing the transaction.
+    """
+    try:
+        new_alert = Alert(
+            alert_type=alert_type,
+            camera_id=camera_id,
+            zone_id=zone_id,
+            region_id=region_id,
+            event_type=event_type,
+            description=description,
+            is_resolved=False,
+            triggered_at=datetime.utcnow(),
+        )
 
-async def create_alert(db, alert_type, camera_id, zone_id, event_type, description):
-    """Create an alert record. Caller is responsible for committing the transaction."""
-    db.add(Alert(alert_type=alert_type, camera_id=camera_id, zone_id=zone_id,
-                 event_type=event_type, description=description,
-                 is_resolved=False, triggered_at=datetime.utcnow()))
-    logger.warning(f"[ALERT][{alert_type.upper()}] {description}")
+        db.add(new_alert)
+        logger.warning(f"[ALERT][{alert_type.upper()}] Cam: {camera_id} | Zone: {zone_id} | {description}")
+
+        # Future Expansion: Add push notifications or email triggers here
+
+    except Exception as e:
+        logger.error(f"Failed to create alert: {e}", exc_info=True)
+        # We don't raise here to prevent the main event processing from failing
+        # just because the alert logging had an issue.

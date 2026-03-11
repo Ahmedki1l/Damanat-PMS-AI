@@ -9,6 +9,8 @@ class AlertOut(BaseModel):
     alert_type: str
     camera_id: str
     zone_id: Optional[str]
+    zone_name: Optional[str]
+    region_id: Optional[int]
     event_type: Optional[str]
     description: Optional[str]
     is_resolved: bool

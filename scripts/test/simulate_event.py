@@ -13,6 +13,7 @@ XML_TEMPLATES = {
 <EventNotificationAlert version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
   <deviceSerial>TEST-SIM</deviceSerial><channelID>1</channelID>
   <triggerTime>{time}</triggerTime><eventType>fielddetection</eventType>
+  <ipAddress>{ip}</ipAddress>
   <eventDescription>Test</eventDescription>
   <DetectionRegionList><DetectionRegionEntry>
     <regionID>{zone}</regionID><detectionTarget>{target}</detectionTarget>
@@ -24,6 +25,7 @@ XML_TEMPLATES = {
 <EventNotificationAlert version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
   <deviceSerial>TEST-SIM</deviceSerial><channelID>1</channelID>
   <triggerTime>{time}</triggerTime><eventType>regionEntrance</eventType>
+  <ipAddress>{ip}</ipAddress>
   <eventDescription>Test</eventDescription>
   <DetectionRegionList><DetectionRegionEntry>
     <regionID>{zone}</regionID>
@@ -34,6 +36,7 @@ XML_TEMPLATES = {
 <EventNotificationAlert version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
   <deviceSerial>TEST-SIM</deviceSerial><channelID>1</channelID>
   <triggerTime>{time}</triggerTime><eventType>regionExiting</eventType>
+  <ipAddress>{ip}</ipAddress>
   <eventDescription>Test</eventDescription>
   <DetectionRegionList><DetectionRegionEntry>
     <regionID>{zone}</regionID>
@@ -44,6 +47,7 @@ XML_TEMPLATES = {
 <EventNotificationAlert version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
   <deviceSerial>TEST-SIM</deviceSerial><channelID>1</channelID>
   <triggerTime>{time}</triggerTime><eventType>linedetection</eventType>
+  <ipAddress>{ip}</ipAddress>
   <eventDescription>Test</eventDescription>
   <DetectionRegionList><DetectionRegionEntry>
     <regionID>{zone}</regionID><detectionTarget>{target}</detectionTarget>
@@ -72,11 +76,11 @@ JSON_ANPR_TEMPLATE = {
 def simulate_xml(event_type, zone, target, source_ip):
     body = XML_TEMPLATES[event_type].format(
         time=datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
-        zone=zone, target=target,
+        zone=zone, target=target, ip=source_ip
     )
     resp = requests.post(BACKEND_URL, data=body.encode(),
                          headers={"Content-Type": "application/xml",
-                                  "X-Forwarded-For": source_ip}, timeout=10)
+                                  "X-Forwarded-For": source_ip}, timeout=30)  # 30s: snapshot takes 4-8s
     print(f"✅ {event_type} (XML) → HTTP {resp.status_code}: {resp.json()}")
 
 
@@ -86,7 +90,7 @@ def simulate_anpr(plate, gate_ip):
     payload["AccessControllerEvent"]["cardNo"] = plate
     resp = requests.post(BACKEND_URL, json=payload,
                          headers={"Content-Type": "application/json",
-                                  "X-Forwarded-For": gate_ip}, timeout=10)
+                                  "X-Forwarded-For": gate_ip}, timeout=30)  # 30s: snapshot takes 4-8s
     print(f"✅ ANPR (JSON) plate={plate} gate={gate_ip} → HTTP {resp.status_code}: {resp.json()}")
 
 
@@ -94,7 +98,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Simulate camera events for testing")
     parser.add_argument("--event", default="fielddetection",
                         choices=list(XML_TEMPLATES.keys()) + ["anpr"])
-    parser.add_argument("--zone", default="zone-A")
+    parser.add_argument("--zone", default="1")
     parser.add_argument("--target", default="vehicle")
     parser.add_argument("--ip", default="192.168.1.103")
     parser.add_argument("--plate", default="ABC-1234")
