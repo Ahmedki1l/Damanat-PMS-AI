@@ -91,3 +91,21 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
 
     if log_entry not in db.new:
         db.add(log_entry)
+
+    # Forward parking-time events to Node.js backend (fire-and-forget)
+    try:
+        from app.utils import core_backend_client
+        event_time = log_entry.event_time or datetime.utcnow()
+        if gate == "entry":
+            await core_backend_client.notify_entry(
+                plate, event.camera_id, event_time,
+                vehicle_type=vehicle_type,
+                image_url=event.snapshot_path,
+            )
+        elif gate == "exit":
+            await core_backend_client.notify_exit(
+                plate, event.camera_id, event_time,
+                image_url=event.snapshot_path,
+            )
+    except Exception as e:
+        logger.warning(f"[UC1] Node.js backend notification failed for plate={plate}: {e}")
