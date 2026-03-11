@@ -290,7 +290,10 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
                 logger.info(f"[ANPR-DEBUG] Found plate '{plate_number}' at path: {path}")
                 break
 
-        if not plate_number:
+        if plate_number:
+            plate_number = _normalize_plate(plate_number)
+            logger.info(f"[ANPR] Normalized plate: {plate_number} ({camera_id})")
+        else:
             logger.warning(
                 f"[ANPR-DEBUG] No plate found in any known path for {event_type} from {camera_id}"
             )
@@ -312,8 +315,42 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
     )
 
 
+def _normalize_plate(raw: str) -> str:
+    """
+    Normalize Saudi plate format from camera output to display format.
+    Examples: "9444HUD" → "HUD-9444",  "7800ERD" → "ERD-7800"
+    Returns None for unknown/partial/invalid plates.
+    """
+    if not raw:
+        return None
+    raw = raw.strip().upper()
+
+    # Camera explicitly couldn't read the plate
+    if raw in ("UNKNOWN", "N/A", "NONE", "NULL", ""):
+        return None
+
+    # Already normalised (e.g. "HUD-9444") — validate full format 3 letters + 4 digits
+    if "-" in raw:
+        m = re.match(r"^([A-Z]{2,3})-(\d{3,4})$", raw)
+        return raw if m else None
+
+    # Saudi format: 1-4 digits then 2-3 letters  e.g. "9444HUD", "7HDU"
+    m = re.match(r"^(\d{1,4})([A-Z]{2,3})$", raw)
+    if m:
+        return f"{m.group(2)}-{m.group(1)}"
+
+    # Letters then digits  e.g. "HUD9444", "HDU7"
+    m = re.match(r"^([A-Z]{2,3})(\d{1,4})$", raw)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+
+    # Partial or unrecognised — reject
+    logger.debug(f"[ANPR] Rejected partial/invalid plate: {raw!r}")
+    return None
+
+
 def _parse_json_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
-    """Parse Phase 2 JSON events (AccessControllerEvent from ANPR cameras)."""
+    """Parse Phase 2 JSON events (AccessControllerEvent / vehicleMatchResult from ANPR cameras)."""
     try:
         data = json.loads(raw_body.decode("utf-8", errors="replace"))
     except json.JSONDecodeError as e:
@@ -330,25 +367,47 @@ def _parse_json_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
             pass
 
     acs = data.get("AccessControllerEvent", {})
-    camera_id = settings.CAMERA_IP_MAP.get(camera_ip, f"UNKNOWN-{camera_ip}")
+    vmr = data.get("VehicleMatchResult", {})
+
+    # Prefer the ipAddress declared inside the JSON body over the HTTP source IP.
+    # This handles NAT/proxy scenarios where the HTTP client IP differs from the camera IP.
+    json_ip = data.get("ipAddress") or camera_ip
+    camera_id = (
+        settings.CAMERA_IP_MAP.get(json_ip)
+        or settings.CAMERA_IP_MAP.get(camera_ip)
+        or f"UNKNOWN-{camera_ip}"
+    )
 
     # Determine gate direction from camera config in settings
     cam_config = settings.CAMERAS.get(camera_id, {})
     gate = cam_config.get("gate")  # "entry" or "exit"
+
+    # Extract plate — check both event structures:
+    #   AccessControllerEvent → cardNo
+    #   VehicleMatchResult    → PlateInfo.plate
+    raw_plate = (
+        acs.get("cardNo")
+        or vmr.get("PlateInfo", {}).get("plate")
+    )
+    plate_number = _normalize_plate(raw_plate) if raw_plate else None
+
+    if plate_number:
+        logger.info(f"[ANPR] Extracted plate: {raw_plate!r} → {plate_number!r} ({camera_id})")
+    else:
+        logger.warning(f"[ANPR] No plate found in JSON event from {camera_id}")
 
     return ParsedCameraEvent(
         camera_id=camera_id,
         device_serial=data.get("deviceSerial", data.get("deviceID", "unknown")),
         channel_id=data.get("channelID", 1),
         event_type=data.get("eventType", "unknown"),
-        detection_target="vehicle",   # ANPR is strictly vehicle-based
-        region_id=gate,               # Using gate as the region identifier
-        channel_name=acs.get("deviceName"),
+        detection_target="vehicle",
+        region_id=gate,
+        channel_name=acs.get("deviceName") or data.get("channelName"),
         trigger_time=trigger_time,
         raw_xml=raw_body.decode("utf-8", errors="replace"),
-        # Phase 2 Specifics
-        plate_number=acs.get("cardNo"),
-        user_type=acs.get("userType"),
+        plate_number=plate_number,
+        user_type=acs.get("userType") or vmr.get("listType"),
         person_name=acs.get("name"),
         employee_id=acs.get("employeeNoString"),
         gate=gate,
