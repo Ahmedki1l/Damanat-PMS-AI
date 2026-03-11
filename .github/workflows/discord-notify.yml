@@ -1,0 +1,88 @@
+name: Discord Notifications
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+      - master
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+  issues:
+    types: [opened, edited, assigned, reopened]
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  notify-discord:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare payload
+        id: prep
+        run: |
+          EVENT_NAME="${{ github.event_name }}"
+          ACTOR="${{ github.actor }}"
+          REPO="${{ github.repository }}"
+          URL="${{ github.event.pull_request.html_url || github.event.comment.html_url || github.event.issue.html_url || github.server_url }}/${{ github.repository }}"
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            TITLE="Push to $REPO"
+            DESCRIPTION="${{ github.actor }} pushed to **${{ github.ref_name }}**\nCommit: ${{ github.sha }}"
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            ACTION="${{ github.event.action }}"
+            NUMBER="${{ github.event.number }}"
+            TITLE="PR #${NUMBER} $ACTION in $REPO"
+            DESCRIPTION="Title: ${{ github.event.pull_request.title }}\nBy: $ACTOR\nState: ${{ github.event.pull_request.state }}"
+            URL="${{ github.event.pull_request.html_url }}"
+          elif [ "$EVENT_NAME" = "issues" ]; then
+            ACTION="${{ github.event.action }}"
+            NUMBER="${{ github.event.issue.number }}"
+            TITLE="Issue #${NUMBER} $ACTION in $REPO"
+            DESCRIPTION="Title: ${{ github.event.issue.title }}\nBy: $ACTOR\nAssignee: ${{ github.event.issue.assignee.login || 'none' }}"
+            URL="${{ github.event.issue.html_url }}"
+          elif [ "$EVENT_NAME" = "issue_comment" ]; then
+            TITLE="New comment on PR/Issue in $REPO"
+            DESCRIPTION="By: $ACTOR\nComment: ${{ github.event.comment.body }}"
+          elif [ "$EVENT_NAME" = "pull_request_review" ]; then
+            TITLE="PR Review submitted in $REPO"
+            DESCRIPTION="By: $ACTOR\nState: ${{ github.event.review.state }}\nPR: #${{ github.event.pull_request.number }}"
+            URL="${{ github.event.pull_request.html_url }}"
+          elif [ "$EVENT_NAME" = "pull_request_review_comment" ]; then
+            TITLE="New review comment on PR in $REPO"
+            DESCRIPTION="By: $ACTOR\nComment: ${{ github.event.comment.body }}"
+          else
+            TITLE="GitHub event in $REPO"
+            DESCRIPTION="Event: $EVENT_NAME by $ACTOR"
+          fi
+
+          # Escape double quotes in DESCRIPTION
+          SAFE_DESCRIPTION=$(printf '%s' "$DESCRIPTION" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read())[1:-1])')
+
+          cat << EOF > payload.json
+          {
+            "username": "Damanat-PMS-AI Bot",
+            "embeds": [
+              {
+                "title": "$TITLE",
+                "description": "$SAFE_DESCRIPTION",
+                "url": "$URL",
+                "color": 5814783,
+                "timestamp": "${{ github.event.head_commit.timestamp || github.event.pull_request.updated_at || github.event.comment.created_at || github.event.review.submitted_at || github.event.repository.pushed_at }}"
+              }
+            ]
+          }
+          EOF
+
+      - name: Send to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL not set; skipping notification"
+            exit 0
+          fi
+          curl -X POST -H 'Content-Type: application/json' -d @payload.json "$DISCORD_WEBHOOK_URL"
