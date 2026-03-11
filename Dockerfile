@@ -15,4 +15,5 @@ RUN mkdir -p logs
 
 EXPOSE 8080
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "2"]
+# Use gunicorn + uvicorn workers for proper request timeout support
+CMD ["sh", "-c", "gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 2 --timeout 30 --bind 0.0.0.0:${PORT:-8080}"]

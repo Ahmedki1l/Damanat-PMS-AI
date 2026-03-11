@@ -1,0 +1,116 @@
+services:
+  - type: web
+    name: damanat-pms-ai
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/v1/health
+    envVars:
+      # ── Database (auto-filled from Render managed DB) ──────────────────
+      - key: DATABASE_URL
+        fromDatabase:
+          name: damanat-db
+          property: connectionString
+
+      # ── Node.js Core Backend ───────────────────────────────────────────
+      - key: NODEBACK_URL
+        sync: false                         # Set in Render dashboard
+      - key: NODEBACK_SITE_ID
+        value: 0843a455-5720-4d90-80b9-e3a859bba9ce
+      - key: NODEBACK_SERVICE_KEY
+        sync: false                         # Set in Render dashboard
+
+      # ── Security ──────────────────────────────────────────────────────
+      - key: API_KEY
+        sync: false                         # Set in Render dashboard (or leave empty)
+
+      # ── Logging ───────────────────────────────────────────────────────
+      - key: LOG_LEVEL
+        value: INFO
+
+      # ── Phase 1 Cameras — set all in Render dashboard ─────────────────
+      - key: CAM_04_IP
+        sync: false
+      - key: CAM_04_USER
+        sync: false
+      - key: CAM_04_PASSWORD
+        sync: false
+      - key: CAM_05_IP
+        sync: false
+      - key: CAM_05_USER
+        sync: false
+      - key: CAM_05_PASSWORD
+        sync: false
+      - key: CAM_06_IP
+        sync: false
+      - key: CAM_06_USER
+        sync: false
+      - key: CAM_06_PASSWORD
+        sync: false
+      - key: CAM_07_IP
+        sync: false
+      - key: CAM_07_USER
+        sync: false
+      - key: CAM_07_PASSWORD
+        sync: false
+      - key: CAM_09_IP
+        sync: false
+      - key: CAM_09_USER
+        sync: false
+      - key: CAM_09_PASSWORD
+        sync: false
+      - key: CAM_11_IP
+        sync: false
+      - key: CAM_11_USER
+        sync: false
+      - key: CAM_11_PASSWORD
+        sync: false
+      - key: CAM_12_IP
+        sync: false
+      - key: CAM_12_USER
+        sync: false
+      - key: CAM_12_PASSWORD
+        sync: false
+      - key: CAM_13_IP
+        sync: false
+      - key: CAM_13_USER
+        sync: false
+      - key: CAM_13_PASSWORD
+        sync: false
+      - key: CAM_14_IP
+        sync: false
+      - key: CAM_14_USER
+        sync: false
+      - key: CAM_14_PASSWORD
+        sync: false
+      - key: CAM_02_IP
+        sync: false
+      - key: CAM_02_USER
+        sync: false
+      - key: CAM_02_PASSWORD
+        sync: false
+      - key: CAM_35_IP
+        sync: false
+      - key: CAM_35_USER
+        sync: false
+      - key: CAM_35_PASSWORD
+        sync: false
+
+      # ── Phase 2 ANPR Cameras ───────────────────────────────────────────
+      - key: CAM_ENTRY_IP
+        sync: false
+      - key: CAM_ENTRY_USER
+        sync: false
+      - key: CAM_ENTRY_PASSWORD
+        sync: false
+      - key: CAM_EXIT_IP
+        sync: false
+      - key: CAM_EXIT_USER
+        sync: false
+      - key: CAM_EXIT_PASSWORD
+        sync: false
+
+databases:
+  - name: damanat-db
+    plan: starter
+    databaseName: damanat_db
+    user: damanat
