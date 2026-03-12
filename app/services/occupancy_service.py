@@ -17,41 +17,14 @@ CACHE_TTL_SECONDS = 5
 
 async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Session):
     """
-    Update a zone's occupancy count.
-    If NODEBACK_URL is configured: POST to Node.js and check isFull for capacity alert.
-    Fallback: write directly to local zone_occupancy table.
+    Update a zone's occupancy count in the local database first, then try to
+    sync the same increment/decrement to the Node.js backend.
     """
     from app.utils import core_backend_client
 
     zone_uuid = settings.ZONE_NAME_TO_UUID.get(zone_id)
 
-    if settings.NODEBACK_URL and zone_uuid:
-        # ── HTTP push to Node.js ──────────────────────────────────────────
-        if delta > 0:
-            data = await core_backend_client.notify_occupancy_entry(zone_uuid, camera_id)
-        else:
-            data = await core_backend_client.notify_occupancy_exit(zone_uuid, camera_id)
-
-        if data:
-            current = data.get("currentCount", 0)
-            max_cap = data.get("maxCapacity", 0)
-            pct = data.get("percentage", 0)
-            logger.debug(f"[UC3] {zone_id}: {current}/{max_cap} ({pct}%)")
-
-            if data.get("isFull"):
-                await create_alert(
-                    db,
-                    alert_type="capacity_exceeded",
-                    camera_id=camera_id,
-                    zone_id=zone_uuid,
-                    event_type="occupancy_update",
-                    description=f"Zone {zone_id} is full: {current}/{max_cap} (100%)",
-                )
-        return
-
-    # ── Fallback: write to local zone_occupancy table ─────────────────────
-    from app.models.zone_occupancy import ZoneOccupancy
-
+    # ── Primary source of truth: local zone_occupancy table ───────────────
     zone = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id == zone_id).first()
     if not zone:
         logger.info(f"[UC3] Auto-creating zone '{zone_id}'")
@@ -65,7 +38,9 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
         db.add(zone)
         db.flush()
 
+    zone.camera_id = camera_id
     zone.current_count = max(0, zone.current_count + delta)
+    zone.last_updated = datetime.utcnow()
     occupancy_ratio = (zone.current_count / zone.max_capacity) if zone.max_capacity > 0 else 0
     pct = int(occupancy_ratio * 100)
     logger.debug(f"[UC3] {zone_id}: {zone.current_count}/{zone.max_capacity} ({pct}%)")
@@ -80,6 +55,20 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
             description=f"Zone {zone_id} is nearly full: {pct}% ({zone.current_count}/{zone.max_capacity})",
         )
 
+    # ── Secondary sync: push the same delta to Node.js backend ────────────
+    if settings.NODEBACK_URL and zone_uuid:
+        if delta > 0:
+            data = await core_backend_client.notify_occupancy_entry(zone_uuid, camera_id)
+        else:
+            data = await core_backend_client.notify_occupancy_exit(zone_uuid, camera_id)
+
+        if data:
+            logger.debug(
+                f"[UC3][NodeSync] {zone_id}: "
+                f"{data.get('currentCount', 0)}/{data.get('maxCapacity', 0)} "
+                f"({data.get('percentage', 0)}%)"
+            )
+
 async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
     """
     UC3: Updates multi-level occupancy counts.
@@ -92,7 +81,7 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
         return
     
     # 2. Event type must be an occupancy trigger
-    allowed_types = ("linedetection", "ANPR", "AccessControllerEvent", "vehicleMatchResult")
+    allowed_types = ("linedetection",)
     if event.event_type not in allowed_types:
         logger.debug(f"[UC3] Ignoring {event.event_type} event from {event.camera_id}: type not in {allowed_types}")
         return
@@ -162,18 +151,8 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
 
     # ── MULTI-ZONE ROUTING LOGIC ──────────────────────────────────────
     
-    # Case 0: Main ANPR Entrance Gate (Phase 2 Entry)
-    if cam_id == "CAM-ENTRY":
-        await _queue_or_apply(settings.GARAGE_TOTAL_ZONE, 1 * multiplier)
-        await _queue_or_apply(settings.B1_PARKING_ZONE, 1 * multiplier)
-
-    # Case 0.1: Main ANPR Exit Gate (Phase 2 Exit)
-    elif cam_id == "CAM-EXIT":
-        await _queue_or_apply(settings.GARAGE_TOTAL_ZONE, -1 * multiplier)
-        await _queue_or_apply(settings.B1_PARKING_ZONE, -1 * multiplier)
-
     # Case 1: Main Entrance Gate (CAM-03 Internal)
-    elif cam_id == "CAM-03":
+    if cam_id == "CAM-03":
         await _queue_or_apply(settings.GARAGE_TOTAL_ZONE, 1 * multiplier)
         await _queue_or_apply(settings.B1_PARKING_ZONE, 1 * multiplier)
 
@@ -193,18 +172,6 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
         await _queue_or_apply(settings.B2_PARKING_ZONE, -1 * multiplier, skip_window=True)
         await _queue_or_apply(settings.B1_PARKING_ZONE, 1 * multiplier)
 
-
-    # Case 5: Legacy/Phase 1 Fallback (e.g. CAM-04 or others during debug)
-    # Only processes if specially triggered by dispatcher
-    elif event.event_type in ("ANPR", "vehicleMatchResult", "AccessControllerEvent", "linedetection"):
-        cam_config = settings.CAMERAS.get(cam_id, {})
-        gate = cam_config.get("gate")
-        
-        # If no specific multi-zone rule, update the camera's primary zone
-        delta = 1 if gate == "entry" else (-1 if gate == "exit" else 0)
-        if delta != 0:
-            zone_id = cam_config.get("name") or settings.B1_PARKING_ZONE
-            await _update_zone_count(zone_id, cam_id, delta, db)
 
     # Final Summary Log: Always show all zone statuses for full context
     all_zones = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id.in_([
