@@ -34,3 +34,10 @@ docker-compose.override.yml
 
 # Detection images
 detection_images/
+
+# Test results
+tests_result.txt
+
+# Debug files
+debug_db.py
+

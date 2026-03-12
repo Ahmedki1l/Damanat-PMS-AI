@@ -225,8 +225,8 @@ class Settings(BaseSettings):
     OCCUPANCY_ZONE_NAME: str = "B1-PARKING"  # Legacy/Default fallback
     
     # Internal Ground Truth Zones (Line detection IDs from CAM-09/CAM-10)
-    OCCUPANCY_ENTRANCE_ZONES: List[str] = ["1"]
-    OCCUPANCY_EXIT_ZONES: List[str] = ["2"]
+    OCCUPANCY_ENTRANCE_ZONES: str = "1"
+    OCCUPANCY_EXIT_ZONES: str= "2"
 
     # ── Storage ───────────────────────────────────────────────────────────
     STORAGE_MODE: str = "local"          # "local" or "spaces"

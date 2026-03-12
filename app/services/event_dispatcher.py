@@ -103,7 +103,7 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
         # ✅ UC3: Parking Occupancy
         # Only line-crossing occupancy cameras are allowed to affect counts.
         is_occupancy_cam = event.camera_id in ("CAM-03", "CAM-08", "CAM-09", "CAM-10")
-        is_smart_occupancy_event = is_occupancy_event and is_occupancy_cam
+        is_smart_occupancy_event = is_occupancy_cam
 
         if is_smart_occupancy_event:
             await handle_occupancy_event(event, db)
@@ -125,23 +125,21 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
                 await handle_intrusion_event(event, db)
 
         # Line Crossing: violation unless it's a designated occupancy gate
-        if event.event_type == "linedetection" and (is_vehicle or is_human):
-            is_occupancy_gate = (
-                zone_id in settings.OCCUPANCY_ENTRANCE_ZONES or 
-                zone_id in settings.OCCUPANCY_EXIT_ZONES
-            )
-            if not is_occupancy_gate:
-                await handle_violation_event(event, db)
+        # if event.event_type == "linedetection" and (is_vehicle or is_human):
+        #     is_occupancy_gate = (
+        #         zone_id in settings.OCCUPANCY_ENTRANCE_ZONES or 
+        #         zone_id in settings.OCCUPANCY_EXIT_ZONES
+        #     )
+        #     if not is_occupancy_gate:
+        #         await handle_violation_event(event, db)
 
         # ── PHASE 2 ───────────────────────────────────────────────────────────
         # UC1 + UC2 + UC4: ANPR gate events (JSON=AccessControllerEvent, XML=ANPR/vehicleMatchResult)
-        if event.event_type in ("AccessControllerEvent", "ANPR", "vehicleMatchResult") and event.plate_number:
+        if event.event_type in ("ANPR", "vehicleMatchResult") and event.plate_number:
             await handle_anpr_event(event, db)
 
         # ── MAINTENANCE ───────────────────────────────────────────────────────
-        # Finalize any pending exits that have passed the confirmation window
-        from app.services.occupancy_service import process_pending_exits
-        await process_pending_exits(db)
+        # Pending logic removed per user request
 
     except Exception as e:
         db.rollback()
