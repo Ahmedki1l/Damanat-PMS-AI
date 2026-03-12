@@ -52,6 +52,7 @@ XML_TEMPLATES = {
   <DetectionRegionList><DetectionRegionEntry>
     <regionID>{zone}</regionID><detectionTarget>{target}</detectionTarget>
   </DetectionRegionEntry></DetectionRegionList>
+  <direction>{direction}</direction>
 </EventNotificationAlert>""",
 }
 
@@ -73,15 +74,15 @@ JSON_ANPR_TEMPLATE = {
 }
 
 
-def simulate_xml(event_type, zone, target, source_ip):
+def simulate_xml(event_type, zone, target, source_ip, direction):
     body = XML_TEMPLATES[event_type].format(
         time=datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
-        zone=zone, target=target, ip=source_ip
+        zone=zone, target=target, ip=source_ip, direction=direction
     )
     resp = requests.post(BACKEND_URL, data=body.encode(),
                          headers={"Content-Type": "application/xml",
                                   "X-Forwarded-For": source_ip}, timeout=30)  # 30s: snapshot takes 4-8s
-    print(f"✅ {event_type} (XML) → HTTP {resp.status_code}: {resp.json()}")
+    print(f"✅ {event_type} (XML) ip={source_ip} dir={direction} → HTTP {resp.status_code}: {resp.json()}")
 
 
 def simulate_anpr(plate, gate_ip):
@@ -102,9 +103,10 @@ if __name__ == "__main__":
     parser.add_argument("--target", default="vehicle")
     parser.add_argument("--ip", default="192.168.1.103")
     parser.add_argument("--plate", default="ABC-1234")
+    parser.add_argument("--direction", default="B-to-A", choices=["B-to-A", "A-to-B"])
     args = parser.parse_args()
 
     if args.event == "anpr":
         simulate_anpr(args.plate, args.ip)
     else:
-        simulate_xml(args.event, args.zone, args.target, args.ip)
+        simulate_xml(args.event, args.zone, args.target, args.ip, args.direction)

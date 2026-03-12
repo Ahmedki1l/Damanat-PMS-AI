@@ -42,20 +42,36 @@ class ZoneNames:
 
 ZONE_MAPPING: dict[str, dict[str, str]] = {
 
-    # -- Violation cameras (line crossing / restricted zones) ---------------
+    # ── Violation cameras (GF / B1 / B2 entrances, exits, line-crossing) ─────
+
+    # CAM-01 · GF-ENTRANCE-INTERNAL
+    "CAM-01": {
+        "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
+        "zone2": ZoneNames.Violation.EMERGENCY_EXIT,
+        "zone3": ZoneNames.Violation.NO_PARKING_ZONE,
+        "zone4": ZoneNames.Violation.LOADING_BAY,
+    },
+    # CAM-02 · GF-WAITING
+    "CAM-02": {
+        "zone1": ZoneNames.Violation.NO_PARKING_ZONE,
+        "zone2": ZoneNames.Violation.RESTRICTED_VIP,
+        "zone3": ZoneNames.Violation.LOADING_BAY,
+        "zone4": ZoneNames.Violation.EMERGENCY_EXIT,
+    },
+    # CAM-03 · B1-ENTRANCE-INTERNAL
+    "CAM-03": {
+        "zone1": ZoneNames.Violation.LOADING_BAY,
+        "zone2": ZoneNames.Violation.NO_PARKING_ZONE,
+        "zone3": ZoneNames.Violation.RESTRICTED_VIP,
+        "zone4": ZoneNames.Violation.EMERGENCY_EXIT,
+    },
+    # CAM-04 · B1-PARKING (primary violation cam)
     "CAM-04": {
         "zone1": ZoneNames.Violation.RESTRICTED_VIP,
         "zone2": ZoneNames.Violation.NO_PARKING_ZONE,
         "zone3": ZoneNames.Violation.EMERGENCY_EXIT,
         "zone4": ZoneNames.Violation.LOADING_BAY,
     },
-    "CAM-02": {
-        "zone1": ZoneNames.Violation.RESTRICTED_VIP,
-        "zone2": ZoneNames.Violation.NO_PARKING_ZONE,
-        "zone3": ZoneNames.Violation.EMERGENCY_EXIT,
-        "zone4": ZoneNames.Violation.LOADING_BAY,
-    },
-
     # -- Intrusion cameras (field detection / after-hours zones) ------------
     "CAM-14": {
         "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
@@ -81,7 +97,19 @@ ZONE_MAPPING: dict[str, dict[str, str]] = {
         "zone3": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
         "zone4": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
     },
+    "CAM-10": {
+        "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
+        "zone2": ZoneNames.Intrusion.STAFF_ONLY_AREA,
+        "zone3": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
+        "zone4": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
+    },
     "CAM-09": {
+        "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
+        "zone2": ZoneNames.Intrusion.STAFF_ONLY_AREA,
+        "zone3": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
+        "zone4": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
+    },
+    "CAM-08": {
         "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
         "zone2": ZoneNames.Intrusion.STAFF_ONLY_AREA,
         "zone3": ZoneNames.Intrusion.AFTER_HOURS_ZONE,

@@ -20,56 +20,12 @@ class Settings(BaseSettings):
         return self.DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
     # ── Network ───────────────────────────────────────────────────────────
-    BACKEND_IP: str = "5.5.5.1"
+    BACKEND_IP: str = "127.0.0.1"  # override via .env per deployment
     BACKEND_PORT: int = 8080
 
     # ── Security ──────────────────────────────────────────────────────────
     API_KEY: Optional[str] = None   # Set in .env to enable auth on API endpoints
 
-    # ── Cameras ───────────────────────────────────────────────────────────
-    # Phase 1 — Active
-    CAMERAS: dict = {
-
-        #"CAM-35":  {"ip": "10.1.13.54", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B1-DATA CENTER"},
-        "CAM-14":  {"ip": "10.1.13.73", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B2-PARKING"},
-        "CAM-13":  {"ip": "10.1.13.72", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B2-PARKING"},
-        "CAM-12":  {"ip": "10.1.13.71", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B2-PARKING"},
-        "CAM-11":  {"ip": "10.1.13.70", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B2-PARKING"},
-        "CAM-10":  {"ip": "10.1.13.69", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B2-PARKING"},
-        "CAM-09":  {"ip": "10.1.13.68", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B2-PARKING"},
-        #"CAM-08":  {"ip": "10.1.13.67", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B2-PARKING"},
-        "CAM-07":  {"ip": "10.1.13.66", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B1-PARKING"},
-        "CAM-06":  {"ip": "10.1.13.65", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B1-PARKING"},
-        "CAM-05":  {"ip": "10.1.13.64", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B1-PARKING"},
-        "CAM-04":  {"ip": "10.1.13.63", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B1-PARKING"},
-        #"CAM-03":  {"ip": "10.1.13.62", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "B1-PARKING"},
-        "CAM-02":  {"ip": "10.1.13.20", "user": "kloudspot", "password": "Kloud@123", "phase": 1, "name": "GF-WAITING"},
-
-        # Phase 2 — ANPR cameras
-        "CAM-ENTRY": {"ip": "10.1.13.100", "user": "kloudspott", "password": "Kloudspot@321", "phase": 2, "gate": "entry"},
-        "CAM-EXIT":  {"ip": "10.1.13.101", "user": "kloudspot", "password": "Kloudspot@321", "phase": 2, "gate": "exit"},
-    }
-
-    CAMERA_IP_MAP: dict = {
-        # Phase 1
-        "10.1.13.63": "CAM-04",
-        "10.1.13.20": "CAM-02",
-        "10.1.13.54": "CAM-35",
-        "10.1.13.73": "CAM-14",
-        "10.1.13.72": "CAM-13",
-        "10.1.13.71": "CAM-12",
-        "10.1.13.70": "CAM-11",
-        "10.1.13.69": "CAM-10",
-        "10.1.13.68": "CAM-09",
-        "10.1.13.67": "CAM-08",
-        "10.1.13.66": "CAM-07",
-        "10.1.13.65": "CAM-06",
-        "10.1.13.64": "CAM-05",
-        "10.1.13.62": "CAM-03",
-        # Phase 2
-        "10.1.13.100": "CAM-ENTRY",
-        "10.1.13.101": "CAM-EXIT",
-    }
     # ── Node.js Core Backend Integration ─────────────────────────────────
     NODEBACK_URL: str = ""          # e.g. "http://localhost:3000"; empty = disabled
     NODEBACK_SITE_ID: str = ""      # UUID of this parking site in the website backend
@@ -78,19 +34,19 @@ class Settings(BaseSettings):
     # ── Zone UUID mappings (from Node.js backend database) ────────────────
     # Camera ID → Zone UUID (used for alert zone_id in violation/intrusion/ANPR)
     CAMERA_ZONE_MAP: dict = {
+        "CAM-03":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",  # B1-PARKING
         "CAM-04":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",  # B1-PARKING
-        "CAM-05":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",
-        "CAM-06":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",
-        "CAM-07":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",
+        "CAM-05":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",  # B1-PARKING
+        "CAM-06":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",  # B1-PARKING
+        "CAM-07":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",  # B1-PARKING
+        "CAM-08":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",  # B1-PARKING
         "CAM-09":    "93651f64-fb84-4082-b51e-9477cf7c06ac",  # B2-PARKING
         "CAM-11":    "93651f64-fb84-4082-b51e-9477cf7c06ac",
         "CAM-12":    "93651f64-fb84-4082-b51e-9477cf7c06ac",
         "CAM-13":    "93651f64-fb84-4082-b51e-9477cf7c06ac",
         "CAM-14":    "93651f64-fb84-4082-b51e-9477cf7c06ac",
-        "CAM-02":    "e0a6c09c-4e69-46cb-93df-ebf26b8b8239",  # GF-WAITING
         "CAM-ENTRY": "b17a1403-2b37-4a03-8e49-0977a1d16736",  # GF-GATES
-        "CAM-EXIT":  "b17a1403-2b37-4a03-8e49-0977a1d16736",
-        "CAM-35":    "3cde4635-7b8e-43e4-b8a8-51cf92cd4a65",  # B1-DATA CENTER
+        "CAM-EXIT":  "b17a1403-2b37-4a03-8e49-0977a1d16736",  # GF-GATES
     }
 
     # Zone name → Zone UUID (used for occupancy HTTP push)
@@ -98,11 +54,7 @@ class Settings(BaseSettings):
     ZONE_NAME_TO_UUID: dict = {
         "B1-PARKING":     "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",
         "B2-PARKING":     "93651f64-fb84-4082-b51e-9477cf7c06ac",
-        "GF-WAITING":     "e0a6c09c-4e69-46cb-93df-ebf26b8b8239",
-        "GF-GATES":       "b17a1403-2b37-4a03-8e49-0977a1d16736",
-        "B1-DATA CENTER": "3cde4635-7b8e-43e4-b8a8-51cf92cd4a65",
     }
-
     # ── Phase 1 Camera credentials (read from .env) ──────────────────────
     CAM_03_IP: str = ""
     CAM_03_USER: str = ""
@@ -164,10 +116,6 @@ class Settings(BaseSettings):
     CAM_14_PASSWORD: str = ""
     CAM_14_NAME: str = "B2-PARKING"
 
-    CAM_02_IP: str = ""
-    CAM_02_USER: str = ""
-    CAM_02_PASSWORD: str = ""
-    CAM_02_NAME: str = "GF-WAITING"
 
     CAM_35_IP: str = ""
     CAM_35_USER: str = ""
@@ -209,7 +157,6 @@ class Settings(BaseSettings):
             "CAM-12": (self.CAM_12_IP, self.CAM_12_USER, self.CAM_12_PASSWORD, self.CAM_12_NAME),
             "CAM-13": (self.CAM_13_IP, self.CAM_13_USER, self.CAM_13_PASSWORD, self.CAM_13_NAME),
             "CAM-14": (self.CAM_14_IP, self.CAM_14_USER, self.CAM_14_PASSWORD, self.CAM_14_NAME),
-            "CAM-02": (self.CAM_02_IP, self.CAM_02_USER, self.CAM_02_PASSWORD, self.CAM_02_NAME),
             "CAM-35": (self.CAM_35_IP, self.CAM_35_USER, self.CAM_35_PASSWORD, self.CAM_35_NAME),
         }
         for cam_id, (ip, user, password, name) in phase1_cams.items():

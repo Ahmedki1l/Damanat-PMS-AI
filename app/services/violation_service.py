@@ -31,6 +31,16 @@ def _get_always_violation_events() -> set:
     return set(e.strip() for e in settings.ALWAYS_VIOLATION_EVENTS.split(",") if e.strip())
 
 
+def _parse_region_id(raw_region_id: str | int | None) -> int | None:
+    if raw_region_id is None:
+        return None
+    if isinstance(raw_region_id, int):
+        return raw_region_id
+    if isinstance(raw_region_id, str) and raw_region_id.strip().isdigit():
+        return int(raw_region_id.strip())
+    return None
+
+
 # Module-level aliases for dispatcher import — reflect current settings values.
 RESTRICTED_ZONES = _get_restricted_zones()
 ALWAYS_VIOLATION_EVENTS = _get_always_violation_events()
@@ -98,17 +108,26 @@ async def handle_violation_event(event: ParsedCameraEvent, db: Session):
         alert_zone_id,
         event.event_type,
         desc,
+        region_id=_parse_region_id(event.region_id),
         snapshot_path=event.snapshot_path,
     )
 
 
 async def resolve_violation_on_exit(camera_id: str, zone_id: str, db: Session):
     """Auto-resolve the latest open violation when vehicle exits the restricted zone."""
+    zone_ids = {zone_id}
+    mapped = settings.CAMERA_ZONE_MAP.get(camera_id)
+    if mapped:
+        zone_ids.add(mapped)
+    zone_ids = {z for z in zone_ids if z}
+    if not zone_ids:
+        return
+
     alert = (
         db.query(Alert)
         .filter(
             Alert.camera_id == camera_id,
-            Alert.zone_id == zone_id,
+            Alert.zone_id.in_(zone_ids),
             Alert.is_resolved == False,
         )
         .order_by(Alert.triggered_at.desc())

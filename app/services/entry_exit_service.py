@@ -46,6 +46,45 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         logger.info(f"[UC1] Duplicate suppressed for plate={plate} gate={gate} (already logged at {recent.event_time})")
         return
 
+    # Anti-bounce: if this is an entry event but the plate just exited within the
+    # last 2 minutes, the entry camera is likely capturing the car driving away
+    # from the exit gate — suppress the false re-entry.
+    if gate == "entry":
+        recent_exit_window = event_time - timedelta(seconds=120)
+        recent_exit = (
+            db.query(EntryExitLog)
+            .filter(
+                EntryExitLog.plate_number == plate,
+                EntryExitLog.gate == "exit",
+                EntryExitLog.event_time >= recent_exit_window,
+            )
+            .first()
+        )
+        if recent_exit:
+            logger.info(
+                f"[UC1] Anti-bounce: suppressed false entry for plate={plate} "
+                f"(exited {int((event_time - recent_exit.event_time).total_seconds())}s ago)"
+            )
+            return
+
+    # Deduplication: the ANPR camera pushes two events per detection —
+    # one ANPR XML (multipart) and one vehicleMatchResult JSON.
+    # Suppress the second if the same plate + gate was logged within 30 seconds.
+    event_time = event.trigger_time or datetime.utcnow()
+    dedup_window = event_time - timedelta(seconds=30)
+    recent = (
+        db.query(EntryExitLog)
+        .filter(
+            EntryExitLog.plate_number == plate,
+            EntryExitLog.gate == gate,
+            EntryExitLog.event_time >= dedup_window,
+        )
+        .first()
+    )
+    if recent:
+        logger.info(f"[UC1] Duplicate suppressed for plate={plate} gate={gate} (already logged at {recent.event_time})")
+        return
+
     # UC4: Resolve vehicle identity via vehicle_service
     vehicle = vehicle_service.lookup_vehicle(db, plate)
     vehicle_type = vehicle.vehicle_type if vehicle else "unknown"

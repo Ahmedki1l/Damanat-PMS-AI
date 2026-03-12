@@ -86,7 +86,7 @@ async def handle_intrusion_event(event: ParsedCameraEvent, db: Session):
         Alert.triggered_at >= datetime.utcnow() - cooldown
     ).first()
 
-    if recent_alert:
+    if recent:
         logger.debug(f"Intrusion in {zone_id} skipped due to cooldown.")
         return
 
