@@ -72,7 +72,7 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
             return
 
         is_gate = settings.CAMERAS.get(event.camera_id, {}).get("gate") in ("entry", "exit")
-        is_occupancy_event = event.event_type in ("ANPR", "vehicleMatchResult", "AccessControllerEvent")
+        is_occupancy_event = event.event_type == "linedetection"
         should_log = False
     # Selective Logging: Only log gate events or smart events to reduce noise
         include = {x.strip() for x in settings.LOG_CAMERA_FILTER.split(",") if x.strip()} if settings.LOG_CAMERA_FILTER else set()
@@ -101,18 +101,14 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
         # ── PHASE 1 ───────────────────────────────────────────────────────────
         
         # ✅ UC3: Parking Occupancy
-        # Strictly using ANPR gate systems (Entry/Exit) OR internal transition gates (CAM-03/08/09/10)
+        # Only line-crossing occupancy cameras are allowed to affect counts.
         is_occupancy_cam = event.camera_id in ("CAM-03", "CAM-08", "CAM-09", "CAM-10")
-        is_smart_occupancy_event = is_occupancy_event or (event.event_type == "linedetection" and is_occupancy_cam)
+        is_smart_occupancy_event = is_occupancy_event and is_occupancy_cam
 
-        if is_smart_occupancy_event or is_occupancy_cam:
-            if is_gate or is_occupancy_cam:
-                await handle_occupancy_event(event, db)
-            else:
-                logger.debug(f"[UC3] Ignoring occupancy event from {event.camera_id} (not a configured gate)")
+        if is_smart_occupancy_event:
+            await handle_occupancy_event(event, db)
         elif is_gate:
-             # If it's a gate camera but not an ANPR event (e.g. VMD, duration), we might want to know
-             logger.debug(f"[UC3] Gate camera {event.camera_id} sent non-vehicle event: {event.event_type}")
+             logger.debug(f"[UC3] Gate camera {event.camera_id} sent non-occupancy event: {event.event_type}")
 
 
         # ✅ UC5 & UC6: Violations and Intrusion (Teammates' Tasks)
