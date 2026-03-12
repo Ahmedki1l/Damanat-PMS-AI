@@ -4,9 +4,9 @@ from app.models.zone_occupancy import ZoneOccupancy
 
 # Define your desired capacities here
 ZONE_CAPACITIES = {
-    "GARAGE-TOTAL": 100,
-    "B1-PARKING": 50,
-    "B2-PARKING": 50
+    "GARAGE-TOTAL": 18,
+    "B1-PARKING": 9,
+    "B2-PARKING": 9
 }
 
 db = SessionLocal()
@@ -22,7 +22,7 @@ try:
     # 2. Ensure total zone exists if it was deleted
     if not any(z.zone_id == "GARAGE-TOTAL" for z in zones):
         print("Creating GARAGE-TOTAL zone...")
-        db.add(ZoneOccupancy(zone_id="GARAGE-TOTAL", current_count=0, max_capacity=100))
+        db.add(ZoneOccupancy(zone_id="GARAGE-TOTAL", current_count=0, max_capacity=ZONE_CAPACITIES["GARAGE-TOTAL"]))
 
     db.commit()
     print("✅ All zones reset and capacities updated successfully.")

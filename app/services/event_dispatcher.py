@@ -102,9 +102,11 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
         
         # ✅ UC3: Parking Occupancy
         # Strictly using ANPR gate systems (Entry/Exit) OR internal transition gates (CAM-03/08/09/10)
-        is_internal_transition = event.camera_id in ("CAM-03", "CAM-08", "CAM-09", "CAM-10")
-        if is_occupancy_event or is_internal_transition:
-            if is_gate or is_internal_transition:
+        is_occupancy_cam = event.camera_id in ("CAM-03", "CAM-08", "CAM-09", "CAM-10")
+        is_smart_occupancy_event = is_occupancy_event or (event.event_type == "linedetection" and is_occupancy_cam)
+
+        if is_smart_occupancy_event or is_occupancy_cam:
+            if is_gate or is_occupancy_cam:
                 await handle_occupancy_event(event, db)
             else:
                 logger.debug(f"[UC3] Ignoring occupancy event from {event.camera_id} (not a configured gate)")
