@@ -56,6 +56,16 @@ class Settings(BaseSettings):
         "B2-PARKING":     "93651f64-fb84-4082-b51e-9477cf7c06ac",
     }
     # ── Phase 1 Camera credentials (read from .env) ──────────────────────
+    CAM_01_IP: str = ""
+    CAM_01_USER: str = ""
+    CAM_01_PASSWORD: str = ""
+    CAM_01_NAME: str = "B1-ENTRANCE-INTERNAL"
+
+    CAM_02_IP: str = ""
+    CAM_02_USER: str = ""
+    CAM_02_PASSWORD: str = ""
+    CAM_02_NAME: str = "B1-ENTRANCE-INTERNAL"
+    
     CAM_03_IP: str = ""
     CAM_03_USER: str = ""
     CAM_03_PASSWORD: str = ""
@@ -145,6 +155,8 @@ class Settings(BaseSettings):
 
         # Phase 1 cameras
         phase1_cams = {
+            "CAM-01": (self.CAM_01_IP, self.CAM_01_USER, self.CAM_01_PASSWORD, self.CAM_01_NAME),
+            "CAM-02": (self.CAM_02_IP, self.CAM_02_USER, self.CAM_02_PASSWORD, self.CAM_02_NAME),
             "CAM-03": (self.CAM_03_IP, self.CAM_03_USER, self.CAM_03_PASSWORD, self.CAM_03_NAME),
             "CAM-04": (self.CAM_04_IP, self.CAM_04_USER, self.CAM_04_PASSWORD, self.CAM_04_NAME),
             "CAM-05": (self.CAM_05_IP, self.CAM_05_USER, self.CAM_05_PASSWORD, self.CAM_05_NAME),

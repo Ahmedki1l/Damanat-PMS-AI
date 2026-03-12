@@ -29,6 +29,14 @@ class ZoneNames:
         STAFF_ONLY_AREA  = "staff-only-area"
         AFTER_HOURS_ZONE = "after-hours-zone"
 
+    class ParkingArea:
+        """Named parking spots — use slot(n) to reference a specific bay number."""
+
+        @staticmethod
+        def slot(number: int) -> str:
+            """Return the canonical name for parking spot *number*, e.g. slot(3) → 'parking-area-3'."""
+            return f"parking-area-{number}"
+
 
 # ---------------------------------------------------------------------------
 # Per-camera zone mapping
@@ -53,22 +61,23 @@ ZONE_MAPPING: dict[str, dict[str, str]] = {
     },
     # CAM-02 · GF-WAITING
     "CAM-02": {
-        "zone1": ZoneNames.Violation.NO_PARKING_ZONE,
-        "zone2": ZoneNames.Violation.RESTRICTED_VIP,
+        "zone1": ZoneNames.Violation.RESTRICTED_VIP,
+        "zone2": ZoneNames.Violation.NO_PARKING_ZONE,
         "zone3": ZoneNames.Violation.LOADING_BAY,
         "zone4": ZoneNames.Violation.EMERGENCY_EXIT,
     },
     # CAM-03 · B1-ENTRANCE-INTERNAL
     "CAM-03": {
-        "zone1": ZoneNames.Violation.LOADING_BAY,
-        "zone2": ZoneNames.Violation.NO_PARKING_ZONE,
+        "zone1": ZoneNames.ParkingArea.slot(11),
+        "zone2": ZoneNames.ParkingArea.slot(10),
         "zone3": ZoneNames.Violation.RESTRICTED_VIP,
         "zone4": ZoneNames.Violation.EMERGENCY_EXIT,
     },
     # CAM-04 · B1-PARKING (primary violation cam)
+    # zone1 → parking spot #3, zone2 → parking spot #7, etc.
     "CAM-04": {
-        "zone1": ZoneNames.Violation.RESTRICTED_VIP,
-        "zone2": ZoneNames.Violation.NO_PARKING_ZONE,
+        "zone1": ZoneNames.ParkingArea.slot(3),   # real parking bay number 3
+        "zone2": ZoneNames.ParkingArea.slot(2),
         "zone3": ZoneNames.Violation.EMERGENCY_EXIT,
         "zone4": ZoneNames.Violation.LOADING_BAY,
     },
@@ -116,13 +125,13 @@ ZONE_MAPPING: dict[str, dict[str, str]] = {
         "zone4": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
     },
     "CAM-07": {
-        "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
+        "zone1": ZoneNames.ParkingArea.slot(9),
         "zone2": ZoneNames.Intrusion.STAFF_ONLY_AREA,
         "zone3": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
         "zone4": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
     },
     "CAM-06": {
-        "zone1": ZoneNames.Intrusion.EMERGENCY_EXIT,
+        "zone1": ZoneNames.ParkingArea.slot(6),
         "zone2": ZoneNames.Intrusion.STAFF_ONLY_AREA,
         "zone3": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
         "zone4": ZoneNames.Intrusion.AFTER_HOURS_ZONE,
