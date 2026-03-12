@@ -96,17 +96,40 @@ def simulate_anpr(plate, gate_ip):
 
 
 if __name__ == "__main__":
+    # Camera name → IP mapping (matches .env / config.py)
+    CAMERA_IP_MAP = {
+        "CAM-03": "10.1.13.62",
+        "CAM-08": "10.1.13.67",
+        "CAM-09": "10.1.13.68",
+        "CAM-10": "10.1.13.69",
+    }
+
     parser = argparse.ArgumentParser(description="Simulate camera events for testing")
-    parser.add_argument("--event", default="fielddetection",
+    parser.add_argument("--event", default="linedetection",
                         choices=list(XML_TEMPLATES.keys()) + ["anpr"])
-    parser.add_argument("--zone", default="1")
+    # --zone / --line  (same meaning: which region/line ID to trigger)
+    parser.add_argument("--zone", "--line", dest="zone", default="1")
     parser.add_argument("--target", default="vehicle")
-    parser.add_argument("--ip", default="192.168.1.103")
+    # --ip  is the raw IP; --cam  resolves via CAMERA_IP_MAP
+    parser.add_argument("--ip", default=None)
+    parser.add_argument("--cam", default=None, choices=list(CAMERA_IP_MAP.keys()),
+                        help="Camera name (e.g. CAM-03). Overrides --ip.")
     parser.add_argument("--plate", default="ABC-1234")
-    parser.add_argument("--direction", default="B-to-A", choices=["B-to-A", "A-to-B"])
+    # --direction / --dir  (same meaning)
+    parser.add_argument("--direction", "--dir", dest="direction",
+                        default="B-to-A", choices=["B-to-A", "A-to-B"])
     args = parser.parse_args()
 
-    if args.event == "anpr":
-        simulate_anpr(args.plate, args.ip)
+    # Resolve IP
+    if args.cam:
+        source_ip = CAMERA_IP_MAP.get(args.cam, "192.168.1.103")
+    elif args.ip:
+        source_ip = args.ip
     else:
-        simulate_xml(args.event, args.zone, args.target, args.ip, args.direction)
+        source_ip = "192.168.1.103"
+
+    if args.event == "anpr":
+        simulate_anpr(args.plate, source_ip)
+    else:
+        simulate_xml(args.event, args.zone, args.target, source_ip, args.direction)
+

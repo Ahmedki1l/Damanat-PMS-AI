@@ -78,57 +78,80 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
     # ───────────────────────────────────────────────────────────────────
 
     cam_id = event.camera_id
-    
-    multiplier = 1
-    # Priority 1: Use Line IDs (Region 1 = Entry/Forward, Region 2 = Exit/Reverse)
-    if event.event_type == "linedetection" and event.region_id:
-        if event.region_id == settings.OCCUPANCY_ENTRANCE_ZONES:
-            multiplier = 1
-            logger.info(f"[UC3] {cam_id}: Line {event.region_id} (Entry) -> mult: +1")
-        elif event.region_id == settings.OCCUPANCY_EXIT_ZONES:
-            multiplier = -1
-            logger.info(f"[UC3] {cam_id}: Line {event.region_id} (Exit) -> mult: -1")
-        elif event.crossing_direction and event.crossing_direction != "B-to-A":
-            multiplier = -1
-            logger.info(f"[UC3] {cam_id}: Reverse direct ({event.crossing_direction}) -> mult: -1")
-        else:
-            logger.info(f"[UC3] {cam_id}: Forward direct ({event.crossing_direction}) via Line {event.region_id} -> mult: +1")
-    # Priority 2: Fallback to simplified direction logic
-    elif event.crossing_direction and event.crossing_direction != "B-to-A":
+
+    # ── DETERMINE DIRECTION MULTIPLIER ────────────────────────────────────
+    # +1 = primary/forward direction for this camera
+    # -1 = reverse direction for this camera
+    #
+    # Source priority:
+    #   1. region_id: "1" = forward (+1), "2" = reverse (−1)
+    #   2. crossing_direction: "B-to-A" = forward (+1), "A-to-B" = reverse (−1)
+    #   3. No signal at all → REJECT the event (better to skip than count wrong)
+    # ──────────────────────────────────────────────────────────────────────
+
+    multiplier = None
+
+    if event.region_id == settings.OCCUPANCY_ENTRANCE_ZONES:       # "1"
+        multiplier = 1
+        logger.info(f"[UC3] {cam_id}: Line {event.region_id} (forward) → mult: +1")
+    elif event.region_id == settings.OCCUPANCY_EXIT_ZONES:          # "2"
         multiplier = -1
-        logger.info(f"[UC3] {cam_id}: Fallback reverse ({event.crossing_direction}) -> mult: -1")
+        logger.info(f"[UC3] {cam_id}: Line {event.region_id} (reverse) → mult: -1")
+    elif event.crossing_direction == "B-to-A":
+        multiplier = 1
+        logger.info(f"[UC3] {cam_id}: dir=B-to-A (forward) → mult: +1")
+    elif event.crossing_direction == "A-to-B":
+        multiplier = -1
+        logger.info(f"[UC3] {cam_id}: dir=A-to-B (reverse) → mult: -1")
     else:
-        logger.info(f"[UC3] {cam_id}: Fallback forward ({event.crossing_direction}) -> mult: +1")
-    # ───────────────────────────────────────────────────────────────────
+        logger.warning(
+            f"[UC3] {cam_id}: SKIPPED — no direction signal "
+            f"(region_id={event.region_id!r}, crossing_direction={event.crossing_direction!r}). "
+            f"Cannot determine entry/exit; ignoring event to avoid wrong count."
+        )
+        return
+    # ──────────────────────────────────────────────────────────────────────
+
 
     cam_config = settings.CAMERAS.get(cam_id, {})
-    
-    # (Option A check is now implicit via multiplier + cancellation logic below)
 
     # Confirmation window removed per user request for immediate feedback
     # ───────────────────────────────────────────────────────────────────
 
     # ── MULTI-ZONE ROUTING LOGIC ──────────────────────────────────────
-    
-    # Case 1: Main Entrance Gate (CAM-03 Internal)
+    #
+    # multiplier  = +1 →  primary / forward direction for this camera
+    # multiplier  = -1 →  reverse  direction for this camera
+    #
+    # The delta signs below are set so that the "primary" direction  
+    # (mult = +1) produces the expected occupancy change per camera:
+    #
+    #   CAM-03: primary = enter garage  →  TOTAL+1, B1+1
+    #             delta: (+1 * mult)
+    #   CAM-08: primary = exit  garage  →  TOTAL-1, B1-1
+    #             delta: (-1 * mult)  ← double-negation intentional
+    #   CAM-09: primary = B1→B2        →  B1-1, B2+1
+    #             delta: (-1 * mult), (+1 * mult)
+    #   CAM-10: primary = B2→B1        →  B2-1, B1+1
+    #             delta: (-1 * mult), (+1 * mult)
+    # ───────────────────────────────────────────────────────────────────
+
+    # Case 1: Main Entrance Gate (CAM-03)
     if cam_id == "CAM-03":
-        await _update_zone_count(settings.GARAGE_TOTAL_ZONE, cam_id, 1 * multiplier, db)
-        await _update_zone_count(settings.B1_PARKING_ZONE, cam_id, 1 * multiplier, db)
-    # Case 2: Main Exit Gate (CAM-08 Internal)
+        await _update_zone_count(settings.GARAGE_TOTAL_ZONE, cam_id,  1 * multiplier, db)
+        await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id,  1 * multiplier, db)
+    # Case 2: Main Exit Gate (CAM-08)
     elif cam_id == "CAM-08":
         await _update_zone_count(settings.GARAGE_TOTAL_ZONE, cam_id, -1 * multiplier, db)
-        await _update_zone_count(settings.B1_PARKING_ZONE, cam_id, -1 * multiplier, db)
- 
-    # Case 3: Transition B1 -> B2 (CAM-09)
-    # Transitions are internal
+        await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id, -1 * multiplier, db)
+    # Case 3: Transition B1 → B2 (CAM-09)
     elif cam_id == "CAM-09":
-        await _update_zone_count(settings.B1_PARKING_ZONE, cam_id, -1 * multiplier, db)
-        await _update_zone_count(settings.B2_PARKING_ZONE, cam_id, 1 * multiplier, db)
- 
-    # Case 4: Transition B2 -> B1 (CAM-10)
+        await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id, -1 * multiplier, db)
+        await _update_zone_count(settings.B2_PARKING_ZONE,   cam_id,  1 * multiplier, db)
+    # Case 4: Transition B2 → B1 (CAM-10)
     elif cam_id == "CAM-10":
-        await _update_zone_count(settings.B2_PARKING_ZONE, cam_id, -1 * multiplier, db)
-        await _update_zone_count(settings.B1_PARKING_ZONE, cam_id, 1 * multiplier, db)
+        await _update_zone_count(settings.B2_PARKING_ZONE,   cam_id, -1 * multiplier, db)
+        await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id,  1 * multiplier, db)
 
 
     # Final Summary Log: Always show all zone statuses for full context
