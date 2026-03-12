@@ -98,22 +98,8 @@ app.include_router(parking_stats.router, prefix="/api/v1", tags=["📊 Stats —
 app.include_router(vehicles.router,      prefix="/api/v1", tags=["🔍 Vehicles — UC4"])
 
 import asyncio
-from app.services.occupancy_service import process_pending_exits
 from app.database import SessionLocal
 
-async def background_task_loop():
-    """Periodically processes background tasks like pending occupancy exits."""
-    while True:
-        try:
-            db = SessionLocal()
-            try:
-                await process_pending_exits(db)
-                db.commit()
-            finally:
-                db.close()
-        except Exception as e:
-            logger.error(f"Error in background task loop: {e}")
-        await asyncio.sleep(2)
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 @app.on_event("startup")
@@ -125,8 +111,7 @@ async def startup():
     except Exception as e:
         logger.error(f"❌ Database initialization failed: {e}")
 
-    # Start background task loop
-    asyncio.create_task(background_task_loop())
+
 
     logger.info(f"📡 Cameras configured: {list(settings.CAMERAS.keys())}")
     logger.info(f"🌐 Listening on http://{settings.BACKEND_IP}:{settings.BACKEND_PORT}")
