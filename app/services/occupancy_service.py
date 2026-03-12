@@ -104,6 +104,19 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
     # We define the event_key to keep track of zones for the entry-exit confirm window
     event_key = (cam_id, event.event_type, id_ref, event.crossing_direction)
 
+    # ── DE-DUPLICATION (short TTL) ─────────────────────────────────────
+    # Prevent duplicate counts when the same trigger is emitted repeatedly
+    now = datetime.utcnow()
+    stale = [k for k, ts in _processed_events_cache.items() if (now - ts).total_seconds() > CACHE_TTL_SECONDS]
+    for k in stale:
+        del _processed_events_cache[k]
+
+    if event_key in _processed_events_cache:
+        logger.debug(f"[UC3] Duplicate occupancy event ignored: {event_key}")
+        return
+
+    _processed_events_cache[event_key] = now
+
     multiplier = 1
     if event.crossing_direction and event.crossing_direction != settings.FORWARD_DIRECTION_FIELD:
         multiplier = -1

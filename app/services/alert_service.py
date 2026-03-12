@@ -35,7 +35,7 @@ async def create_alert(
             event_type=event_type,
             description=description,
             snapshot_path=snapshot_path,
-            is_resolved=0,
+            is_resolved=False,
             triggered_at=datetime.utcnow(),
         )
 

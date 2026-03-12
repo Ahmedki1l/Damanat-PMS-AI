@@ -20,7 +20,7 @@ class Settings(BaseSettings):
         return self.DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
     # ── Network ───────────────────────────────────────────────────────────
-    BACKEND_IP: str = "5.5.5.3"
+    BACKEND_IP: str = "127.0.0.1"  # override via .env per deployment
     BACKEND_PORT: int = 8080
 
     # ── Security ──────────────────────────────────────────────────────────
