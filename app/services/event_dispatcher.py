@@ -139,9 +139,7 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
             await handle_anpr_event(event, db)
 
         # ── MAINTENANCE ───────────────────────────────────────────────────────
-        # Finalize any pending exits that have passed the confirmation window
-        from app.services.occupancy_service import process_pending_exits
-        await process_pending_exits(db)
+        # Pending logic removed per user request
 
     except Exception as e:
         db.rollback()

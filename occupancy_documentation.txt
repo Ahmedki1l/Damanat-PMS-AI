@@ -1,0 +1,43 @@
+# Damanat PMS: Local Occupancy Tracking System
+
+## 1. Overview
+The Damanat PMS Occupancy System provides real-time tracking of vehicle presence across multiple levels of the parking garage. It utilizes a combination of ANPR (Automatic Number Plate Recognition) for main gates and line-crossing cameras for internal level transitions.
+
+## 2. Architecture & Zones
+The system follows a hierarchical zone model to provide both high-level and granular visibility:
+
+| Zone ID | Description | Primary Triggers |
+|---------|-------------|------------------|
+| `GARAGE-TOTAL` | Overall garage occupancy | `CAM-03`, `CAM-08`, `CAM-ENTRY`, `CAM-EXIT` |
+| `B1-PARKING` | Level B1 specific count | `CAM-03`, `CAM-08`, `CAM-09`, `CAM-10` |
+| `B2-PARKING` | Level B2 specific count | `CAM-09`, `CAM-10` |
+
+
+## 3. Directional Counting Logic
+The system interprets camera events as either an **Increment (+1)** or **Decrement (-1)** based on the crossing direction.
+
+### The "B-to-A" Standard
+All cameras are configured with a primary "Forward" direction, defined as `B-to-A`.
+- **Forward (B -> A):** Interpreted as an entry to the target zone (Multiplier: `+1`).
+- **Reverse (A -> B):** Interpreted as an exit or reversal (Multiplier: `-1`).
+
+---
+
+## 4. Intelligent Reversal Prevention (Bug)
+To ensure accuracy against "tailgating" or "line-touching" (where a vehicle crosses the line and immediately reverses), the system implements a **Timed Confirmation Window**.
+
+### How it works:
+1. **Pending Exit:** When a vehicle crosses an exit line (`A -> B`), the counter is NOT decremented immediately. Instead, the event is held in a **5-second confirmation queue**.
+2. **Cancellation:** If the same vehicle (or any vehicle on that camera) crosses the entry line (`B -> A`) within those 5 seconds, the system assumes a reversal occurred. The pending exit is deleted, and the occupancy count remains unchanged.
+3. **Confirmation:** If 5 seconds pass without a re-entry, the system confirms the exit and decrements the zone count.
+
+---
+
+## 5. Camera Configuration Requirements
+For the logic to function, physical cameras must be configured as follows in their respective Web UIs:
+
+*   **Detection Type:** Line Crossing.
+*   **Direction:** **Bidirectional** (Both).
+*   **Line Alignment:** The line must be drawn so that the **"A" arrow** points **INTO** the zone being tracked (e.g., pointing into B1 for Cam 3, or into B2 for Cam 9).
+
+---

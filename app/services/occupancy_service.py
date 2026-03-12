@@ -12,8 +12,7 @@ logger = get_logger(__name__)
 # Simple in-memory cache to prevent double-counting from identical events fired within seconds
 # Format: {(camera_id, event_type, plate_or_region): timestamp}
 _processed_events_cache = {}
-_pending_exits = {} # Format: {event_key: (zone_id, delta, timestamp)}
-CACHE_TTL_SECONDS = 5
+CACHE_TTL_SECONDS = 1
 
 async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Session):
     """
@@ -37,15 +36,18 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
         )
         db.add(zone)
         db.flush()
+    logger.debug(f"[UC3] {zone_id}: {zone.current_count} {delta} ({zone.current_count + delta}) 1")
 
     zone.camera_id = camera_id
     zone.current_count = max(0, zone.current_count + delta)
+    logger.debug(f"[UC3] {zone_id}: {zone.current_count} {delta} 2")
     zone.last_updated = datetime.utcnow()
     occupancy_ratio = (zone.current_count / zone.max_capacity) if zone.max_capacity > 0 else 0
     pct = int(occupancy_ratio * 100)
     logger.debug(f"[UC3] {zone_id}: {zone.current_count}/{zone.max_capacity} ({pct}%)")
+    logger.debug(f"[UC3] {zone_id}: {zone.current_count} {delta} 3")
 
-    if occupancy_ratio >= settings.OCCUPANCY_ALERT_THRESHOLD:
+    if occupancy_ratio >= 1:
         await create_alert(
             db,
             alert_type="capacity_exceeded",
@@ -55,19 +57,7 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
             description=f"Zone {zone_id} is nearly full: {pct}% ({zone.current_count}/{zone.max_capacity})",
         )
 
-    # ── Secondary sync: push the same delta to Node.js backend ────────────
-    if settings.NODEBACK_URL and zone_uuid:
-        if delta > 0:
-            data = await core_backend_client.notify_occupancy_entry(zone_uuid, camera_id)
-        else:
-            data = await core_backend_client.notify_occupancy_exit(zone_uuid, camera_id)
-
-        if data:
-            logger.debug(
-                f"[UC3][NodeSync] {zone_id}: "
-                f"{data.get('currentCount', 0)}/{data.get('maxCapacity', 0)} "
-                f"({data.get('percentage', 0)}%)"
-            )
+    logger.debug(f"[UC3] {zone_id}: {zone.current_count} {delta} 4")
 
 async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
     """
@@ -87,90 +77,58 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
         return
     # ───────────────────────────────────────────────────────────────────
 
-    id_ref = event.plate_number or event.region_id or "default"
     cam_id = event.camera_id
     
-    # We define the event_key to keep track of zones for the entry-exit confirm window
-    event_key = (cam_id, event.event_type, id_ref, event.crossing_direction)
-
-    # ── DE-DUPLICATION (short TTL) ─────────────────────────────────────
-    # Prevent duplicate counts when the same trigger is emitted repeatedly
-    now = datetime.utcnow()
-    stale = [k for k, ts in _processed_events_cache.items() if (now - ts).total_seconds() > CACHE_TTL_SECONDS]
-    for k in stale:
-        del _processed_events_cache[k]
-
-    if event_key in _processed_events_cache:
-        logger.debug(f"[UC3] Duplicate occupancy event ignored: {event_key}")
-        return
-
-    _processed_events_cache[event_key] = now
-
     multiplier = 1
-    if event.crossing_direction and event.crossing_direction != settings.FORWARD_DIRECTION_FIELD:
+    # Priority 1: Use Line IDs (Region 1 = Entry/Forward, Region 2 = Exit/Reverse)
+    if event.event_type == "linedetection" and event.region_id:
+        if event.region_id == settings.OCCUPANCY_ENTRANCE_ZONES:
+            multiplier = 1
+            logger.info(f"[UC3] {cam_id}: Line {event.region_id} (Entry) -> mult: +1")
+        elif event.region_id == settings.OCCUPANCY_EXIT_ZONES:
+            multiplier = -1
+            logger.info(f"[UC3] {cam_id}: Line {event.region_id} (Exit) -> mult: -1")
+        elif event.crossing_direction and event.crossing_direction != "B-to-A":
+            multiplier = -1
+            logger.info(f"[UC3] {cam_id}: Reverse direct ({event.crossing_direction}) -> mult: -1")
+        else:
+            logger.info(f"[UC3] {cam_id}: Forward direct ({event.crossing_direction}) via Line {event.region_id} -> mult: +1")
+    # Priority 2: Fallback to simplified direction logic
+    elif event.crossing_direction and event.crossing_direction != "B-to-A":
         multiplier = -1
-        logger.debug(f"[UC3] Reverse crossing detected on {cam_id} (mult: -1)")
+        logger.info(f"[UC3] {cam_id}: Fallback reverse ({event.crossing_direction}) -> mult: -1")
+    else:
+        logger.info(f"[UC3] {cam_id}: Fallback forward ({event.crossing_direction}) -> mult: +1")
     # ───────────────────────────────────────────────────────────────────
 
     cam_config = settings.CAMERAS.get(cam_id, {})
     
     # (Option A check is now implicit via multiplier + cancellation logic below)
 
-    # ── CONFIRMATION WINDOW (Option B - Setup helper) ────────────────
-    async def _queue_or_apply(zone_id: str, delta: int, skip_window: bool = False):
-        # We use a combined key to allow multiple zones from the same event to be pending
-        full_key = (event_key, zone_id)
-        
-        if delta < 0 and settings.USE_EXIT_CONFIRM_WINDOW and not skip_window:
-            logger.info(f"[UC3] {zone_id}: Exit pending {settings.EXIT_CONFIRM_SECONDS}s confirmation (vehicle reversing?)")
-            _pending_exits[full_key] = (zone_id, cam_id, delta, datetime.utcnow())
-        else:
-            if delta > 0:
-                cancelled_zones = []
-                # logger.debug(f"[UC3] Entry detected on {cam_id}, checking {len(_pending_exits)} pending exits...")
-                for k in list(_pending_exits.keys()):
-                    # Match by camera_id. k is ((cam_id, type, id, dir), zone_id)
-                    pending_cam = k[0][0]
-                    pending_key = k[0]
-                    
-                    if pending_cam == cam_id:
-                        # Avoid self-cancellation: don't cancel a pending exit from the SAME trigger
-                        if pending_key == event_key:
-                            continue
-                        
-                        del _pending_exits[k]
-                        cancelled_zones.append(k[1])
-                
-                if cancelled_zones:
-                    unique_zones = list(set(cancelled_zones))
-                    logger.info(f"[UC3] Reversed exit cancelled for {cam_id} on: {', '.join(unique_zones)}")
-                    return 
-
-            await _update_zone_count(zone_id, cam_id, delta, db)
+    # Confirmation window removed per user request for immediate feedback
     # ───────────────────────────────────────────────────────────────────
 
     # ── MULTI-ZONE ROUTING LOGIC ──────────────────────────────────────
     
     # Case 1: Main Entrance Gate (CAM-03 Internal)
     if cam_id == "CAM-03":
-        await _queue_or_apply(settings.GARAGE_TOTAL_ZONE, 1 * multiplier)
-        await _queue_or_apply(settings.B1_PARKING_ZONE, 1 * multiplier)
-
+        await _update_zone_count(settings.GARAGE_TOTAL_ZONE, cam_id, 1 * multiplier, db)
+        await _update_zone_count(settings.B1_PARKING_ZONE, cam_id, 1 * multiplier, db)
     # Case 2: Main Exit Gate (CAM-08 Internal)
     elif cam_id == "CAM-08":
-        await _queue_or_apply(settings.GARAGE_TOTAL_ZONE, -1 * multiplier)
-        await _queue_or_apply(settings.B1_PARKING_ZONE, -1 * multiplier)
-
+        await _update_zone_count(settings.GARAGE_TOTAL_ZONE, cam_id, -1 * multiplier, db)
+        await _update_zone_count(settings.B1_PARKING_ZONE, cam_id, -1 * multiplier, db)
+ 
     # Case 3: Transition B1 -> B2 (CAM-09)
-    # Transitions are internal - skip confirmation window for immediate feedback
+    # Transitions are internal
     elif cam_id == "CAM-09":
-        await _queue_or_apply(settings.B1_PARKING_ZONE, -1 * multiplier, skip_window=True)
-        await _queue_or_apply(settings.B2_PARKING_ZONE, 1 * multiplier)
-
+        await _update_zone_count(settings.B1_PARKING_ZONE, cam_id, -1 * multiplier, db)
+        await _update_zone_count(settings.B2_PARKING_ZONE, cam_id, 1 * multiplier, db)
+ 
     # Case 4: Transition B2 -> B1 (CAM-10)
     elif cam_id == "CAM-10":
-        await _queue_or_apply(settings.B2_PARKING_ZONE, -1 * multiplier, skip_window=True)
-        await _queue_or_apply(settings.B1_PARKING_ZONE, 1 * multiplier)
+        await _update_zone_count(settings.B2_PARKING_ZONE, cam_id, -1 * multiplier, db)
+        await _update_zone_count(settings.B1_PARKING_ZONE, cam_id, 1 * multiplier, db)
 
 
     # Final Summary Log: Always show all zone statuses for full context
@@ -197,36 +155,3 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
         logger.info(f"[UC3] OVERALL STATUS | {' | '.join(summary_parts)}")
 
 
-async def process_pending_exits(db: Session):
-    """
-    Background worker to confirm exits that passed the confirmation window.
-    Should be called periodically or after each event.
-    """
-    now = datetime.utcnow()
-    to_confirm = []
-    
-    for key, (zone_id, cam_id, delta, ts) in list(_pending_exits.items()):
-        if (now - ts).total_seconds() > settings.EXIT_CONFIRM_SECONDS:
-            to_confirm.append((key, zone_id, cam_id, delta))
-            
-    for key, zone_id, cam_id, delta in to_confirm:
-        del _pending_exits[key]
-        await _update_zone_count(zone_id, cam_id, delta, db)
-
-    if to_confirm:
-        # Show overall status after confirmation for context
-        all_zones = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id.in_([
-            settings.GARAGE_TOTAL_ZONE, 
-            settings.B1_PARKING_ZONE, 
-            settings.B2_PARKING_ZONE
-        ])).all()
-        zone_order = {settings.GARAGE_TOTAL_ZONE: 0, settings.B1_PARKING_ZONE: 1, settings.B2_PARKING_ZONE: 2}
-        all_zones.sort(key=lambda z: zone_order.get(z.zone_id, 99))
-        
-        summary_parts = []
-        for z in all_zones:
-            pct = int((z.current_count / z.max_capacity * 100) if z.max_capacity > 0 else 0)
-            summary_parts.append(f"{z.zone_id}: {z.current_count}/{z.max_capacity} ({pct}%)")
-        
-        if summary_parts:
-            logger.info(f"[UC3] OVERALL STATUS AFTER CONFIRMATION | {' | '.join(summary_parts)}")
