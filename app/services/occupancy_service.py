@@ -63,6 +63,7 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
             last_updated=datetime.utcnow(),
         )
         db.add(zone)
+        db.flush()
 
     zone.current_count = max(0, zone.current_count + delta)
     occupancy_ratio = (zone.current_count / zone.max_capacity) if zone.max_capacity > 0 else 0
@@ -84,23 +85,42 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
     UC3: Updates multi-level occupancy counts.
     Handles GARAGE-TOTAL, B1-PARKING, and B2-PARKING.
     """
-    logger.info(f"[UC3] Processing occupancy event from {event.camera_id} ({event.event_type})")
-    # ── DE-DUPLICATION ───────────────────────────────────────────────────
-    now = datetime.utcnow()
-    to_delete = [k for k, ts in _processed_events_cache.items() if (now - ts).total_seconds() > CACHE_TTL_SECONDS]
-    for k in to_delete: del _processed_events_cache[k]
+    # ── STRICT FILTERING ────────────────────────────────────────────────
+    # 1. Target must be 'vehicle'
+    if event.detection_target != "vehicle":
+        logger.debug(f"[UC3] Ignoring {event.event_type} event from {event.camera_id}: target={event.detection_target} (expected 'vehicle')")
+        return
+    
+    # 2. Event type must be an occupancy trigger
+    allowed_types = ("linedetection", "ANPR", "AccessControllerEvent", "vehicleMatchResult")
+    if event.event_type not in allowed_types:
+        logger.debug(f"[UC3] Ignoring {event.event_type} event from {event.camera_id}: type not in {allowed_types}")
+        return
+    # ───────────────────────────────────────────────────────────────────
 
     id_ref = event.plate_number or event.region_id or "default"
     cam_id = event.camera_id
-    # Include direction in key so forward/reverse are distinct for de-duplication
+    
+    # We define the event_key to keep track of zones for the entry-exit confirm window
     event_key = (cam_id, event.event_type, id_ref, event.crossing_direction)
+
+    # ── DE-DUPLICATION (short TTL) ─────────────────────────────────────
+    # Prevent duplicate counts when the same trigger is emitted repeatedly
+    now = datetime.utcnow()
+    stale = [k for k, ts in _processed_events_cache.items() if (now - ts).total_seconds() > CACHE_TTL_SECONDS]
+    for k in stale:
+        del _processed_events_cache[k]
+
+    if event_key in _processed_events_cache:
+        logger.debug(f"[UC3] Duplicate occupancy event ignored: {event_key}")
+        return
+
+    _processed_events_cache[event_key] = now
 
     multiplier = 1
     if event.crossing_direction and event.crossing_direction != settings.FORWARD_DIRECTION_FIELD:
         multiplier = -1
         logger.debug(f"[UC3] Reverse crossing detected on {cam_id} (mult: -1)")
-
-    _processed_events_cache[event_key] = now
     # ───────────────────────────────────────────────────────────────────
 
     cam_config = settings.CAMERAS.get(cam_id, {})
@@ -173,6 +193,7 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
         await _queue_or_apply(settings.B2_PARKING_ZONE, -1 * multiplier, skip_window=True)
         await _queue_or_apply(settings.B1_PARKING_ZONE, 1 * multiplier)
 
+
     # Case 5: Legacy/Phase 1 Fallback (e.g. CAM-04 or others during debug)
     # Only processes if specially triggered by dispatcher
     elif event.event_type in ("ANPR", "vehicleMatchResult", "AccessControllerEvent", "linedetection"):
@@ -187,11 +208,17 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
 
     # Final Summary Log: Always show all zone statuses for full context
     all_zones = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id.in_([
-        settings.GARAGE_TOTAL_ZONE, settings.B1_PARKING_ZONE, settings.B2_PARKING_ZONE
+        settings.GARAGE_TOTAL_ZONE, 
+        settings.B1_PARKING_ZONE, 
+        settings.B2_PARKING_ZONE
     ])).all()
     
-    # Sort for consistent display: Total, then B1, then B2
-    zone_order = {settings.GARAGE_TOTAL_ZONE: 0, settings.B1_PARKING_ZONE: 1, settings.B2_PARKING_ZONE: 2}
+    # Sort for consistent display: Total, then GF, then B1, then B2
+    zone_order = {
+        settings.GARAGE_TOTAL_ZONE: 0, 
+        settings.B1_PARKING_ZONE: 1, 
+        settings.B2_PARKING_ZONE: 2
+    }
     all_zones.sort(key=lambda z: zone_order.get(z.zone_id, 99))
     
     summary_parts = []
@@ -222,7 +249,9 @@ async def process_pending_exits(db: Session):
     if to_confirm:
         # Show overall status after confirmation for context
         all_zones = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id.in_([
-            settings.GARAGE_TOTAL_ZONE, settings.B1_PARKING_ZONE, settings.B2_PARKING_ZONE
+            settings.GARAGE_TOTAL_ZONE, 
+            settings.B1_PARKING_ZONE, 
+            settings.B2_PARKING_ZONE
         ])).all()
         zone_order = {settings.GARAGE_TOTAL_ZONE: 0, settings.B1_PARKING_ZONE: 1, settings.B2_PARKING_ZONE: 2}
         all_zones.sort(key=lambda z: zone_order.get(z.zone_id, 99))

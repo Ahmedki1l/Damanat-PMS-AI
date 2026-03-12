@@ -20,7 +20,7 @@ class Settings(BaseSettings):
         return self.DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
     # ── Network ───────────────────────────────────────────────────────────
-    BACKEND_IP: str = "5.5.5.1"
+    BACKEND_IP: str = "127.0.0.1"  # override via .env per deployment
     BACKEND_PORT: int = 8080
 
     # ── Security ──────────────────────────────────────────────────────────
@@ -34,8 +34,6 @@ class Settings(BaseSettings):
     # ── Zone UUID mappings (from Node.js backend database) ────────────────
     # Camera ID → Zone UUID (used for alert zone_id in violation/intrusion/ANPR)
     CAMERA_ZONE_MAP: dict = {
-        "CAM-01":    "e0a6c09c-4e69-46cb-93df-ebf26b8b8239",  # GF-WAITING
-        "CAM-02":    "e0a6c09c-4e69-46cb-93df-ebf26b8b8239",  # GF-WAITING
         "CAM-03":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",  # B1-PARKING
         "CAM-04":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",  # B1-PARKING
         "CAM-05":    "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",  # B1-PARKING
@@ -56,19 +54,7 @@ class Settings(BaseSettings):
     ZONE_NAME_TO_UUID: dict = {
         "B1-PARKING":     "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",
         "B2-PARKING":     "93651f64-fb84-4082-b51e-9477cf7c06ac",
-        "GF-WAITING":     "e0a6c09c-4e69-46cb-93df-ebf26b8b8239",
-        "GF-GATES":       "b17a1403-2b37-4a03-8e49-0977a1d16736",
     }
-    #── (Ground Floor) ────────────────────────────────────────────
-    CAM_01_IP: str = ""
-    CAM_01_USER: str = ""
-    CAM_01_PASSWORD: str = ""
-    CAM_01_NAME: str = "GF-ENTRANCE-INTERNAL"
-
-    CAM_02_IP: str = ""
-    CAM_02_USER: str = ""
-    CAM_02_PASSWORD: str = ""
-    CAM_02_NAME: str = "GF-WAITING"
     # ── Phase 1 Camera credentials (read from .env) ──────────────────────
     CAM_03_IP: str = ""
     CAM_03_USER: str = ""
@@ -130,10 +116,6 @@ class Settings(BaseSettings):
     CAM_14_PASSWORD: str = ""
     CAM_14_NAME: str = "B2-PARKING"
 
-    CAM_02_IP: str = ""
-    CAM_02_USER: str = ""
-    CAM_02_PASSWORD: str = ""
-    CAM_02_NAME: str = "GF-WAITING"
 
     CAM_35_IP: str = ""
     CAM_35_USER: str = ""
@@ -163,8 +145,6 @@ class Settings(BaseSettings):
 
         # Phase 1 cameras
         phase1_cams = {
-            "CAM-01": (self.CAM_01_IP, self.CAM_01_USER, self.CAM_01_PASSWORD, self.CAM_01_NAME),
-            "CAM-02": (self.CAM_02_IP, self.CAM_02_USER, self.CAM_02_PASSWORD, self.CAM_02_NAME),
             "CAM-03": (self.CAM_03_IP, self.CAM_03_USER, self.CAM_03_PASSWORD, self.CAM_03_NAME),
             "CAM-04": (self.CAM_04_IP, self.CAM_04_USER, self.CAM_04_PASSWORD, self.CAM_04_NAME),
             "CAM-05": (self.CAM_05_IP, self.CAM_05_USER, self.CAM_05_PASSWORD, self.CAM_05_NAME),
