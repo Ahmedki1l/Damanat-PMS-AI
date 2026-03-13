@@ -15,7 +15,7 @@ from app.models.alert import Alert
 from app.services.event_parser import ParsedCameraEvent
 from app.services.alert_service import create_alert
 from app.config import settings
-from app.zone_config import resolve_zone
+from app.zone_config import resolve_zone, get_real_slot_number
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -97,10 +97,14 @@ async def handle_violation_event(event: ParsedCameraEvent, db: Session):
 
     # First event in session — process and start tracking
     _active_sessions[key] = now
-    desc = (f"Line crossing in zone {zone_id}" if event.event_type == "linedetection"
-            else f"Vehicle in restricted zone: {zone_id}")
+    # zone_id is the canonical name (e.g. "restricted-vip"); zone_name is the same value
+    # stored explicitly in its own column so the API can return both fields independently.
+    zone_name = zone_id
+    desc = (f"Line crossing in zone {zone_name}" if event.event_type == "linedetection"
+            else f"Vehicle in restricted zone: {zone_name}")
     logger.warning(f"[UC5] VIOLATION: {desc}")
     alert_zone_id = settings.CAMERA_ZONE_MAP.get(event.camera_id, zone_id)
+    slot_number = get_real_slot_number(event.camera_id, event.region_id)
     await create_alert(
         db,
         "violation",
@@ -110,6 +114,8 @@ async def handle_violation_event(event: ParsedCameraEvent, db: Session):
         desc,
         region_id=_parse_region_id(event.region_id),
         snapshot_path=event.snapshot_path,
+        slot_number=slot_number,
+        zone_name=zone_name,
     )
 
 

@@ -11,7 +11,7 @@ from app.models.alert import Alert
 from app.services.event_parser import ParsedCameraEvent
 from app.services.alert_service import create_alert
 from app.config import settings
-from app.zone_config import ZoneNames, resolve_zone
+from app.zone_config import ZoneNames, resolve_zone, get_real_slot_number
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -92,13 +92,10 @@ async def handle_intrusion_event(event: ParsedCameraEvent, db: Session):
 
     # First event in session — process and start tracking
     _active_sessions[key] = now
-    desc = f"Vehicle intrusion in {zone_id} — {event.camera_id}"
-    logger.warning(f"[UC6] INTRUSION: {desc}")
-    await create_alert(db, "intrusion", event.camera_id, zone_id, event.event_type, desc)
-    # 4. Create Alert
     description = f"Vehicle intrusion detected in {zone_id} via {event.camera_id}"
     logger.warning(f"[UC6] INTRUSION DETECTED: {description}")
     alert_zone_id = settings.CAMERA_ZONE_MAP.get(event.camera_id, zone_id)
+    slot_number = get_real_slot_number(event.camera_id, event.region_id)
     await create_alert(
         db,
         alert_type="intrusion",
@@ -108,4 +105,6 @@ async def handle_intrusion_event(event: ParsedCameraEvent, db: Session):
         description=description,
         snapshot_path=event.snapshot_path,
         region_id=region_id,
+        slot_number=slot_number,
+        zone_name=zone_id,   # stored explicitly in its own column
     )
