@@ -298,12 +298,24 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
                 f"[ANPR-DEBUG] No plate found in any known path for {event_type} from {camera_id}"
             )
 
+    crossing_direction = find_text("direction") or find_text("crossingDirection")
+
+    # Diagnostic: log parsed linedetection fields so we can verify
+    # that region_id and crossing_direction are correctly extracted.
+    parsed_event_type = find_text("eventType") or "unknown"
+    if parsed_event_type == "linedetection":
+        logger.info(
+            f"[Parser] {resolved_camera_id} | linedetection | "
+            f"region_id={region_id!r} | direction={crossing_direction!r} | "
+            f"target={detection_target!r}"
+        )
+
     return ParsedCameraEvent(
         camera_id=resolved_camera_id,
         device_serial=find_text("deviceSerial") or "unknown",
         channel_id=int(find_text("channelID") or 1),
-        event_type=find_text("eventType") or "unknown",
-        detection_target=detection_target or ("vehicle" if find_text("eventType") in ("ANPR", "vehicleMatchResult") else None),
+        event_type=parsed_event_type,
+        detection_target=detection_target or ("vehicle" if parsed_event_type in ("ANPR", "vehicleMatchResult") else None),
         region_id=region_id,
         channel_name=find_text("channelName"),
         trigger_time=trigger_time,
@@ -311,7 +323,7 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
         event_state=find_text("eventState"),
         event_description=find_text("eventDescription"),
         plate_number=plate_number,
-        crossing_direction=find_text("direction") or find_text("crossingDirection"),
+        crossing_direction=crossing_direction,
     )
 
 
