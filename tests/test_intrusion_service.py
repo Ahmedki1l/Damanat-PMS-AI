@@ -60,5 +60,14 @@ async def test_two_regions_create_distinct_alerts(db_session, monkeypatch):
 
     alerts = db_session.query(Alert).order_by(Alert.id).all()
     assert len(alerts) == 2
+
+    # zone_id and zone_name must both be set and match the resolved zone
     assert {a.zone_id for a in alerts} == {"emergency-exit", "staff-only-area"}
     assert {a.region_id for a in alerts} == {0, 1}
+
+    # zone_name column (real DB field) must equal zone_id for each row
+    for a in alerts:
+        assert a.zone_name is not None, f"Alert {a.id} has NULL zone_name"
+        assert a.zone_name == a.zone_id, (
+            f"Alert {a.id}: zone_name={a.zone_name!r} != zone_id={a.zone_id!r}"
+        )
