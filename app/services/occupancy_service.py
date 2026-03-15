@@ -14,15 +14,25 @@ logger = get_logger(__name__)
 _processed_events_cache = {}
 CACHE_TTL_SECONDS = 1
 
+async def push_db_update(db: Session, zone_id: str, delta: int):
+    """
+    Atomic 'Push' function to update the database directly.
+    This replaces the old ORM update to prevent miscounts.
+    """
+    from sqlalchemy import update
+    
+    stmt = (
+        update(ZoneOccupancy)
+        .where(ZoneOccupancy.zone_id == zone_id)
+        .values(current_count=ZoneOccupancy.current_count + delta)
+    )
+    db.execute(stmt)
+    db.flush() # Explicitly push the change to the database session
+
 async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Session):
     """
-    Update a zone's occupancy count in the local database first, then try to
-    sync the same increment/decrement to the Node.js backend.
+    Update a zone's occupancy count using the manual push function.
     """
-    from app.utils import core_backend_client
-
-    zone_uuid = settings.ZONE_NAME_TO_UUID.get(zone_id)
-
     # ── Primary source of truth: local zone_occupancy table ───────────────
     zone = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id == zone_id).first()
     if not zone:
@@ -36,16 +46,23 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
         )
         db.add(zone)
         db.flush()
-    logger.debug(f"[UC3] {zone_id}: {zone.current_count} {delta} ({zone.current_count + delta}) 1")
 
-    zone.camera_id = camera_id
-    zone.current_count = max(0, zone.current_count + delta)
-    logger.debug(f"[UC3] {zone_id}: {zone.current_count} {delta} 2")
+    # 1. Use the 'push' function to update the count atomically
+    await push_db_update(db, zone_id, delta)
+    
+    # 2. Refresh to get the final count for logging/alerts
+    db.refresh(zone)
+    
+    # Ensure count doesn't drop below zero
+    if zone.current_count < 0:
+        zone.current_count = 0
+        db.flush()
+
     zone.last_updated = datetime.utcnow()
     occupancy_ratio = (zone.current_count / zone.max_capacity) if zone.max_capacity > 0 else 0
     pct = int(occupancy_ratio * 100)
-    logger.debug(f"[UC3] {zone_id}: {zone.current_count}/{zone.max_capacity} ({pct}%)")
-    logger.debug(f"[UC3] {zone_id}: {zone.current_count} {delta} 3")
+    
+    logger.info(f"[UC3] {zone_id} Updated via Push: {zone.current_count}/{zone.max_capacity} ({pct}%)")
 
     if occupancy_ratio >= 1:
         await create_alert(
@@ -56,8 +73,6 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
             event_type="occupancy_update",
             description=f"Zone {zone_id} is nearly full: {pct}% ({zone.current_count}/{zone.max_capacity})",
         )
-
-    logger.debug(f"[UC3] {zone_id}: {zone.current_count} {delta} 4")
 
 async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
     """
@@ -75,6 +90,17 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
     if event.event_type not in allowed_types:
         logger.debug(f"[UC3] Ignoring {event.event_type} event from {event.camera_id}: type not in {allowed_types}")
         return
+
+    # 3. Deduplication: Ignore identical events within 1 second
+    # Use (cam, type, region) or (cam, type, direction) as the key
+    cache_key = (event.camera_id, event.event_type, event.region_id or event.crossing_direction)
+    now = datetime.utcnow().timestamp()
+    if cache_key in _processed_events_cache:
+        last_time = _processed_events_cache[cache_key]
+        if now - last_time < CACHE_TTL_SECONDS:
+            logger.debug(f"[UC3] {event.camera_id}: DROPPED duplicate {event.event_type} event (too fast)")
+            return
+    _processed_events_cache[cache_key] = now
     # ───────────────────────────────────────────────────────────────────
 
     cam_id = event.camera_id
