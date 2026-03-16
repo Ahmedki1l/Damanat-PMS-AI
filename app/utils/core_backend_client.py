@@ -169,12 +169,18 @@ async def notify_pms_anpr(
                     resp = await client.get(image_path)
                     if resp.status_code == 200:
                         image_base64 = base64.b64encode(resp.content).decode("ascii")
+                    else:
+                        logger.warning(f"[PMS] Image download failed: HTTP {resp.status_code} from {image_path}")
             elif os.path.exists(image_path):
                 # Local file
                 with open(image_path, "rb") as f:
                     image_base64 = base64.b64encode(f.read()).decode("ascii")
+            else:
+                logger.warning(f"[PMS] Image path does not exist: {image_path}")
         except Exception as e:
             logger.warning(f"[PMS] Failed to encode image for plate={plate}: {e}")
+    else:
+        logger.warning(f"[PMS] No snapshot available for plate={plate} — sending without image")
 
     body = {
         "plate": plate,
@@ -187,10 +193,11 @@ async def notify_pms_anpr(
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(url, json=body, headers={"Content-Type": "application/json"})
             if resp.status_code in (200, 201):
-                logger.info(f"[PMS] Plate forwarded: {plate} ({direction})")
+                logger.info(f"[PMS] Plate forwarded: {plate} ({direction}) image={'yes' if image_base64 else 'no'}")
             else:
-                logger.warning(f"[PMS] POST /api/anpr/event → HTTP {resp.status_code}: {resp.text[:200]}")
+                logger.warning(f"[PMS] POST /api/anpr/event -> HTTP {resp.status_code}: {resp.text[:200]}")
     except httpx.ConnectError:
         logger.warning(f"[PMS] Unreachable — could not forward plate={plate}")
     except Exception as e:
         logger.warning(f"[PMS] Forward failed for plate={plate}: {e}")
+

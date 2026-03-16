@@ -40,6 +40,7 @@ class ParsedCameraEvent:
     event_state: Optional[str] = None      # active | inactive
     event_description: Optional[str] = None  # human-readable description
     snapshot_path: Optional[str] = None    # path to saved snapshot image
+    local_snapshot_path: Optional[str] = None  # original local file (preserved for PMS forwarding)
     # Phase 2 ANPR fields
     plate_number: Optional[str] = None     # cardNo from AccessControllerEvent
     user_type: Optional[str] = None        # normal | visitor | blacklist
