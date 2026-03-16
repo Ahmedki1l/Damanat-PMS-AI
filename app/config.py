@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     NODEBACK_SITE_ID: str = ""      # UUID of this parking site in the website backend
     NODEBACK_SERVICE_KEY: str = ""  # X-Service-Key header value for service-to-service auth
 
+    # ── PMS Tracking API Integration ─────────────────────────────────────
+    PMS_API_URL: str = ""           # e.g. "http://localhost:8000"; empty = disabled
+
     # ── Zone UUID mappings (from Node.js backend database) ────────────────
     # Camera ID → Zone UUID (used for alert zone_id in violation/intrusion/ANPR)
     CAMERA_ZONE_MAP: dict = {

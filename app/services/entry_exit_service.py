@@ -73,6 +73,24 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
             )
             return
 
+    # Deduplication: the ANPR camera pushes two events per detection —
+    # one ANPR XML (multipart) and one vehicleMatchResult JSON.
+    # Suppress the second if the same plate + gate was logged within 30 seconds.
+    event_time = event.trigger_time or datetime.utcnow()
+    dedup_window = event_time - timedelta(seconds=30)
+    recent = (
+        db.query(EntryExitLog)
+        .filter(
+            EntryExitLog.plate_number == plate,
+            EntryExitLog.gate == gate,
+            EntryExitLog.event_time >= dedup_window,
+        )
+        .first()
+    )
+    if recent:
+        logger.info(f"[UC1] Duplicate suppressed for plate={plate} gate={gate} (already logged at {recent.event_time})")
+        return
+
     # UC4: Resolve vehicle identity via vehicle_service
     vehicle = vehicle_service.lookup_vehicle(db, plate)
     vehicle_type = vehicle.vehicle_type if vehicle else "unknown"
@@ -86,7 +104,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         vehicle_type=vehicle_type,
         gate=gate,
         camera_id=event.camera_id,
-        event_time=event_time,
+        event_time=event.trigger_time or datetime.utcnow(),
         snapshot_path=event.snapshot_path,
         created_at=datetime.utcnow(),
     )
@@ -158,3 +176,11 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
             )
     except Exception as e:
         logger.warning(f"[UC1] Node.js backend notification failed for plate={plate}: {e}")
+
+    # Forward plate + snapshot to PMS tracking API (fire-and-forget)
+    try:
+        await core_backend_client.notify_pms_anpr(
+            plate, gate, image_path=event.snapshot_path,
+        )
+    except Exception as e:
+        logger.warning(f"[UC1] PMS API forwarding failed for plate={plate}: {e}")
