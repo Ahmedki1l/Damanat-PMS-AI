@@ -139,3 +139,58 @@ async def notify_exit(
     result = await _post(f"/api/v1/sites/{settings.NODEBACK_SITE_ID}/parking-times/exit", body)
     if result is not None:
         logger.info(f"[NodeBack] Exit recorded plate={plate}")
+
+
+# ── PMS Tracking API (plate forwarding) ────────────────────────────────
+
+async def notify_pms_anpr(
+    plate: str,
+    direction: str,
+    image_path: Optional[str] = None,
+) -> None:
+    """
+    Forward ANPR detection to the PMS tracking API.
+    Sends plate + direction + base64-encoded snapshot image.
+    Fire-and-forget: failures are logged but never block camera event processing.
+    """
+    if not settings.PMS_API_URL:
+        return
+
+    import base64
+    import os
+
+    image_base64 = ""
+
+    if image_path:
+        try:
+            if image_path.startswith("http"):
+                # CDN URL — download the image first
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.get(image_path)
+                    if resp.status_code == 200:
+                        image_base64 = base64.b64encode(resp.content).decode("ascii")
+            elif os.path.exists(image_path):
+                # Local file
+                with open(image_path, "rb") as f:
+                    image_base64 = base64.b64encode(f.read()).decode("ascii")
+        except Exception as e:
+            logger.warning(f"[PMS] Failed to encode image for plate={plate}: {e}")
+
+    body = {
+        "plate": plate,
+        "direction": direction,
+        "image_base64": image_base64,
+    }
+
+    url = f"{settings.PMS_API_URL}/api/anpr/event"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, json=body, headers={"Content-Type": "application/json"})
+            if resp.status_code in (200, 201):
+                logger.info(f"[PMS] Plate forwarded: {plate} ({direction})")
+            else:
+                logger.warning(f"[PMS] POST /api/anpr/event → HTTP {resp.status_code}: {resp.text[:200]}")
+    except httpx.ConnectError:
+        logger.warning(f"[PMS] Unreachable — could not forward plate={plate}")
+    except Exception as e:
+        logger.warning(f"[PMS] Forward failed for plate={plate}: {e}")
