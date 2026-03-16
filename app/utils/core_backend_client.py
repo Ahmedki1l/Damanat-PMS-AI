@@ -183,6 +183,7 @@ async def notify_pms_anpr(
     }
 
     url = f"{settings.PMS_API_URL}/api/anpr/event"
+    logger.info(f"[PMS→YOLO] Sending plate={plate} direction={direction} to {url}")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(url, json=body, headers={"Content-Type": "application/json"})
