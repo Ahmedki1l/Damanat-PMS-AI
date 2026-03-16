@@ -11,6 +11,7 @@ from app.services.event_parser import ParsedCameraEvent
 from app.services.alert_service import create_alert
 from app.config import settings
 from app.utils.logger import get_logger
+from app.utils import core_backend_client
 
 logger = get_logger(__name__)
 
@@ -25,7 +26,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
     gate = camera_config.get("gate", event.gate)
 
     if not plate:
-        logger.warning(f"[Phase2] ANPR event with no plate from {event.camera_id} - skipped")
+        logger.debug(f"[Phase2] ANPR event with no plate from {event.camera_id} - skipped")
         return
 
     # Strip timezone info: camera sends tz-aware timestamps but DB stores naive UTC.
@@ -48,13 +49,20 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         .first()
     )
     if recent:
-        logger.info(f"[UC1] Duplicate suppressed for plate={plate} gate={gate} (already logged at {recent.event_time})")
+        logger.debug(f"[UC1] Duplicate suppressed for plate={plate} gate={gate}")
         return
 
     # Anti-bounce: if this is an entry event but the plate just exited within the
     # last 2 minutes, the entry camera is likely capturing the car driving away
     # from the exit gate — suppress the false re-entry.
     if gate == "entry":
+        # Forward plate + snapshot to PMS tracking API (fire-and-forget)
+        try:
+            await core_backend_client.notify_pms_anpr(
+                plate, gate, image_path=event.snapshot_path,
+            )
+        except Exception as e:
+            logger.warning(f"[UC1] PMS API forwarding failed for plate={plate}: {e}")
         recent_exit_window = event_time - timedelta(seconds=120)
         recent_exit = (
             db.query(EntryExitLog)
@@ -66,10 +74,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
             .first()
         )
         if recent_exit:
-            logger.info(
-                f"[UC1] Anti-bounce: suppressed false entry for plate={plate} "
-                f"(exited {int((event_time - recent_exit.event_time).total_seconds())}s ago)"
-            )
+            logger.debug(f"[UC1] Anti-bounce: suppressed false entry for plate={plate}")
             return
 
     # UC4: Resolve vehicle identity via vehicle_service
@@ -139,20 +144,3 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
 
     if log_entry not in db.new:
         db.add(log_entry)
-
-    # Forward parking-time events to Node.js backend (fire-and-forget)
-    try:
-        from app.utils import core_backend_client
-        if gate == "entry":
-            await core_backend_client.notify_entry(
-                plate, event.camera_id, event_time,
-                vehicle_type=vehicle_type,
-                image_url=event.snapshot_path,
-            )
-        elif gate == "exit":
-            await core_backend_client.notify_exit(
-                plate, event.camera_id, event_time,
-                image_url=event.snapshot_path,
-            )
-    except Exception as e:
-        logger.warning(f"[UC1] Node.js backend notification failed for plate={plate}: {e}")

@@ -241,20 +241,12 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
              if node is not None and not plate_number:
                  plate_number = find_text("licensePlateNumber", node) or find_text("plateNumber", node) or find_text("cardNo", node)
          
-         if not plate_number:
-             logger.debug(f"[DEBUG-ANPR] Plate not found in XML. Payload head (500 chars): {xml_str[:500]}")
-         else:
-             logger.info(f"[DEBUG-ANPR] Extracted plate: {plate_number}")
+         pass  # plate search continues below in the ANPR extraction block
 
     event_type = find_text("eventType") or "unknown"
     camera_id = settings.CAMERA_IP_MAP.get(camera_ip, f"UNKNOWN-{camera_ip}")
 
-    # ── ANPR XML debug: dump full XML so we can see the actual structure ──
-    if event_type in ("ANPR", "vehicleMatchResult"):
-        logger.warning(
-            f"[ANPR-DEBUG] camera={camera_id} ip={camera_ip} type={event_type} "
-            f"--- RAW XML START ---\n{xml_str}\n--- RAW XML END ---"
-        )
+
 
     # ── ANPR XML extraction: try common Hikvision plate paths ──
     plate_number = None
@@ -287,16 +279,13 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
             el = root.find(path)
             if el is not None and el.text and el.text.strip():
                 plate_number = el.text.strip()
-                logger.info(f"[ANPR-DEBUG] Found plate '{plate_number}' at path: {path}")
                 break
 
         if plate_number:
             plate_number = _normalize_plate(plate_number)
-            logger.info(f"[ANPR] Normalized plate: {plate_number} ({camera_id})")
+            logger.debug(f"[ANPR] Normalized plate: {plate_number} ({camera_id})")
         else:
-            logger.warning(
-                f"[ANPR-DEBUG] No plate found in any known path for {event_type} from {camera_id}"
-            )
+            logger.debug(f"[ANPR] No plate found in XML for {event_type} from {camera_id}")
 
     crossing_direction = find_text("direction") or find_text("crossingDirection")
 
@@ -404,9 +393,9 @@ def _parse_json_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
     plate_number = _normalize_plate(raw_plate) if raw_plate else None
 
     if plate_number:
-        logger.info(f"[ANPR] Extracted plate: {raw_plate!r} → {plate_number!r} ({camera_id})")
+        logger.debug(f"[ANPR] Extracted plate: {raw_plate!r} -> {plate_number!r} ({camera_id})")
     else:
-        logger.warning(f"[ANPR] No plate found in JSON event from {camera_id}")
+        logger.debug(f"[ANPR] No plate found in JSON event from {camera_id}")
 
     return ParsedCameraEvent(
         camera_id=camera_id,
