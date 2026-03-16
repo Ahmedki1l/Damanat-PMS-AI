@@ -34,6 +34,10 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
         "AccessControllerEvent", "vehicleMatchResult", "ANPR",
     )
     if event.event_type in SNAPSHOT_EVENT_TYPES:
+        # Preserve the original local file path before Spaces upload replaces it
+        if event.snapshot_path and not event.snapshot_path.startswith("http"):
+            event.local_snapshot_path = event.snapshot_path
+
         # Step 1: Upload the multipart detection frame (the actual evidence) to Spaces
         if (
             event.snapshot_path
