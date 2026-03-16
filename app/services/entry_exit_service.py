@@ -168,3 +168,11 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
             )
     except Exception as e:
         logger.warning(f"[UC1] Node.js backend notification failed for plate={plate}: {e}")
+
+    # Forward plate + snapshot to PMS tracking API (fire-and-forget)
+    try:
+        await core_backend_client.notify_pms_anpr(
+            plate, gate, image_path=event.snapshot_path,
+        )
+    except Exception as e:
+        logger.warning(f"[UC1] PMS API forwarding failed for plate={plate}: {e}")
