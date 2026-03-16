@@ -12,6 +12,7 @@ from typing import List, Optional
 from app.database import get_db
 from app.services.event_parser import parse_camera_event
 from app.services.event_dispatcher import dispatch_event
+from app.services.occupancy_service import record_event_in_cache
 from app.utils.logger import get_logger
 
 router = APIRouter()
@@ -38,11 +39,20 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
 
         # 1. Parse unified event
         event = parse_camera_event(raw_body, camera_ip, content_type)
-        # logger.info(f"Parsed Event: type={event.event_type} | camera={event.camera_id} | plate={event.plate_number}") # Moved to dispatcher/parser
+        logger.info(f"Parsed Event: type={event.event_type} | camera={event.camera_id} | plate={event.plate_number}")
+
+        # CAM-04 diagnostic: log every field so we can see exit events and ignored types
+        if event.camera_id == "CAM-04":
+            logger.info(
+                f"[CAM-04 DEBUG] type={event.event_type} | state={event.event_state} | "
+                f"target={event.detection_target} | region_id={event.region_id} | "
+                f"direction={event.crossing_direction} | description={event.event_description}"
+            )
 
         # 2. Dispatch to handlers (UC1–UC6) — this also fetches the snapshot
         #    and sets event.snapshot_path before we persist records.
-        await dispatch_event(event, db)
+        #    FIX #2: dispatch now returns pending cache keys for post-commit recording.
+        dispatch_result = await dispatch_event(event, db) or {}
 
         # 3. Persist raw event log (skip high-frequency VMD noise)
         #    Done AFTER dispatch so event.snapshot_path contains the CDN URL.
@@ -66,6 +76,12 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
 
         # 4. Commit — router owns the transaction, not the dispatcher
         db.commit()
+
+        # FIX #2 (cache-vs-rollback): only record occupancy events in the dedup
+        # cache AFTER commit succeeds. If commit had failed (rollback above),
+        # the cache stays clean so camera retries are accepted, not dropped.
+        for cache_key in dispatch_result.get("occupancy_cache_keys", []):
+            record_event_in_cache(cache_key)
 
         return {"status": "ok", "event_type": event.event_type}
 

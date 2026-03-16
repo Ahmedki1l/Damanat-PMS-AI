@@ -2,10 +2,11 @@
 """Routes events to correct use-case handlers — Phase 1 and Phase 2."""
 
 from app.services.event_parser import ParsedCameraEvent
-from app.services.occupancy_service import handle_occupancy_event
+from app.services.occupancy_service import handle_occupancy_event, record_event_in_cache
 from app.services.violation_service import handle_violation_event, resolve_violation_on_exit, RESTRICTED_ZONES
 from app.zone_config import resolve_zone
 from app.services.intrusion_service import handle_intrusion_event, MONITORED_INTRUSION_ZONES
+from app.services.field_occupancy_service import handle_field_occupancy_event
 from app.services.entry_exit_service import handle_anpr_event
 from app.services.snapshot_service import fetch_snapshot
 from app.utils.logger import get_logger
@@ -14,11 +15,16 @@ from sqlalchemy.orm import Session
 
 logger = get_logger(__name__)
 
-async def dispatch_event(event: ParsedCameraEvent, db: Session):
+async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
     """
     Route event to handlers and commit as a single transaction.
     Protects UC3 and UC2 logic while maintaining teammates' UC5/UC6 work.
+
+    Returns a dict of post-commit callbacks. The router must call these
+    AFTER db.commit() succeeds (FIX #2: cache-vs-rollback mismatch).
     """
+    # Collects cache keys that should only be recorded after successful commit
+    _post_commit_cache_keys = []
     # Snapshot strategy (priority order):
     # 1. If multipart detection frame was saved locally → upload to Spaces → CDN URL
     # 2. If no multipart image → try fetching fresh snapshot from camera
@@ -106,14 +112,22 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
         is_smart_occupancy_event = is_occupancy_cam
 
         if is_smart_occupancy_event:
-            await handle_occupancy_event(event, db)
+            # FIX #2: handle_occupancy_event now returns a cache_key (or None).
+            # We collect it for post-commit recording instead of caching pre-commit.
+            oc_cache_key = await handle_occupancy_event(event, db)
+            if oc_cache_key:
+                _post_commit_cache_keys.append(oc_cache_key)
         elif is_gate:
              logger.debug(f"[UC3] Gate camera {event.camera_id} sent non-occupancy event: {event.event_type}")
 
 
+        # ✅ Field Occupancy: fielddetection in parking-area zones → per-slot tracking
+        if event.event_type == "fielddetection" and resolved_zone and resolved_zone.startswith("parking-area"):
+            await handle_field_occupancy_event(event, db)
+
         # ✅ UC5 & UC6: Violations and Intrusion (Teammates' Tasks)
         # Logic: Route based on zone lists to prevent double-firing
-        if event.event_type in ("fielddetection", "regionEntrance") and is_vehicle:
+        elif event.event_type in ("fielddetection", "regionEntrance") and is_vehicle:
             route_zone = resolved_zone or zone_id
             if route_zone in MONITORED_INTRUSION_ZONES:
                 await handle_intrusion_event(event, db)
@@ -140,6 +154,9 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session):
 
         # ── MAINTENANCE ───────────────────────────────────────────────────────
         # Pending logic removed per user request
+
+        # FIX #2: Return pending cache keys for the router to record after commit
+        return {"occupancy_cache_keys": _post_commit_cache_keys}
 
     except Exception as e:
         db.rollback()
