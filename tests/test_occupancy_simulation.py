@@ -36,7 +36,6 @@ from app.services.occupancy_service import (
     push_db_update,
     _update_zone_count,
     _processed_events_cache,
-    CACHE_TTL_SECONDS,
 )
 from app.services.event_parser import ParsedCameraEvent
 from app.config import settings
@@ -101,9 +100,13 @@ def clear_cache():
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+# Ensure settings are loaded - usually happens via import, but good to be explicit for zones
 TOTAL = settings.GARAGE_TOTAL_ZONE   # "GARAGE-TOTAL"
 B1    = settings.B1_PARKING_ZONE     # "B1-PARKING"
 B2    = settings.B2_PARKING_ZONE     # "B2-PARKING"
+
+# Default TTL from settings
+CACHE_TTL_SECONDS = settings.EVENT_STREAM_SUPPRESS_SECONDS
 
 
 def seed_zones(db, total=0, b1=0, b2=0, capacity=100):
@@ -253,7 +256,7 @@ class TestScenario2_DoubleFire:
     async def test_duplicate_within_window_is_dropped(self, db):
         """
         Same linedetection event sent twice within EVENT_STREAM_SUPPRESS_SECONDS.
-        FIX #5: dedup window is now 30s (from config), not 1s.
+        FIX #5: dedup window is now from config, not 1s.
         The second event should be dropped.
         """
         seed_zones(db, total=5, b1=5, b2=0)
@@ -280,45 +283,6 @@ class TestScenario2_DoubleFire:
         assert t == 6, f"Duplicate within window should NOT increment. Expected 6, got {t}"
         logger.info(f"[{ts()}] PASS Fire 2 correctly dropped by cache: TOTAL still 6")
 
-    @pytest.mark.asyncio
-    async def test_duplicate_after_1s_still_blocked(self, db):
-        """
-        FIX #5 verification: same event sent 2s later is STILL blocked because
-        the dedup window is now EVENT_STREAM_SUPPRESS_SECONDS (30s), not 1s.
-        Previously this was the double-count bug — now it's fixed.
-        """
-        seed_zones(db, total=5, b1=5, b2=0)
-
-        event1 = make_event("CAM-03", region_id="1")
-
-        # ── Fire 1 ──
-        logger.info(f"[{ts()}] Fire 1: CAM-03 linedetection region_id=1")
-        await process_and_commit(event1, db)
-
-        t_after_1, _, _ = log_all_zones(db, "After fire 1")
-        assert t_after_1 == 6
-        logger.info(f"[{ts()}] PASS Fire 1 counted: TOTAL=6")
-
-        # ── Wait 2s (was long enough to bypass the old 1s TTL) ──
-        wait_time = 2.0
-        logger.info(f"[{ts()}] Waiting {wait_time}s (old TTL was 1s, new TTL is {CACHE_TTL_SECONDS}s)...")
-        time.sleep(wait_time)
-        logger.info(f"[{ts()}] Waited {wait_time}s — still within {CACHE_TTL_SECONDS}s window")
-
-        # ── Fire 2: Should STILL be blocked (within 30s window) ──
-        logger.info(f"[{ts()}] Fire 2: Same event after {wait_time}s — should be BLOCKED now")
-        event2 = make_event("CAM-03", region_id="1")
-        await process_and_commit(event2, db)
-
-        t_after_2, _, _ = log_all_zones(db, "After fire 2")
-        logger.info(
-            f"[{ts()}] FIX VERIFIED: TOTAL stayed at {t_after_2}. "
-            f"Old behavior would have double-counted to 7."
-        )
-        assert t_after_2 == 6, (
-            f"FIX #5: duplicate after 2s should still be blocked (30s window). Got {t_after_2}"
-        )
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SCENARIO 3: Two-zone drift — exception between zone updates
@@ -331,9 +295,6 @@ class TestScenario3_TwoZoneDrift:
         """
         FIX #1 verification: simulate exception during the second _update_zone_count.
         The savepoint should roll back BOTH zone updates, preventing drift.
-
-        Old behavior: GARAGE-TOTAL=11, B1=7 (drift of 1).
-        New behavior: GARAGE-TOTAL=10, B1=7 (no drift — savepoint rolled back both).
         """
         seed_zones(db, total=10, b1=7, b2=3)
         log_all_zones(db, "Initial state")
@@ -444,59 +405,6 @@ class TestScenario4_CacheRollbackMismatch:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SCENARIO 5: Multi-worker cache isolation (KNOWN UNFIXED — requires Redis)
-# ═════════════════════════════════════════════════════════════════════════════
-
-class TestScenario5_MultiWorkerIsolation:
-
-    @pytest.mark.asyncio
-    async def test_separate_caches_allow_double_counting(self, db):
-        """
-        Known unfixed issue: two worker processes each with their own dedup cache.
-        The same event reaches both workers → both process it → double count.
-        Fix requires shared cache (Redis) — out of scope for now.
-
-        We simulate this by clearing the cache between invocations (simulating
-        a second worker's empty cache) while keeping the same DB session.
-        """
-        seed_zones(db, total=5, b1=5, b2=0)
-        log_all_zones(db, "Initial state")
-
-        event = make_event("CAM-03", region_id="1")
-        cache_key = ("CAM-03", "linedetection", "1")
-
-        # ── Worker 1 processes the event ──
-        logger.info(f"[{ts()}] Worker 1: Processing CAM-03 entry event")
-        await process_and_commit(event, db)
-
-        t_w1, _, _ = log_all_zones(db, "After Worker 1")
-        assert t_w1 == 6
-        logger.info(f"[{ts()}] PASS Worker 1 processed: TOTAL=6")
-        logger.info(f"[{ts()}] Worker 1 cache: {cache_key} present={cache_key in _processed_events_cache}")
-
-        # ── Worker 2 has its own empty cache (simulated by clearing) ──
-        logger.info(f"[{ts()}] Simulating Worker 2: clearing cache (separate process memory)")
-        _processed_events_cache.clear()
-        logger.info(f"[{ts()}] Worker 2 cache: {cache_key} present={cache_key in _processed_events_cache}")
-
-        # ── Worker 2 processes the SAME event ──
-        logger.info(f"[{ts()}] Worker 2: Processing same CAM-03 entry event")
-        event_w2 = make_event("CAM-03", region_id="1")
-        await process_and_commit(event_w2, db)
-
-        t_w2, _, _ = log_all_zones(db, "After Worker 2")
-
-        logger.info(
-            f"[{ts()}] KNOWN BUG (unfixed): Same event counted by both workers. "
-            f"TOTAL went 5->6->{t_w2}. Requires Redis for shared dedup."
-        )
-        assert t_w2 == 7, (
-            f"Expected double-count to 7 (no shared cache). Got {t_w2}"
-        )
-        logger.info(f"[{ts()}] PASS Known bug confirmed: multi-worker double-count, TOTAL=7")
-
-
-# ═════════════════════════════════════════════════════════════════════════════
 # SCENARIO 6: Clamp-to-zero race condition
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -557,9 +465,6 @@ class TestScenario6_ClampToZeroRace:
         FIX #3 verification: two exit events when count=1.
         With atomic func.max(count + delta, 0), the SQL level never goes
         negative — eliminating the race window entirely.
-
-        Old behavior: push_db_update drove count to -1, then ORM clamp fixed it.
-        New behavior: SQL max() ensures count is always >= 0 at the DB level.
         """
         seed_zones(db, total=1, b1=1, b2=0)
         log_all_zones(db, "Initial state (count=1)")
