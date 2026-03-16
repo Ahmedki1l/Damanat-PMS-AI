@@ -1,6 +1,6 @@
 # app/services/occupancy_service.py
 from datetime import datetime
-from sqlalchemy import update, func
+from sqlalchemy import update, func, case
 from sqlalchemy.orm import Session
 from app.models.zone_occupancy import ZoneOccupancy
 from app.services.event_parser import ParsedCameraEvent
@@ -30,7 +30,12 @@ async def push_db_update(db: Session, zone_id: str, delta: int):
     stmt = (
         update(ZoneOccupancy)
         .where(ZoneOccupancy.zone_id == zone_id)
-        .values(current_count=func.max(ZoneOccupancy.current_count + delta, 0))
+        .values(
+            current_count=case(
+                (ZoneOccupancy.current_count + delta > 0, ZoneOccupancy.current_count + delta),
+                else_=0
+            )
+        )
     )
     db.execute(stmt)
     db.flush()
