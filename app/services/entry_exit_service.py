@@ -28,10 +28,16 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         logger.warning(f"[Phase2] ANPR event with no plate from {event.camera_id} - skipped")
         return
 
+    # Normalize to naive UTC once: camera sends tz-aware timestamps but DB stores
+    # naive UTC. Mixing the two in subtraction/comparison raises
+    # "can't subtract offset-naive and offset-aware datetimes".
+    event_time = event.trigger_time or datetime.utcnow()
+    if event_time.tzinfo is not None:
+        event_time = event_time.replace(tzinfo=None)
+
     # Deduplication: the ANPR camera pushes two events per detection —
     # one ANPR XML (multipart) and one vehicleMatchResult JSON.
     # Suppress the second if the same plate + gate was logged within 30 seconds.
-    event_time = event.trigger_time or datetime.utcnow()
     dedup_window = event_time - timedelta(seconds=30)
     recent = (
         db.query(EntryExitLog)
@@ -67,24 +73,6 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
             )
             return
 
-    # Deduplication: the ANPR camera pushes two events per detection —
-    # one ANPR XML (multipart) and one vehicleMatchResult JSON.
-    # Suppress the second if the same plate + gate was logged within 30 seconds.
-    event_time = event.trigger_time or datetime.utcnow()
-    dedup_window = event_time - timedelta(seconds=30)
-    recent = (
-        db.query(EntryExitLog)
-        .filter(
-            EntryExitLog.plate_number == plate,
-            EntryExitLog.gate == gate,
-            EntryExitLog.event_time >= dedup_window,
-        )
-        .first()
-    )
-    if recent:
-        logger.info(f"[UC1] Duplicate suppressed for plate={plate} gate={gate} (already logged at {recent.event_time})")
-        return
-
     # UC4: Resolve vehicle identity via vehicle_service
     vehicle = vehicle_service.lookup_vehicle(db, plate)
     vehicle_type = vehicle.vehicle_type if vehicle else "unknown"
@@ -98,7 +86,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         vehicle_type=vehicle_type,
         gate=gate,
         camera_id=event.camera_id,
-        event_time=event.trigger_time or datetime.utcnow(),
+        event_time=event_time,
         snapshot_path=event.snapshot_path,
         created_at=datetime.utcnow(),
     )
@@ -117,11 +105,13 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         )
 
         if matching_entry:
-            # Normalize both to naive UTC to avoid "can't subtract offset-naive and offset-aware datetimes"
-            t1 = log_entry.event_time.replace(tzinfo=None) if log_entry.event_time.tzinfo else log_entry.event_time
-            t2 = matching_entry.event_time.replace(tzinfo=None) if matching_entry.event_time.tzinfo else matching_entry.event_time
-            
-            duration_seconds = int((t1 - t2).total_seconds())
+            # event_time is already naive (normalized above); matching_entry may
+            # still be tz-aware if it was stored before the fix, so strip it too.
+            t2 = matching_entry.event_time
+            if t2.tzinfo is not None:
+                t2 = t2.replace(tzinfo=None)
+
+            duration_seconds = int((event_time - t2).total_seconds())
             log_entry.parking_duration = max(0, duration_seconds)
 
             db.add(log_entry)
