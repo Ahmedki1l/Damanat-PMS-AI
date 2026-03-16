@@ -1,117 +1,181 @@
 # tests/test_occupancy_service.py
-"""Unit tests for the occupancy service (UC3) — linedetection + region_id direction."""
+"""Unit tests for the occupancy service (UC3) — linedetection + region_id direction.
+
+Updated to use real SQLite DB instead of MagicMock, since the service now uses
+savepoints (begin_nested) and atomic SQL updates (func.max) which require a
+real DB session.
+"""
 
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import AsyncMock, patch
 from datetime import datetime
-from app.services.occupancy_service import handle_occupancy_event
-from app.services.event_parser import ParsedCameraEvent
+from sqlalchemy import create_engine, event as sa_event
+from sqlalchemy.orm import sessionmaker
 
-def make_event(region_id="1", event_type="linedetection"):
+from app.database import Base
+from app.models.zone_occupancy import ZoneOccupancy
+from app.services.occupancy_service import (
+    handle_occupancy_event,
+    record_event_in_cache,
+    _processed_events_cache,
+)
+from app.services.event_parser import ParsedCameraEvent
+from app.config import settings
+
+# SQLite SAVEPOINT support (required for begin_nested in occupancy service)
+engine = create_engine("sqlite:///:memory:")
+
+@sa_event.listens_for(engine, "connect")
+def _set_sqlite_pragma(dbapi_conn, connection_record):
+    dbapi_conn.isolation_level = None
+
+@sa_event.listens_for(engine, "begin")
+def _do_begin(conn):
+    conn.exec_driver_sql("BEGIN")
+
+TestSession = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+@pytest.fixture
+def db():
+    Base.metadata.create_all(bind=engine)
+    session = TestSession()
+    try:
+        yield session
+    finally:
+        session.close()
+        Base.metadata.drop_all(bind=engine)
+
+
+@pytest.fixture(autouse=True)
+def clear_cache():
+    _processed_events_cache.clear()
+    yield
+    _processed_events_cache.clear()
+
+
+def seed_zones(db, total=0, b1=0, b2=0, capacity=10):
+    for zone_id, count, cam in [
+        (settings.GARAGE_TOTAL_ZONE, total, "CAM-03"),
+        (settings.B1_PARKING_ZONE, b1, "CAM-03"),
+        (settings.B2_PARKING_ZONE, b2, "CAM-09"),
+    ]:
+        db.add(ZoneOccupancy(
+            zone_id=zone_id, camera_id=cam,
+            current_count=count, max_capacity=capacity,
+            last_updated=datetime.utcnow(),
+        ))
+    db.commit()
+
+
+def get_count(db, zone_id):
+    zone = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id == zone_id).first()
+    if zone:
+        db.refresh(zone)
+        return zone.current_count
+    return -1
+
+
+def make_event(region_id="1", cam_id="CAM-03", event_type="linedetection"):
     """
-    Helper: creates an event from CAM-04.
-    By default: region_id="1" → entrance, region_id="2" → exit.
+    Helper: creates an event from an occupancy camera.
+    Uses CAM-03 (main entrance) by default.
+    region_id="1" → entrance, region_id="2" → exit.
     """
     return ParsedCameraEvent(
-        camera_id="CAM-04",
+        camera_id=cam_id,
         device_serial="TEST-SN",
         channel_id=1,
         event_type=event_type,
         detection_target="vehicle",
         region_id=region_id,
-        channel_name="CAM-04 (B1-PARKING)",
+        channel_name=f"{cam_id} test",
         trigger_time=datetime.utcnow(),
         raw_xml="<test/>",
     )
 
+
 class TestOccupancyService:
 
     @pytest.mark.asyncio
-    async def test_new_zone_created_on_first_event(self):
-        """UC3: Zone row is auto-created if it doesn't exist in the DB."""
-        db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = None
-
+    async def test_new_zone_auto_created_on_first_event(self, db):
+        """UC3: Zone rows are auto-created if they don't exist in the DB."""
+        # Start with empty DB (no zones seeded)
         with patch("app.services.occupancy_service.create_alert", new_callable=AsyncMock):
-            await handle_occupancy_event(make_event("1"), db)
+            cache_key = await handle_occupancy_event(make_event("1"), db)
+        db.commit()
 
-        db.add.assert_called_once()
-        # Updated: Service performs a flush to prepare data; Dispatcher handles the commit.
-        db.flush.assert_called_once()
+        total = db.query(ZoneOccupancy).filter(
+            ZoneOccupancy.zone_id == settings.GARAGE_TOTAL_ZONE
+        ).first()
+        assert total is not None, "GARAGE-TOTAL should be auto-created"
+        assert total.current_count == 1
 
     @pytest.mark.asyncio
-    async def test_entrance_increments_count(self):
-        """Line 1 crossing (entrance) increments the zone count."""
-        zone = MagicMock()
-        zone.current_count = 3
-        zone.max_capacity = 10
-        db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = zone
+    async def test_entrance_increments_count(self, db):
+        """Line 1 crossing (entrance via CAM-03) increments TOTAL and B1."""
+        seed_zones(db, total=3, b1=3, b2=0)
 
         with patch("app.services.occupancy_service.create_alert", new_callable=AsyncMock):
-            await handle_occupancy_event(make_event("1"), db)
+            await handle_occupancy_event(make_event("1", "CAM-03"), db)
+        db.commit()
 
-        assert zone.current_count == 4
+        assert get_count(db, settings.GARAGE_TOTAL_ZONE) == 4
+        assert get_count(db, settings.B1_PARKING_ZONE) == 4
 
     @pytest.mark.asyncio
-    async def test_exit_decrements_count(self):
-        """Line 2 crossing (exit) decrements the zone count."""
-        zone = MagicMock()
-        zone.current_count = 5
-        zone.max_capacity = 10
-        db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = zone
+    async def test_exit_decrements_count(self, db):
+        """Line 1 crossing on exit camera (CAM-08) decrements TOTAL and B1."""
+        seed_zones(db, total=5, b1=5, b2=0)
 
         with patch("app.services.occupancy_service.create_alert", new_callable=AsyncMock):
-            await handle_occupancy_event(make_event("2"), db)
+            await handle_occupancy_event(make_event("1", "CAM-08"), db)
+        db.commit()
 
-        assert zone.current_count == 4
+        assert get_count(db, settings.GARAGE_TOTAL_ZONE) == 4
+        assert get_count(db, settings.B1_PARKING_ZONE) == 4
 
     @pytest.mark.asyncio
-    async def test_count_never_goes_negative(self):
-        """Count should floor at 0 even if exit events are received."""
-        zone = MagicMock()
-        zone.current_count = 0
-        zone.max_capacity = 10
-        db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = zone
+    async def test_count_never_goes_negative(self, db):
+        """Count should floor at 0 even if exit events are received on empty zone."""
+        seed_zones(db, total=0, b1=0, b2=0)
 
         with patch("app.services.occupancy_service.create_alert", new_callable=AsyncMock):
-            await handle_occupancy_event(make_event("2"), db)
+            await handle_occupancy_event(make_event("1", "CAM-08"), db)
+        db.commit()
 
-        assert zone.current_count == 0
+        assert get_count(db, settings.GARAGE_TOTAL_ZONE) == 0
+        assert get_count(db, settings.B1_PARKING_ZONE) == 0
 
     @pytest.mark.asyncio
-    async def test_alert_triggered_at_90_percent(self):
-        """UC3: Alert fires when occupancy reaches or exceeds 90%."""
-        zone = MagicMock()
-        zone.current_count = 8   # Will become 9 after entrance
-        zone.max_capacity = 10   # 9/10 = 90% -> Alert trigger
-        db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = zone
+    async def test_alert_triggered_at_capacity(self, db):
+        """UC3: Alert fires when occupancy reaches or exceeds 100% capacity."""
+        seed_zones(db, total=9, b1=9, b2=0, capacity=10)
 
         with patch("app.services.occupancy_service.create_alert", new_callable=AsyncMock) as mock_alert:
-            await handle_occupancy_event(make_event("1"), db)
-            
-            mock_alert.assert_called_once()
-            # Verify alert type in either positional or keyword arguments
-            args, kwargs = mock_alert.call_args
-            alert_type = kwargs.get("alert_type") or args[1]
-            assert alert_type == "occupancy_full"
+            await handle_occupancy_event(make_event("1", "CAM-03"), db)
+        db.commit()
+
+        # Alert should fire for both GARAGE-TOTAL and B1 (both hit 10/10 = 100%)
+        assert mock_alert.call_count >= 1
+        # Verify at least one call has the right alert type
+        alert_types = [
+            call.kwargs.get("alert_type", call.args[1] if len(call.args) > 1 else None)
+            for call in mock_alert.call_args_list
+        ]
+        assert "capacity_exceeded" in alert_types
 
     @pytest.mark.asyncio
-    async def test_alert_not_triggered_below_threshold(self):
-        """No alert should be sent if occupancy is below 90%."""
-        zone = MagicMock()
-        zone.current_count = 5
-        zone.max_capacity = 10
-        db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = zone
+    async def test_alert_not_triggered_below_threshold(self, db):
+        """No alert should be sent if occupancy is below 100%."""
+        seed_zones(db, total=5, b1=5, b2=0, capacity=10)
 
         with patch("app.services.occupancy_service.create_alert", new_callable=AsyncMock) as mock_alert:
-            await handle_occupancy_event(make_event("1"), db)
-            mock_alert.assert_not_called()
+            await handle_occupancy_event(make_event("1", "CAM-03"), db)
+        db.commit()
+
+        mock_alert.assert_not_called()
