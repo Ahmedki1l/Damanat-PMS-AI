@@ -9,6 +9,7 @@ python-multipart==0.0.22
 sqlalchemy==2.0.47
 psycopg2-binary==2.9.11
 alembic==1.18.4
+mysqlclient==2.2.0
 
 # Config & validation
 pydantic==2.12.5

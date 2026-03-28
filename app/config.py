@@ -11,7 +11,7 @@ from typing import Optional, Dict, List
 
 class Settings(BaseSettings):
     # ── Database ──────────────────────────────────────────────────────────
-    DATABASE_URL: str = "postgresql://damanat:damanat@localhost:5432/damanat_db"
+    DATABASE_URL: str = "mysql+pymysql://root:password@localhost:3306/damanat_pms"
 
     @property
     def db_url(self) -> str:
@@ -214,16 +214,11 @@ class Settings(BaseSettings):
         return self
 
     # ── Zone configuration ───────────────────────────────────────────────
-    RESTRICTED_ZONES: str = "restricted-vip,no-parking-zone,emergency-exit,loading-bay"
-    MONITORED_INTRUSION_ZONES: str = "emergency-exit,staff-only-area,after-hours-zone"
-    ALWAYS_VIOLATION_EVENTS: str = "linedetection"
     CAMERA_REGION_ZONE_MAP: str = ""  # e.g. CAM-04:0=emergency-exit;CAM-04:1=restricted-vip
 
     # ── Thresholds ────────────────────────────────────────────────────────
     OCCUPANCY_ALERT_THRESHOLD: float = 0.90
     DEFAULT_ZONE_CAPACITY: int = 50
-    INTRUSION_COOLDOWN_SECONDS: int = 30
-    VIOLATION_COOLDOWN_SECONDS: int = 30
     
     # False Exit Prevention (Bug #23)
     EXIT_CONFIRM_SECONDS: int = 5
