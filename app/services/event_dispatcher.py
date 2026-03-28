@@ -3,10 +3,6 @@
 
 from app.services.event_parser import ParsedCameraEvent
 from app.services.occupancy_service import handle_occupancy_event
-from app.services.violation_service import handle_violation_event, resolve_violation_on_exit, RESTRICTED_ZONES
-from app.zone_config import resolve_zone
-from app.services.intrusion_service import handle_intrusion_event, MONITORED_INTRUSION_ZONES
-# from app.services.field_occupancy_service import handle_field_occupancy_event # REMOVED: File missing
 from app.services.entry_exit_service import handle_anpr_event
 from app.services.snapshot_service import fetch_snapshot
 from app.utils.logger import get_logger
@@ -98,16 +94,6 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
         if should_log and (is_gate or is_occupancy_event or event.event_type in ("fielddetection", "linedetection", "regionEntrance")):
             logger.info(f"Event: type={event.event_type} | camera={event.camera_id} | plate={event.plate_number}")
 
-
-        is_vehicle = event.detection_target in ("vehicle", None)
-        is_human = event.detection_target in ("human", None)
-        resolved_zone = resolve_zone(event.camera_id, event.region_id)
-        zone_id = event.region_id or ""
-        # Auto-resolve violations on exit from restricted zones
-        if event.event_type in ("regionExiting", "regionExit") and is_vehicle:
-            canonical_zone = resolved_zone or zone_id
-            if canonical_zone in RESTRICTED_ZONES:
-                await resolve_violation_on_exit(event.camera_id, canonical_zone, db)
         # ── PHASE 1 ───────────────────────────────────────────────────────────
         
         # ✅ UC3: Parking Occupancy
@@ -123,33 +109,6 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
                 _post_commit_cache_keys.append(oc_cache_key)
         elif is_gate:
              logger.debug(f"[UC3] Gate camera {event.camera_id} sent non-occupancy event: {event.event_type}")
-
-
-        # ✅ Field Occupancy: fielddetection in parking-area zones → per-slot tracking
-        # if event.event_type == "fielddetection" and resolved_zone and resolved_zone.startswith("parking-area"):
-        #     await handle_field_occupancy_event(event, db)
-
-        # ✅ UC5 & UC6: Violations and Intrusion (Teammates' Tasks)
-        # Logic: Route based on zone lists to prevent double-firing
-        elif event.event_type in ("fielddetection", "regionEntrance") and is_vehicle:
-            route_zone = resolved_zone or zone_id
-            if route_zone in MONITORED_INTRUSION_ZONES:
-                await handle_intrusion_event(event, db)
-            elif route_zone in RESTRICTED_ZONES:
-                await handle_violation_event(event, db)
-            elif not event.region_id:
-                # Fallback if no zone name: fire both, services will self-filter
-                await handle_violation_event(event, db)
-                await handle_intrusion_event(event, db)
-
-        # Line Crossing: violation unless it's a designated occupancy gate
-        # if event.event_type == "linedetection" and (is_vehicle or is_human):
-        #     is_occupancy_gate = (
-        #         zone_id in settings.OCCUPANCY_ENTRANCE_ZONES or 
-        #         zone_id in settings.OCCUPANCY_EXIT_ZONES
-        #     )
-        #     if not is_occupancy_gate:
-        #         await handle_violation_event(event, db)
 
         # ── PHASE 2 ───────────────────────────────────────────────────────────
         # UC1 + UC2 + UC4: ANPR gate events (JSON=AccessControllerEvent, XML=ANPR/vehicleMatchResult)
