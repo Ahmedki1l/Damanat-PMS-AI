@@ -10,7 +10,7 @@ Fully offline AI camera event processing system for Damanat parking facility (Sa
 ## 🏗️ Architecture
 
 ```
-Edge AI Cameras (Hikvision) → HTTP Push (LAN) → FastAPI Backend → PostgreSQL → Dashboard & Alerts
+Edge AI Cameras (Hikvision) → HTTP Push (LAN) → FastAPI Backend → SQL Server → Dashboard & Alerts
 ```
 
 - **Fully Offline** — LAN only, no cloud or internet required
@@ -35,7 +35,7 @@ Edge AI Cameras (Hikvision) → HTTP Push (LAN) → FastAPI Backend → PostgreS
 
 ### 1. Prerequisites
 - Python 3.11+
-- PostgreSQL 14+ (or Docker)
+- Microsoft SQL Server (and ODBC Driver 17/18) or Docker
 - Hikvision cameras on local network
 
 ### 2. Setup
@@ -49,13 +49,12 @@ cp .env.example .env        # Edit with real IPs + DB URL
 
 ### 3. Start Database
 ```bash
-# Option A: Docker (recommended)
-docker-compose up -d db
+# Option A: Docker (SQL Server Express or Developer)
+docker-compose up -d sql-server
 
-# Option B: Local PostgreSQL
-# Windows: Start PostgreSQL service
-# Linux: sudo systemctl start postgresql
-# Then: createdb damanat_db
+# Option B: Local SQL Server
+# Ensure SQL Server Service is running on Windows
+# Create database: CREATE DATABASE damanat_pms;
 ```
 
 ### 4. Initialize DB & Configure Cameras
@@ -77,7 +76,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
 ```bash
 # Start everything (DB + Backend)
 docker-compose up -d
-docker-compose up -d db
+docker-compose up -d sql-server
 docker-compose down -v
 # View logs
 docker-compose logs -f backend
@@ -158,7 +157,7 @@ damanat-backend/
 │   └── test/                   # Event simulation + connectivity
 ├── tests/                      # Unit tests
 ├── logs/                       # Application logs (auto-created)
-├── docker-compose.yml          # PostgreSQL + Backend
+├── docker-compose.yml          # SQL Server + Backend
 ├── Dockerfile                  # Container build
 ├── requirements.txt            # Python dependencies
 └── .env.example                # Environment template
@@ -189,6 +188,7 @@ When ANPR cameras are physically installed:
 - Never hardcode IPs — use `settings` from `config.py`
 - Always add docstrings explaining: Purpose, Camera, Event type
 - Always return HTTP 200 from the camera webhook
+- **SQL Server Note**: Always specify a length for `String()` columns that are used in indexes or unique constraints (e.g., `String(255)`), as SQL Server does not support indexing columns with unlimited length.
 - Phase 2 files: full working implementations, commented out in `main.py`
 
 ## 📚 Full Documentation

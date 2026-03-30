@@ -11,7 +11,7 @@ from typing import Optional, Dict, List
 
 class Settings(BaseSettings):
     # ── Database ──────────────────────────────────────────────────────────
-    DATABASE_URL: str = "mysql+pymysql://root:password@localhost:3306/damanat_pms"
+    DATABASE_URL: str = "mssql+pyodbc://sa:DamanatPms2026!@localhost:1433/damanat_pms?driver=ODBC+Driver+17+for+SQL+Server"
 
     @property
     def db_url(self) -> str:
