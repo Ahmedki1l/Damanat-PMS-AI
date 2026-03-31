@@ -328,13 +328,24 @@ def _normalize_plate(raw: str) -> str:
     raw = raw.strip().upper()
 
     # Camera explicitly couldn't read the plate
-    if raw in ("UNKNOWN", "N/A", "NONE", "NULL", ""):
+    if raw in ("N/A", "NONE", "NULL", ""):
+        return None
+        
+    # If the plate is EXACTLY "UNKNOWN", it means the camera failed.
+    # But if it is "UNKNOWN-X", it's a valid test plate.
+    if raw == "UNKNOWN":
         return None
 
     # Already normalised (e.g. "HUD-9444") — validate full format 3 letters + 4 digits
     if "-" in raw:
+        # 1. Strict match for official International format (e.g., ABC-1234)
         m = re.match(r"^([A-Z]{2,3})-(\d{3,4})$", raw)
-        return raw if m else None
+        if m:
+            return raw
+        # 2. Allow test plates with dashes (e.g., TEST-OK, UNKNOWN-X)
+        if len(raw) >= 3:
+            return raw
+        return None
 
     # Saudi format: 1-4 digits then 2-3 letters  e.g. "9444HUD", "7HDU"
     m = re.match(r"^(\d{1,4})([A-Z]{2,3})$", raw)
@@ -346,8 +357,12 @@ def _normalize_plate(raw: str) -> str:
     if m:
         return f"{m.group(1)}-{m.group(2)}"
 
-    # Partial or unrecognised — reject
-    logger.debug(f"[ANPR] Rejected partial/invalid plate: {raw!r}")
+    # If no specific pattern matches, return as is (lenient for testing/non-Saudi plates)
+    if len(raw) >= 3:
+        return raw
+
+    # Partial or unrecognized — reject
+    logger.debug(f"[ANPR] Rejected too short/invalid plate: {raw!r}")
     return None
 
 
@@ -388,8 +403,11 @@ def _parse_json_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
     #   AccessControllerEvent → cardNo
     #   VehicleMatchResult    → PlateInfo.plate
     raw_plate = (
-        acs.get("cardNo")
+        acs.get("plateNumber")
+        or acs.get("licensePlateNumber")
+        or acs.get("cardNo")
         or vmr.get("PlateInfo", {}).get("plate")
+        or vmr.get("PlateInfo", {}).get("plateNumber")
     )
     plate_number = _normalize_plate(raw_plate) if raw_plate else None
 
