@@ -4,9 +4,23 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.alert import Alert
 from app.schemas.alert import AlertOut
+from app.utils.event_bus import event_bus
+from sse_starlette.sse import EventSourceResponse
 from typing import Optional
 
 router = APIRouter()
+
+@router.get(
+    "/alerts/stream", 
+    summary="Real-time alert stream (SSE)",
+    response_class=EventSourceResponse
+)
+async def stream_alerts():
+    """
+    Server-Sent Events endpoint that pushes new alerts to the client.
+    Usage: const source = new EventSource('/api/v1/alerts/stream');
+    """
+    return EventSourceResponse(event_bus.subscribe())
 
 @router.get("/alerts", response_model=list[AlertOut], summary="All alerts — filterable by type")
 def get_all_alerts(

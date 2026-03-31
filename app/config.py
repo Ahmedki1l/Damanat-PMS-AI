@@ -218,7 +218,7 @@ class Settings(BaseSettings):
 
     # ── Thresholds ────────────────────────────────────────────────────────
     OCCUPANCY_ALERT_THRESHOLD: float = 0.90
-    DEFAULT_ZONE_CAPACITY: int = 50
+    DEFAULT_ZONE_CAPACITY: int = 9
     
     # False Exit Prevention (Bug #23)
     EXIT_CONFIRM_SECONDS: int = 5

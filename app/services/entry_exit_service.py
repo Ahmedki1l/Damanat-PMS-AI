@@ -35,9 +35,8 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
     if event_time.tzinfo is not None:
         event_time = event_time.replace(tzinfo=None)
 
-    # Deduplication: the ANPR camera pushes two events per detection —
-    # one ANPR XML (multipart) and one vehicleMatchResult JSON.
-    # Suppress the second if the same plate + gate was logged within 30 seconds.
+    # Deduplication: check for recent events
+    logger.debug(f"[UC1] Checking dedup for plate {plate}...")
     dedup_window = event_time - timedelta(seconds=30)
     recent = (
         db.query(EntryExitLog)
@@ -79,6 +78,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
             return
 
     # UC4: Resolve vehicle identity via vehicle_service
+    logger.debug(f"[UC4] Looking up vehicle for plate {plate}...")
     vehicle = vehicle_service.lookup_vehicle(db, plate)
     vehicle_type = vehicle.vehicle_type if vehicle else "unknown"
     owner_name = vehicle.owner_name if vehicle else "Unknown"
@@ -131,8 +131,24 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         else:
             logger.warning(f"[UC2] No matching entry found for vehicle {plate}")
 
-    # UC4: Alert for unregistered vehicles
-    if not vehicle:
+    # UC4: Clear logic for single notification/alert
+    if vehicle:
+        # Registered vehicle — send single 'info' notification
+        from app.utils.event_bus import event_bus
+        import json
+        event_bus.publish(json.dumps({
+            "is_alert": False,
+            "severity": "info",
+            "alert_type": "AccessControllerEvent",
+            "camera_id": event.camera_id,
+            "description": f"Registered vehicle at {gate} gate: plate {plate}",
+            "plate_number": plate,
+            "timestamp": event_time.isoformat(),
+            "snapshot_path": event.snapshot_path
+        }))
+    else:
+        # Unregistered vehicle — send single 'critical' alert
+        logger.info(f"[UC4] Triggering alert for unknown vehicle: {plate}")
         await create_alert(
             db=db,
             alert_type="unknown_vehicle",
@@ -140,6 +156,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
             zone_id=gate,
             event_type="AccessControllerEvent",
             description=f"Unregistered vehicle at {gate} gate: plate {plate}",
+            plate_number=plate,
             snapshot_path=event.snapshot_path,
         )
 

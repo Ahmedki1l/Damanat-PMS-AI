@@ -40,7 +40,7 @@ async def fetch_snapshot(camera_id: str, event_type: str) -> str | None:
 
     try:
         auth = httpx.DigestAuth(cam["user"], cam["password"])
-        async with httpx.AsyncClient(auth=auth, timeout=10) as client:
+        async with httpx.AsyncClient(auth=auth, timeout=2.0) as client:
             response = await client.get(url)
 
         if response.status_code != 200:

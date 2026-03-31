@@ -5,6 +5,7 @@ from app.services.event_parser import ParsedCameraEvent
 from app.services.occupancy_service import handle_occupancy_event
 from app.services.entry_exit_service import handle_anpr_event
 from app.services.snapshot_service import fetch_snapshot
+from app.utils.event_bus import event_bus
 from app.utils.logger import get_logger
 from app.config import settings
 from sqlalchemy.orm import Session
@@ -91,8 +92,19 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
         else:
             should_log = True
 
-        if should_log and (is_gate or is_occupancy_event or event.event_type in ("fielddetection", "linedetection", "regionEntrance")):
+        if should_log and not is_gate and (is_occupancy_event or event.event_type in ("fielddetection", "linedetection", "regionEntrance")):
             logger.info(f"Event: type={event.event_type} | camera={event.camera_id} | plate={event.plate_number}")
+            import json
+            event_bus.publish(json.dumps({
+                "is_alert": False,
+                "severity": "info",
+                "alert_type": event.event_type,
+                "camera_id": event.camera_id,
+                "description": f"Live Event from {event.camera_id}",
+                "plate_number": event.plate_number,
+                "timestamp": event.trigger_time.isoformat() if event.trigger_time else None,
+                "snapshot_path": event.snapshot_path
+            }))
 
         # ── PHASE 1 ───────────────────────────────────────────────────────────
         
@@ -112,7 +124,7 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
 
         # ── PHASE 2 ───────────────────────────────────────────────────────────
         # UC1 + UC2 + UC4: ANPR gate events (JSON=AccessControllerEvent, XML=ANPR/vehicleMatchResult)
-        if event.event_type in ("ANPR", "vehicleMatchResult") and event.plate_number:
+        if event.event_type in ("ANPR", "vehicleMatchResult", "AccessControllerEvent") and event.plate_number:
             await handle_anpr_event(event, db)
 
         # ── MAINTENANCE ───────────────────────────────────────────────────────
