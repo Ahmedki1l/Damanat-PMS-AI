@@ -10,11 +10,13 @@ Fully offline AI camera event processing system for Damanat parking facility (Sa
 ## 🏗️ Architecture
 
 ```
-Edge AI Cameras (Hikvision) → HTTP Push (LAN) → FastAPI Backend → PostgreSQL → Dashboard & Alerts
+Edge AI Cameras (Hikvision) → HTTP Push (LAN) → FastAPI Backend → SQL Server/PostgreSQL → Real-time Stream (SSE) → Dashboard
 ```
 
 - **Fully Offline** — LAN only, no cloud or internet required
 - **Event-Driven** — Cameras push events; no polling needed
+- **Real-time Streaming** — Server-Sent Events (SSE) for instant dashboard alerts and status updates
+- **Advanced Occupancy** — Atomic multi-zone tracking (B1, B2, Total) with floor transfer logic
 - **No Backend AI** — All AI processing on camera edge; backend reacts to events
 - **Phased Delivery** — Phase 2 components are pre-built and activated when ANPR cameras arrive
 - **Camera Polling** — Instead of waiting for cameras to push HTTP webhooks (which requires network access from cameras to this machine), this service connects TO the cameras and listens on their alertStream endpoint in real-time.
@@ -33,9 +35,8 @@ Edge AI Cameras (Hikvision) → HTTP Push (LAN) → FastAPI Backend → PostgreS
 
 ## 🚀 Quick Start
 
-### 1. Prerequisites
+- SQL Server 2019+ (or Docker)
 - Python 3.11+
-- PostgreSQL 14+ (or Docker)
 - Hikvision cameras on local network
 
 ### 2. Setup
@@ -52,10 +53,9 @@ cp .env.example .env        # Edit with real IPs + DB URL
 # Option A: Docker (recommended)
 docker-compose up -d db
 
-# Option B: Local PostgreSQL
-# Windows: Start PostgreSQL service
-# Linux: sudo systemctl start postgresql
-# Then: createdb damanat_db
+# Option B: Local SQL Server
+# Ensure SQL Server Authentication is enabled
+# Then: create database damanat_pms;
 ```
 
 ### 4. Initialize DB & Configure Cameras
@@ -83,12 +83,14 @@ docker-compose down -v
 docker-compose logs -f backend
 ```
 
-## 📡 API Endpoints
+## 📡 API Reference
 
 | Phase | Method | Endpoint | Description |
 |-------|--------|----------|-------------|
+| Both | `GET` | `/api/v1/alerts/stream` | **Real-time Alert Stream (SSE)** — EventSource connection |
 | Both | `POST` | `/api/v1/events/camera` | Camera webhook (all events) |
 | Both | `GET` | `/api/v1/events` | Raw event log |
+| Both | `GET` | `/api/v1/alerts` | Combined alerts (Intrusions/Violations/Capacity) |
 | 1 | `GET` | `/api/v1/occupancy` | All zones occupancy (UC3) |
 | 1 | `GET` | `/api/v1/occupancy/{zone_id}` | Single zone occupancy |
 | 1 | `PUT` | `/api/v1/occupancy/{zone_id}/capacity` | Set zone capacity |
@@ -106,15 +108,22 @@ docker-compose logs -f backend
 
 ## 🧪 Testing
 
+### Run All Simulations (Full Demo Data)
+```bash
+python scripts/test/run_all_simulations.py
+```
+
 ### Run Unit Tests
 ```bash
 python -m pytest tests/ -v
 ```
 
-### Simulate Camera Events
+### Simulate Specific Events
 ```bash
 # UC3 — Occupancy
-python scripts/test/simulate_event.py --event regionEntrance --zone parking-row-A --ip 192.168.1.103
+python scripts/test/simulate_event.py --event regionEntrance --zone 1 --ip 10.1.13.63
+python scripts/test/simulate_event.py --event regionExiting  --zone 1 --ip 10.1.13.63
+```
 python scripts/test/simulate_event.py --event regionExiting  --zone parking-row-A --ip 192.168.1.103
 
 # UC5 — Violation
@@ -152,7 +161,8 @@ damanat-backend/
 │   │   ├── entry_exit_service.py # 🔜 Phase 2: UC1+UC2+UC4
 │   │   └── vehicle_service.py  # 🔜 Phase 2: Vehicle lookup
 │   ├── routers/                # API endpoints
-│   └── utils/                  # Logger, XML/JSON helpers
+│   └── utils/                  # Logger, XML/JSON, and EventBus (SSE) helpers
+│       └── event_bus.py        # 🔔 Internal event broadcasting for SSE
 ├── scripts/
 │   ├── setup/                  # Camera + DB configuration
 │   └── test/                   # Event simulation + connectivity
