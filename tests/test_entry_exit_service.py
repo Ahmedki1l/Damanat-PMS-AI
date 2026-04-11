@@ -30,11 +30,15 @@ def make_anpr_event(plate="ABC-1234", gate="entry", trigger_time=None):
 class TestEntryExitService:
     @pytest.mark.asyncio
     @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.open_session")
     @patch("app.services.entry_exit_service.vehicle_service")
-    async def test_entry_event_creates_log(self, mock_vs, mock_alert):
+    async def test_entry_event_creates_log(self, mock_vs, mock_open_session, mock_alert):
         """UC1: Entry event should create a log record in the database."""
         mock_vs.lookup_vehicle.return_value = None  # Unknown vehicle
         db = MagicMock()
+        query_chain = db.query.return_value
+        query_chain.filter.return_value = query_chain
+        query_chain.first.side_effect = [None, None]
 
         await handle_anpr_event(make_anpr_event(), db)
 
@@ -42,6 +46,7 @@ class TestEntryExitService:
         log = db.add.call_args[0][0]
         assert log.plate_number == "ABC-1234"
         assert log.gate == "entry"
+        mock_open_session.assert_called_once()
 
     @pytest.mark.asyncio
     @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
@@ -56,11 +61,15 @@ class TestEntryExitService:
 
     @pytest.mark.asyncio
     @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.open_session")
     @patch("app.services.entry_exit_service.vehicle_service")
-    async def test_unknown_vehicle_triggers_alert(self, mock_vs, mock_alert):
+    async def test_unknown_vehicle_triggers_alert(self, mock_vs, mock_open_session, mock_alert):
         """UC4: Detecting an unregistered vehicle must trigger an alert."""
         mock_vs.lookup_vehicle.return_value = None
         db = MagicMock()
+        query_chain = db.query.return_value
+        query_chain.filter.return_value = query_chain
+        query_chain.first.side_effect = [None, None]
 
         await handle_anpr_event(make_anpr_event(), db)
 
@@ -73,8 +82,9 @@ class TestEntryExitService:
     
     @pytest.mark.asyncio
     @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.close_session")
     @patch("app.services.entry_exit_service.vehicle_service")
-    async def test_exit_calculates_parking_duration(self, mock_vs, mock_alert):
+    async def test_exit_calculates_parking_duration(self, mock_vs, mock_close_session, mock_alert):
         """UC2: Duration should be calculated correctly in seconds when matching an entry."""
         mock_vs.lookup_vehicle.return_value = None
         
@@ -91,18 +101,20 @@ class TestEntryExitService:
         query_chain = db.query.return_value
         query_chain.filter.return_value = query_chain
         query_chain.order_by.return_value = query_chain
-        query_chain.first.return_value = matching_entry
+        query_chain.first.side_effect = [None, matching_entry]
 
         await handle_anpr_event(make_anpr_event(gate="exit", trigger_time=exit_time), db)
 
         log = db.add.call_args[0][0]
         assert log.matched_entry_id == 101
         assert log.parking_duration == 7200  # 2 hours = 7200 seconds
+        mock_close_session.assert_called_once()
 
     @pytest.mark.asyncio
     @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.close_session")
     @patch("app.services.entry_exit_service.vehicle_service")
-    async def test_unmatched_exit_has_null_duration(self, mock_vs, mock_alert):
+    async def test_unmatched_exit_has_null_duration(self, mock_vs, mock_close_session, mock_alert):
         """Exit events with no prior entry record should have null duration."""
         mock_vs.lookup_vehicle.return_value = None
         db = MagicMock()
@@ -110,10 +122,11 @@ class TestEntryExitService:
         query_chain = db.query.return_value
         query_chain.filter.return_value = query_chain
         query_chain.order_by.return_value = query_chain
-        query_chain.first.return_value = None # No entry found
+        query_chain.first.side_effect = [None, None] # dedup miss, then no entry found
 
         await handle_anpr_event(make_anpr_event(gate="exit"), db)
 
         log = db.add.call_args[0][0]
         assert log.parking_duration is None
         assert log.matched_entry_id is None
+        mock_close_session.assert_called_once()

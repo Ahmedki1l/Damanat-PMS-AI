@@ -45,6 +45,7 @@ def create_tables():
     # Phase 2 models
     from app.models.vehicle import Vehicle                 # noqa
     from app.models.entry_exit_log import EntryExitLog     # noqa
+    from app.models.parking_session import ParkingSession  # noqa
 
     Base.metadata.create_all(bind=engine)
 

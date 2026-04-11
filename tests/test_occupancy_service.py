@@ -114,6 +114,8 @@ class TestOccupancyService:
         ).first()
         assert total is not None, "GARAGE-TOTAL should be auto-created"
         assert total.current_count == 1
+        assert total.zone_name == settings.get_zone_metadata(settings.GARAGE_TOTAL_ZONE)["zone_name"]
+        assert total.floor == settings.get_zone_metadata(settings.GARAGE_TOTAL_ZONE)["floor"]
 
     @pytest.mark.asyncio
     async def test_entrance_increments_count(self, db):

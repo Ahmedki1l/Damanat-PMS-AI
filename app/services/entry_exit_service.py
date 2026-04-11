@@ -6,6 +6,7 @@ Handles AccessControllerEvent / vehicleMatchResult / ANPR from ANPR cameras.
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from app.models.entry_exit_log import EntryExitLog
+from app.services import parking_session_service
 from app.services import vehicle_service
 from app.services.event_parser import ParsedCameraEvent
 from app.services.alert_service import create_alert
@@ -96,6 +97,16 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         created_at=datetime.utcnow(),
     )
 
+    if gate == "entry":
+        parking_session_service.open_session(
+            db,
+            plate_number=plate,
+            event_time=event_time,
+            camera_id=event.camera_id,
+            snapshot_path=event.snapshot_path,
+            vehicle=vehicle,
+        )
+
     # UC2: Calculation of Parking Duration on Exit
     if gate == "exit":
         matching_entry = (
@@ -130,6 +141,14 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
             logger.info(f"[UC2] MATCH FOUND! Vehicle {plate} parked for {mins}m {secs}s")
         else:
             logger.warning(f"[UC2] No matching entry found for vehicle {plate}")
+
+        parking_session_service.close_session(
+            db,
+            plate_number=plate,
+            event_time=event_time,
+            camera_id=event.camera_id,
+            snapshot_path=event.snapshot_path,
+        )
 
     # UC4: Clear logic for single notification/alert
     if vehicle:

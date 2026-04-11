@@ -4,6 +4,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from datetime import datetime
+from app.config import settings
 from app.database import get_db
 from app.models.zone_occupancy import ZoneOccupancy
 from app.schemas.zone_occupancy import ZoneOccupancyOut, ZoneCapacityUpdate
@@ -39,14 +40,21 @@ def set_zone_capacity(zone_id: str, body: ZoneCapacityUpdate, db: Session = Depe
     Update the maximum vehicle capacity for a zone.
     Call this once per zone during system setup.
     """
+    zone_meta = settings.get_zone_metadata(zone_id)
     zone = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id == zone_id).first()
     if not zone:
         zone = ZoneOccupancy(zone_id=zone_id, camera_id="manual",
+                             zone_name=zone_meta.get("zone_name"),
+                             floor=zone_meta.get("floor"),
                              current_count=0, max_capacity=body.max_capacity,
                              last_updated=datetime.utcnow())
         db.add(zone)
     else:
         zone.max_capacity = body.max_capacity
+        if zone_meta.get("zone_name") and not zone.zone_name:
+            zone.zone_name = zone_meta["zone_name"]
+        if zone_meta.get("floor") and not zone.floor:
+            zone.floor = zone_meta["floor"]
     db.commit()
     return {"zone_id": zone_id, "max_capacity": body.max_capacity, "status": "updated"}
 

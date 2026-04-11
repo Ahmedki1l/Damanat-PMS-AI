@@ -47,17 +47,29 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
     """
     # ── Primary source of truth: local zone_occupancy table ───────────────
     zone = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id == zone_id).first()
+    zone_meta = settings.get_zone_metadata(zone_id)
     if not zone:
         logger.info(f"[UC3] Auto-creating zone '{zone_id}'")
         zone = ZoneOccupancy(
             zone_id=zone_id,
+            zone_name=zone_meta.get("zone_name"),
+            floor=zone_meta.get("floor"),
             camera_id=camera_id,
             current_count=0,
-            max_capacity=settings.DEFAULT_ZONE_CAPACITY,
+            max_capacity=zone_meta.get("max_capacity") or settings.DEFAULT_ZONE_CAPACITY,
             last_updated=datetime.utcnow(),
         )
         db.add(zone)
         db.flush()
+    else:
+        if zone_meta.get("zone_name") and not zone.zone_name:
+            zone.zone_name = zone_meta["zone_name"]
+        if zone_meta.get("floor") and not zone.floor:
+            zone.floor = zone_meta["floor"]
+        if zone_meta.get("max_capacity") and (
+            zone.max_capacity is None or zone.max_capacity == settings.DEFAULT_ZONE_CAPACITY
+        ):
+            zone.max_capacity = zone_meta["max_capacity"]
 
     # 1. Atomic update: count = max(count + delta, 0) — never goes negative
     await push_db_update(db, zone_id, delta)
@@ -80,6 +92,7 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
             alert_type="capacity_exceeded",
             camera_id=camera_id,
             zone_id=zone_id,
+            zone_name=zone.zone_name,
             event_type="occupancy_update",
             description=f"Zone {zone_id} is nearly full: {pct}% ({zone.current_count}/{zone.max_capacity})",
         )

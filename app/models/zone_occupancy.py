@@ -14,6 +14,8 @@ class ZoneOccupancy(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     zone_id = Column(String(100), unique=True, nullable=False, index=True)
+    zone_name = Column(String(100), nullable=True)
+    floor = Column(String(50), nullable=True)
     camera_id = Column(String(50), nullable=False)
     current_count = Column(Integer, default=0, nullable=False)
     max_capacity = Column(Integer, default=10, nullable=False)

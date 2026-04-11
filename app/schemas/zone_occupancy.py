@@ -7,6 +7,8 @@ from typing import Optional
 class ZoneOccupancyOut(BaseModel):
     id: int
     zone_id: str
+    zone_name: Optional[str] = None
+    floor: Optional[str] = None
     camera_id: str
     current_count: int
     max_capacity: int

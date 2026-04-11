@@ -12,6 +12,9 @@ class AlertOut(BaseModel):
     zone_name: Optional[str]
     region_id: Optional[int]
     slot_number: Optional[str] = None  # real-life parking bay number
+    plate_number: Optional[str] = None
+    severity: str
+    location_display: Optional[str] = None
     event_type: Optional[str]
     description: Optional[str]
     is_resolved: bool

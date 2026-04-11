@@ -4,7 +4,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.schemas.vehicle import VehicleCreate, VehicleResponse
+from app.schemas.vehicle import VehicleCreate, VehicleResponse, VehicleUpdate
 from app.schemas.responses import VehicleActionResponse, VehicleLookupResponse
 from app.services import vehicle_service
 
@@ -24,12 +24,35 @@ def register_vehicle(body: VehicleCreate, db: Session = Depends(get_db)):
         vehicle_service.register_vehicle(
             db, plate_number=body.plate_number, owner_name=body.owner_name,
             vehicle_type=body.vehicle_type, employee_id=body.employee_id,
-            notes=body.notes,
+            notes=body.notes, title=body.title, is_employee=body.is_employee,
+            phone=body.phone, email=body.email,
         )
         db.commit()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"status": "registered", "plate": body.plate_number}
+
+
+@router.put("/vehicles/{plate}", response_model=VehicleResponse, summary="UC4 â€” Update a registered vehicle")
+def update_vehicle(plate: str, body: VehicleUpdate, db: Session = Depends(get_db)):
+    try:
+        vehicle = vehicle_service.update_vehicle(
+            db,
+            plate,
+            owner_name=body.owner_name,
+            title=body.title,
+            vehicle_type=body.vehicle_type,
+            employee_id=body.employee_id,
+            is_employee=body.is_employee,
+            phone=body.phone,
+            email=body.email,
+            notes=body.notes,
+        )
+        db.commit()
+        db.refresh(vehicle)
+        return vehicle
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.delete("/vehicles/{plate}", response_model=VehicleActionResponse, summary="UC4 — Remove a vehicle")

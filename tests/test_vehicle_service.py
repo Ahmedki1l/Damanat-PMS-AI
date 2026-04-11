@@ -22,6 +22,8 @@ def mock_vehicle():
     v.plate_number = "A-1001"
     v.owner_name = "Ahmed Hassan"
     v.vehicle_type = "employee"
+    v.is_employee = True
+    v.title = "Employee"
     return v
 
 
@@ -56,6 +58,7 @@ class TestVehicleService:
         )
         assert result.plate_number == "X-9999"
         assert result.is_registered is True
+        assert result.is_employee is False
         mock_repo.create.assert_called_once()
 
     @patch("app.services.vehicle_service.vehicle_repo")
@@ -89,3 +92,17 @@ class TestVehicleService:
         result = vehicle_service.list_vehicles(db, vehicle_type="employee", limit=10, offset=0)
         assert len(result) == 1
         mock_repo.list_all.assert_called_once_with(db, vehicle_type="employee", limit=10, offset=0)
+
+    @patch("app.services.vehicle_service.vehicle_repo")
+    def test_update_vehicle(self, mock_repo, db, mock_vehicle):
+        mock_repo.get_by_plate.return_value = mock_vehicle
+        result = vehicle_service.update_vehicle(
+            db,
+            "A-1001",
+            owner_name="Updated Owner",
+            phone="12345",
+            email="owner@example.com",
+        )
+        assert result.owner_name == "Updated Owner"
+        assert result.phone == "12345"
+        assert result.email == "owner@example.com"

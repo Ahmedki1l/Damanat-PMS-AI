@@ -6,4 +6,5 @@ from app.models.zone_occupancy import ZoneOccupancy   # noqa
 from app.models.alert import Alert                     # noqa
 from app.models.vehicle import Vehicle                 # noqa
 from app.models.entry_exit_log import EntryExitLog     # noqa
+from app.models.parking_session import ParkingSession  # noqa
 from app.models.system_config import SystemConfig      # noqa
