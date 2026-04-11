@@ -5,7 +5,7 @@ Handles registered vehicle management and lookup.
 """
 
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, UTC
 from sqlalchemy.orm import Session
 from app.models.vehicle import Vehicle
 from app.utils.logger import get_logger
@@ -79,7 +79,7 @@ def register_vehicle(db: Session, plate_number: str, owner_name: str,
         email=email,
         notes=notes,
         is_registered=True,
-        registered_at=datetime.utcnow(),
+        registered_at=datetime.now(UTC),
     )
 
     if vehicle_repo:
@@ -143,3 +143,4 @@ def update_vehicle(
 
     logger.info("Updated vehicle profile: %s", plate)
     return vehicle
+

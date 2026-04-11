@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 from unittest.mock import AsyncMock, patch
-from datetime import datetime
+from datetime import datetime, UTC
 from sqlalchemy import create_engine, event as sa_event
 from sqlalchemy.orm import sessionmaker
 
@@ -67,7 +67,7 @@ def seed_zones(db, total=0, b1=0, b2=0, capacity=10):
         db.add(ZoneOccupancy(
             zone_id=zone_id, camera_id=cam,
             current_count=count, max_capacity=capacity,
-            last_updated=datetime.utcnow(),
+            last_updated=datetime.now(UTC),
         ))
     db.commit()
 
@@ -94,7 +94,7 @@ def make_event(region_id="1", cam_id="CAM-03", event_type="linedetection"):
         detection_target="vehicle",
         region_id=region_id,
         channel_name=f"{cam_id} test",
-        trigger_time=datetime.utcnow(),
+        trigger_time=datetime.now(UTC),
         raw_xml="<test/>",
     )
 
@@ -181,3 +181,5 @@ class TestOccupancyService:
         db.commit()
 
         mock_alert.assert_not_called()
+
+

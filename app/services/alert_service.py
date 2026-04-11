@@ -4,7 +4,7 @@ Shared alert creation service.
 Used by occupancy_service, violation_service, intrusion_service, and entry_exit_service.
 """
 
-from datetime import datetime
+from datetime import datetime, UTC
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.alert import Alert
@@ -107,7 +107,7 @@ async def create_alert(
             severity=severity,
             location_display=location_display,
             is_resolved=False,
-            triggered_at=datetime.utcnow(),
+            triggered_at=datetime.now(UTC),
         )
 
         db.add(new_alert)

@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
-from datetime import datetime, timedelta
+from datetime import datetime, UTC, timedelta
 from app.services.entry_exit_service import handle_anpr_event
 from app.services.event_parser import ParsedCameraEvent
 
@@ -21,7 +21,7 @@ def make_anpr_event(plate="ABC-1234", gate="entry", trigger_time=None):
         detection_target="vehicle",
         region_id=gate,
         channel_name="Test ANPR",
-        trigger_time=trigger_time or datetime.utcnow(),
+        trigger_time=trigger_time or datetime.now(UTC),
         raw_xml="{}",
         plate_number=plate,
         gate=gate,
@@ -130,3 +130,5 @@ class TestEntryExitService:
         assert log.parking_duration is None
         assert log.matched_entry_id is None
         mock_close_session.assert_called_once()
+
+

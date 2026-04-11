@@ -6,7 +6,7 @@ so create_tables() creates every table in one call.
 """
 
 from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
 from app.config import settings
 
@@ -88,3 +88,4 @@ def run_migrations():
                 env_ctx.run_migrations()
 
         conn.commit()
+

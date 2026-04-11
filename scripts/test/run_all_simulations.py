@@ -7,7 +7,7 @@ URL = "http://localhost:8080/api/v1/events/camera"
 
 
 def ts():
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def xml_event(event_type, zone, target, ip):
@@ -80,3 +80,4 @@ anpr_event("ABC-1234", "10.1.13.101")
 anpr_event("XYZ-5678", "10.1.13.101")
 
 print("\n--- Done! All events fired. ---\n")
+

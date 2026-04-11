@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class ParkingSessionBindRequest(BaseModel):
@@ -31,3 +31,4 @@ class ParkingSessionActionResponse(BaseModel):
     zone_name: Optional[str] = None
     floor: Optional[str] = None
     slot_number: Optional[str] = None
+

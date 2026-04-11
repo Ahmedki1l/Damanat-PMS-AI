@@ -106,3 +106,4 @@ class TestVehicleService:
         assert result.owner_name == "Updated Owner"
         assert result.phone == "12345"
         assert result.email == "owner@example.com"
+

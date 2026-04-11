@@ -1,5 +1,5 @@
 # app/schemas/camera_event.py
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from datetime import datetime
 from typing import Optional
 
@@ -19,5 +19,5 @@ class CameraEventOut(BaseModel):
     snapshot_path: Optional[str]
     created_at: Optional[datetime]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
+

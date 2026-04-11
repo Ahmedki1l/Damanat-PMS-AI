@@ -46,7 +46,7 @@ try:
             snapshot_path     = e["cdn_url"],
             raw_payload       = None,
             is_test           = False,
-            created_at        = datetime.utcnow(),
+            created_at        = datetime.now(UTC),
         )
         db.add(ev)
         db.flush()
@@ -61,3 +61,4 @@ except Exception as ex:
     raise
 finally:
     db.close()
+

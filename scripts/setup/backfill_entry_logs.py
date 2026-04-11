@@ -69,7 +69,7 @@ def run():
                 event_time     = evt_time,
                 snapshot_path  = cdn_url,
                 is_test        = False,
-                created_at     = datetime.utcnow(),
+                created_at     = datetime.now(UTC),
             )
             db.add(log)
             db.flush()
@@ -88,3 +88,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+

@@ -13,7 +13,7 @@ from app.database import get_db
 from app.config import settings
 from app.schemas.responses import HealthResponse
 from app.utils.logger import get_logger
-from datetime import datetime
+from datetime import datetime, UTC
 
 router = APIRouter()
 logger = get_logger(__name__)
@@ -30,7 +30,7 @@ def health_check(db: Session = Depends(get_db)):
 
     result = {
         "status": "ok",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "backend": "ok",
         "database": "unknown",
         "cameras": list(settings.CAMERAS.keys()),
@@ -61,3 +61,4 @@ def health_check(db: Session = Depends(get_db)):
         logger.debug(f"[health] camera={cam_id} status={cam_status}")
 
     return result
+

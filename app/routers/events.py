@@ -7,7 +7,7 @@ GET  /events       — lists raw event log with optional filters.
 
 from fastapi import APIRouter, Request, Depends
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import List, Optional
 from app.database import get_db
 from app.services.event_parser import parse_camera_event
@@ -71,7 +71,7 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
                 trigger_time=event.trigger_time,
                 snapshot_path=event.snapshot_path,
                 raw_payload=event.raw_xml,
-                created_at=datetime.utcnow(),
+                created_at=datetime.now(UTC),
             ))
 
         # 4. Commit — router owns the transaction, not the dispatcher

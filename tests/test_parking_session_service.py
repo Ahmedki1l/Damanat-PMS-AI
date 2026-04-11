@@ -140,3 +140,4 @@ def test_bind_slot_requires_open_session(db):
             parked_at=None,
             snapshot_path=None,
         )
+

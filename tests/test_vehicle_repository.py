@@ -81,3 +81,4 @@ class TestVehicleRepository:
         db = MagicMock()
         repo.delete(db, mock_vehicle)
         db.delete.assert_called_once_with(mock_vehicle)
+

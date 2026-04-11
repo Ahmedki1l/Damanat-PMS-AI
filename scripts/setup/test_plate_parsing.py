@@ -17,3 +17,4 @@ p3 = b'{"ipAddress":"10.1.13.100","dateTime":"2026-03-11T09:07:38+03:00","eventT
 for p in [p1, p2, p3]:
     ev = _parse_json_event(p, '10.1.13.100')
     print(f"  event_type={ev.event_type}  plate={ev.plate_number}  gate={ev.gate}")
+

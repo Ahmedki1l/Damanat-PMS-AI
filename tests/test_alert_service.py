@@ -35,3 +35,4 @@ async def test_create_alert_persists_severity_and_location(mock_event_bus):
     assert alert.location_display == "Entry Gate"
     assert alert.snapshot_path == "evidence.jpg"
     mock_event_bus.publish.assert_called_once()
+

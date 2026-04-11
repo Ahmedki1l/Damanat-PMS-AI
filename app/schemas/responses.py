@@ -1,6 +1,6 @@
 # app/schemas/responses.py
 """Shared response schemas for endpoints that return simple status dicts."""
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from datetime import datetime
 from typing import Optional
 
@@ -67,3 +67,4 @@ class HealthResponse(BaseModel):
     backend: str
     database: str
     cameras: list[str]
+

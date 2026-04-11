@@ -11,3 +11,4 @@ with engine.connect() as conn:
     rows = conn.execute(text("SELECT id, plate_number, gate, event_time FROM entry_exit_log ORDER BY id")).fetchall()
     for r in rows:
         print(f"id={r[0]}  plate={r[1]}  gate={r[2]}  time={r[3]}")
+

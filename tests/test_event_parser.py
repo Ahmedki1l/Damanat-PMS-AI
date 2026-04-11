@@ -145,3 +145,4 @@ class TestJSONEventParsing:
         event = parse_camera_event(json_body, "192.168.1.104", "")
         assert event.event_type == "AccessControllerEvent"
         assert event.plate_number == "TEST-001"
+

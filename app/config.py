@@ -4,8 +4,8 @@ Application configuration using Pydantic-Settings.
 All settings can be overridden via environment variables or .env file.
 """
 
+from pydantic import model_validator, ConfigDict, ConfigDict
 from pydantic_settings import BaseSettings
-from pydantic import model_validator
 from typing import Optional, Dict, List, Any
 
 
@@ -281,9 +281,7 @@ class Settings(BaseSettings):
     # ── Logging ───────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
+    model_config = ConfigDict(env_file=".env", extra="ignore")
 
     LOG_CAMERA_FILTER: str = ""
     LOG_CAMERA_EXCLUDE: str = ""
@@ -296,3 +294,4 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+

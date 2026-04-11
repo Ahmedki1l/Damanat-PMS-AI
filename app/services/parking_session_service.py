@@ -2,7 +2,7 @@
 Service helpers for the parking_sessions read model.
 """
 
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 
 
 def _naive(dt: Optional[datetime]) -> datetime:
-    value = dt or datetime.utcnow()
+    value = dt or datetime.now(UTC)
     if value.tzinfo is not None:
         return value.replace(tzinfo=None)
     return value
@@ -44,12 +44,12 @@ def open_session(
 ) -> ParkingSession:
     existing = get_latest_open_session(db, plate_number)
     if existing:
-        existing.updated_at = datetime.utcnow()
+        existing.updated_at = datetime.now(UTC)
         if snapshot_path and not existing.entry_snapshot_path:
             existing.entry_snapshot_path = snapshot_path
         return existing
 
-    now = datetime.utcnow()
+    now = datetime.now(UTC)
     session = ParkingSession(
         plate_number=plate_number,
         vehicle_id=vehicle.id if vehicle else None,
@@ -85,7 +85,7 @@ def close_session(
     session.exit_snapshot_path = snapshot_path
     session.duration_seconds = max(0, int((exit_time - session.entry_time).total_seconds()))
     session.status = "closed"
-    session.updated_at = datetime.utcnow()
+    session.updated_at = datetime.now(UTC)
     return session
 
 
@@ -109,11 +109,11 @@ def bind_slot(
     session.zone_id = zone_id
     session.zone_name = zone_name or zone_meta.get("zone_name") or zone_id
     session.floor = floor or zone_meta.get("floor")
-    session.parked_at = _naive(parked_at) if parked_at else datetime.utcnow()
+    session.parked_at = _naive(parked_at) if parked_at else datetime.now(UTC)
     session.slot_camera_id = camera_id
     if snapshot_path:
         session.slot_snapshot_path = snapshot_path
-    session.updated_at = datetime.utcnow()
+    session.updated_at = datetime.now(UTC)
     db.flush()
     return session
 
@@ -134,10 +134,11 @@ def unbind_slot(
             f"Open parking session for plate {plate_number} is bound to slot {session.slot_number}, not {slot_number}"
         )
 
-    session.slot_left_at = _naive(left_at) if left_at else datetime.utcnow()
+    session.slot_left_at = _naive(left_at) if left_at else datetime.now(UTC)
     session.slot_camera_id = camera_id
     if snapshot_path:
         session.slot_snapshot_path = snapshot_path
-    session.updated_at = datetime.utcnow()
+    session.updated_at = datetime.now(UTC)
     db.flush()
     return session
+
