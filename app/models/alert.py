@@ -16,6 +16,7 @@ class Alert(Base):
     camera_id = Column(String(50), nullable=False)
     zone_id = Column(String(100))          # canonical zone name used by resolution/cooldown logic
     zone_name = Column(String(100))        # human-readable stored name (same value, explicit column)
+    slot_id = Column(String(50), nullable=True, index=True)
     region_id = Column(Integer)            # raw numeric region sent by camera
     slot_number = Column(String(100), nullable=True)  # real-life parking bay number (from ZONE_REAL_SLOT)
     event_type = Column(String(100))

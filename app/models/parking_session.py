@@ -30,6 +30,7 @@ class ParkingSession(Base):
     exit_snapshot_path = Column(Text)
 
     floor = Column(String(50))
+    slot_id = Column(String(50), index=True)
     zone_id = Column(String(100), index=True)
     zone_name = Column(String(100))
     slot_number = Column(String(100))

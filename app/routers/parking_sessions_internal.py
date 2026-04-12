@@ -20,6 +20,7 @@ def bind_slot(body: ParkingSessionBindRequest, db: Session = Depends(get_db)):
         session = parking_session_service.bind_slot(
             db,
             plate_number=body.plate_number,
+            slot_id=body.slot_id,
             slot_number=body.slot_number,
             zone_id=body.zone_id,
             zone_name=body.zone_name,
@@ -40,6 +41,7 @@ def bind_slot(body: ParkingSessionBindRequest, db: Session = Depends(get_db)):
         session_id=session.id,
         plate_number=session.plate_number,
         status=session.status,
+        slot_id=session.slot_id,
         zone_id=session.zone_id,
         zone_name=session.zone_name,
         floor=session.floor,
@@ -56,6 +58,7 @@ def unbind_slot(body: ParkingSessionUnbindRequest, db: Session = Depends(get_db)
             camera_id=body.camera_id,
             left_at=body.left_at,
             snapshot_path=body.snapshot_path,
+            slot_id=body.slot_id,
             slot_number=body.slot_number,
         )
         db.commit()
@@ -70,6 +73,7 @@ def unbind_slot(body: ParkingSessionUnbindRequest, db: Session = Depends(get_db)
         session_id=session.id,
         plate_number=session.plate_number,
         status=session.status,
+        slot_id=session.slot_id,
         zone_id=session.zone_id,
         zone_name=session.zone_name,
         floor=session.floor,

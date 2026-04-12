@@ -92,6 +92,7 @@ def close_session(
 def bind_slot(
     db: Session,
     plate_number: str,
+    slot_id: str,
     slot_number: str,
     zone_id: str,
     zone_name: Optional[str],
@@ -105,6 +106,7 @@ def bind_slot(
         raise LookupError(f"No open parking session found for plate {plate_number}")
 
     zone_meta = settings.get_zone_metadata(zone_id)
+    session.slot_id = slot_id
     session.slot_number = slot_number
     session.zone_id = zone_id
     session.zone_name = zone_name or zone_meta.get("zone_name") or zone_id
@@ -124,6 +126,7 @@ def unbind_slot(
     camera_id: str,
     left_at: Optional[datetime],
     snapshot_path: Optional[str],
+    slot_id: Optional[str] = None,
     slot_number: Optional[str] = None,
 ) -> ParkingSession:
     session = get_latest_open_session(db, plate_number)
@@ -132,6 +135,10 @@ def unbind_slot(
     if slot_number and session.slot_number and session.slot_number != slot_number:
         raise ValueError(
             f"Open parking session for plate {plate_number} is bound to slot {session.slot_number}, not {slot_number}"
+        )
+    if slot_id and session.slot_id and session.slot_id != slot_id:
+        raise ValueError(
+            f"Open parking session for plate {plate_number} is bound to slot id {session.slot_id}, not {slot_id}"
         )
 
     session.slot_left_at = _naive(left_at) if left_at else datetime.now(UTC)

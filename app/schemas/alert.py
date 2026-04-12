@@ -10,6 +10,7 @@ class AlertOut(BaseModel):
     camera_id: str
     zone_id: Optional[str]
     zone_name: Optional[str]
+    slot_id: Optional[str] = None
     region_id: Optional[int]
     slot_number: Optional[str] = None  # real-life parking bay number
     plate_number: Optional[str] = None

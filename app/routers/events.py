@@ -54,26 +54,8 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
         #    FIX #2: dispatch now returns pending cache keys for post-commit recording.
         dispatch_result = await dispatch_event(event, db) or {}
 
-        # 3. Persist raw event log (skip high-frequency VMD noise)
-        #    Done AFTER dispatch so event.snapshot_path contains the CDN URL.
-        from app.models.camera_event import CameraEvent
-        if event.event_type != "VMD":
-            db.add(CameraEvent(
-                camera_id=event.camera_id,
-                device_serial=event.device_serial,
-                channel_id=event.channel_id,
-                event_type=event.event_type,
-                event_state=event.event_state,
-                event_description=event.event_description,
-                detection_target=event.detection_target,
-                region_id=event.region_id,
-                channel_name=event.channel_name,
-                trigger_time=event.trigger_time,
-                snapshot_path=event.snapshot_path,
-                raw_payload=event.raw_xml,
-                created_at=datetime.now(UTC),
-            ))
-
+        # (Removed unused CameraEvent insertion map here)
+        
         # 4. Commit — router owns the transaction, not the dispatcher
         db.commit()
 
@@ -89,23 +71,3 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
         db.rollback()
         logger.error(f"Event processing error: {e}", exc_info=True)
         return {"status": "error", "detail": str(e)}
-
-
-@router.get("/events", summary="List raw camera events")
-def list_events(
-    limit: int = 50, 
-    offset: int = 0, 
-    camera_id: Optional[str] = None, 
-    event_type: Optional[str] = None,
-    db: Session = Depends(get_db)
-):
-    """Returns raw event log with optional filtering."""
-    from app.models.camera_event import CameraEvent
-    q = db.query(CameraEvent)
-    
-    if camera_id:
-        q = q.filter(CameraEvent.camera_id == camera_id)
-    if event_type:
-        q = q.filter(CameraEvent.event_type == event_type)
-        
-    return q.order_by(CameraEvent.created_at.desc()).offset(offset).limit(limit).all()
