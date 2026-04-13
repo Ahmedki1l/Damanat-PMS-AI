@@ -23,3 +23,4 @@ with engine.connect() as conn:
     )).fetchall()
     for r in rows:
         print(f"  id={r[0]}  plate={r[1]:12s}  gate={r[2]}  time={r[3]}")
+

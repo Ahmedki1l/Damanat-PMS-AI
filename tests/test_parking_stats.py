@@ -28,7 +28,7 @@ def make_anpr_event(cam_id, plate, gate, timestamp=None):
         detection_target="vehicle",
         region_id="1",
         channel_name="Gate",
-        trigger_time=timestamp or datetime.utcnow(),
+        trigger_time=timestamp or datetime.now(UTC),
         raw_xml="<test/>",
         crossing_direction="B-to-A",
         plate_number=plate,
@@ -49,8 +49,8 @@ def db():
 async def test_parking_duration_calculation(db):
     """Verify that exit event matches entry and calculates duration."""
     plate = "TEST-123"
-    entry_time = datetime.utcnow() - timedelta(minutes=30)
-    exit_time = datetime.utcnow()
+    entry_time = datetime.now(UTC) - timedelta(minutes=30)
+    exit_time = datetime.now(UTC)
     
     # 1. Entry Event
     entry_event = make_anpr_event("CAM-ENTRY", plate, "entry", entry_time)
@@ -97,3 +97,4 @@ async def test_unmatched_exit_handles_null(db):
     exit_log = db.query(EntryExitLog).filter(EntryExitLog.plate_number == plate).first()
     assert exit_log.parking_duration is None
     assert exit_log.matched_entry_id is None
+

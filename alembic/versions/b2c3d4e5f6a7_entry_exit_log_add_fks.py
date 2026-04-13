@@ -34,7 +34,7 @@ def upgrade() -> None:
             'fk_entry_exit_log_vehicle_id',
             'entry_exit_log', 'vehicles',
             ['vehicle_id'], ['id'],
-            ondelete='SET NULL',
+            ondelete='NO ACTION',
         )
 
     if 'fk_entry_exit_log_matched_entry_id' not in existing_fks:
@@ -42,7 +42,7 @@ def upgrade() -> None:
             'fk_entry_exit_log_matched_entry_id',
             'entry_exit_log', 'entry_exit_log',
             ['matched_entry_id'], ['id'],
-            ondelete='SET NULL',
+            ondelete='NO ACTION',
         )
 
 

@@ -7,10 +7,22 @@ from typing import Optional
 class VehicleCreate(BaseModel):
     plate_number: str
     owner_name: str
+    title: str
     vehicle_type: str        # employee | visitor
     employee_id: Optional[str] = None
     notes: Optional[str] = None
 
+class VehicleUpdate(BaseModel):
+    plate_number: Optional[str] = None
+    owner_name: Optional[str] = None
+    title: Optional[str] = None
+    vehicle_type: Optional[str] = None
+    employee_id: Optional[str] = None
+    notes: Optional[str] = None
+    is_registered: Optional[bool] = None
+
+class VehicleKPI(BaseModel):
+    total_vehicles: int
 
 class VehicleResponse(BaseModel):
     id: int

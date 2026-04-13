@@ -4,9 +4,9 @@ Application configuration using Pydantic-Settings.
 All settings can be overridden via environment variables or .env file.
 """
 
+from pydantic import model_validator, ConfigDict, ConfigDict
 from pydantic_settings import BaseSettings
-from pydantic import model_validator
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 
 
 class Settings(BaseSettings):
@@ -57,6 +57,33 @@ class Settings(BaseSettings):
     ZONE_NAME_TO_UUID: dict = {
         "B1-PARKING":     "f33dd3d2-6fbd-4eda-b682-bd2a7d1f1061",
         "B2-PARKING":     "93651f64-fb84-4082-b51e-9477cf7c06ac",
+    }
+    ZONE_METADATA: dict[str, dict[str, Any]] = {
+        "GARAGE-TOTAL": {
+            "zone_name": "Garage Total",
+            "floor": "ALL",
+            "max_capacity": 18,
+        },
+        "B1-PARKING": {
+            "zone_name": "B1 Parking",
+            "floor": "B1",
+            "max_capacity": 9,
+        },
+        "B2-PARKING": {
+            "zone_name": "B2 Parking",
+            "floor": "B2",
+            "max_capacity": 9,
+        },
+        "entry": {
+            "zone_name": "Entry Gate",
+            "floor": "GF",
+            "max_capacity": None,
+        },
+        "exit": {
+            "zone_name": "Exit Gate",
+            "floor": "GF",
+            "max_capacity": None,
+        },
     }
     # ── Phase 1 Camera credentials (read from .env) ──────────────────────
     CAM_01_IP: str = ""
@@ -254,12 +281,17 @@ class Settings(BaseSettings):
     # ── Logging ───────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
+    model_config = ConfigDict(env_file=".env", extra="ignore")
 
     LOG_CAMERA_FILTER: str = ""
     LOG_CAMERA_EXCLUDE: str = ""
 
+    def get_zone_metadata(self, zone_id: Optional[str]) -> dict[str, Any]:
+        """Return canonical metadata for a logical zone or gate."""
+        if not zone_id:
+            return {}
+        return dict(self.ZONE_METADATA.get(zone_id, {}))
+
 
 settings = Settings()
+

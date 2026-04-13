@@ -8,7 +8,7 @@ so create_tables() creates every table in one call.
 import os as _os
 
 from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool as _NullPool
 from app.config import settings
@@ -44,12 +44,12 @@ def create_tables():
     Kept for scripts (init_db.py) that don't need full Alembic.
     """
     # Phase 1 models
-    from app.models.camera_event import CameraEvent       # noqa
     from app.models.zone_occupancy import ZoneOccupancy   # noqa
     from app.models.alert import Alert                     # noqa
     # Phase 2 models
     from app.models.vehicle import Vehicle                 # noqa
     from app.models.entry_exit_log import EntryExitLog     # noqa
+    from app.models.parking_session import ParkingSession  # noqa
 
     Base.metadata.create_all(bind=engine)
 
@@ -92,3 +92,4 @@ def run_migrations():
                 env_ctx.run_migrations()
 
         conn.commit()
+

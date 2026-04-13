@@ -3,9 +3,10 @@ Phase 2: UC1 (Entry/Exit Counting), UC2 (Parking Time), and UC4 (Vehicle ID).
 Handles AccessControllerEvent / vehicleMatchResult / ANPR from ANPR cameras.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, UTC, timedelta
 from sqlalchemy.orm import Session
 from app.models.entry_exit_log import EntryExitLog
+from app.services import parking_session_service
 from app.services import vehicle_service
 from app.services.event_parser import ParsedCameraEvent
 from app.services.alert_service import create_alert
@@ -31,7 +32,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
 
     # Strip timezone info: camera sends tz-aware timestamps but DB stores naive UTC.
     # Mixing the two in subtraction raises "can't subtract offset-naive and offset-aware".
-    event_time = event.trigger_time or datetime.utcnow()
+    event_time = event.trigger_time or datetime.now(UTC)
     if event_time.tzinfo is not None:
         event_time = event_time.replace(tzinfo=None)
 
@@ -93,8 +94,18 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         camera_id=event.camera_id,
         event_time=event_time,
         snapshot_path=event.snapshot_path,
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(UTC),
     )
+
+    if gate == "entry":
+        parking_session_service.open_session(
+            db,
+            plate_number=plate,
+            event_time=event_time,
+            camera_id=event.camera_id,
+            snapshot_path=event.snapshot_path,
+            vehicle=vehicle,
+        )
 
     # UC2: Calculation of Parking Duration on Exit
     if gate == "exit":
@@ -131,6 +142,14 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         else:
             logger.warning(f"[UC2] No matching entry found for vehicle {plate}")
 
+        parking_session_service.close_session(
+            db,
+            plate_number=plate,
+            event_time=event_time,
+            camera_id=event.camera_id,
+            snapshot_path=event.snapshot_path,
+        )
+
     # UC4: Clear logic for single notification/alert
     if vehicle:
         # Registered vehicle — send single 'info' notification
@@ -162,3 +181,4 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
 
     if log_entry not in db.new:
         db.add(log_entry)
+

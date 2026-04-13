@@ -1,5 +1,5 @@
 # app/services/occupancy_service.py
-from datetime import datetime
+from datetime import datetime, UTC
 from sqlalchemy import update, func, case
 from sqlalchemy.orm import Session
 from app.models.zone_occupancy import ZoneOccupancy
@@ -47,17 +47,29 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
     """
     # ── Primary source of truth: local zone_occupancy table ───────────────
     zone = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id == zone_id).first()
+    zone_meta = settings.get_zone_metadata(zone_id)
     if not zone:
         logger.info(f"[UC3] Auto-creating zone '{zone_id}'")
         zone = ZoneOccupancy(
             zone_id=zone_id,
+            zone_name=zone_meta.get("zone_name"),
+            floor=zone_meta.get("floor"),
             camera_id=camera_id,
             current_count=0,
-            max_capacity=settings.DEFAULT_ZONE_CAPACITY,
-            last_updated=datetime.utcnow(),
+            max_capacity=zone_meta.get("max_capacity") or settings.DEFAULT_ZONE_CAPACITY,
+            last_updated=datetime.now(UTC),
         )
         db.add(zone)
         db.flush()
+    else:
+        if zone_meta.get("zone_name") and not zone.zone_name:
+            zone.zone_name = zone_meta["zone_name"]
+        if zone_meta.get("floor") and not zone.floor:
+            zone.floor = zone_meta["floor"]
+        if zone_meta.get("max_capacity") and (
+            zone.max_capacity is None or zone.max_capacity == settings.DEFAULT_ZONE_CAPACITY
+        ):
+            zone.max_capacity = zone_meta["max_capacity"]
 
     # 1. Atomic update: count = max(count + delta, 0) — never goes negative
     await push_db_update(db, zone_id, delta)
@@ -68,7 +80,7 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
     # FIX #3: removed non-atomic ORM clamp (if zone.current_count < 0: zone.current_count = 0)
     # The atomic func.max() in push_db_update now handles this.
 
-    zone.last_updated = datetime.utcnow()
+    zone.last_updated = datetime.now(UTC)
     occupancy_ratio = (zone.current_count / zone.max_capacity) if zone.max_capacity > 0 else 0
     pct = int(occupancy_ratio * 100)
 
@@ -80,6 +92,7 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
             alert_type="capacity_exceeded",
             camera_id=camera_id,
             zone_id=zone_id,
+            zone_name=zone.zone_name,
             event_type="occupancy_update",
             description=f"Zone {zone_id} is nearly full: {pct}% ({zone.current_count}/{zone.max_capacity})",
         )
@@ -90,7 +103,7 @@ def _cache_cleanup():
     FIX #4 (cache memory leak): evict entries older than CACHE_TTL_SECONDS.
     Called on every new cache insert to bound memory growth over long uptimes.
     """
-    now = datetime.utcnow().timestamp()
+    now = datetime.now(UTC).timestamp()
     expired = [k for k, v in _processed_events_cache.items() if now - v >= CACHE_TTL_SECONDS]
     for k in expired:
         del _processed_events_cache[k]
@@ -103,7 +116,7 @@ def record_event_in_cache(cache_key: tuple):
     If the transaction rolls back, the cache stays clean and camera retries are accepted.
     """
     _cache_cleanup()  # FIX #4: prune stale entries on every insert
-    _processed_events_cache[cache_key] = datetime.utcnow().timestamp()
+    _processed_events_cache[cache_key] = datetime.now(UTC).timestamp()
 
 
 async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
@@ -129,7 +142,7 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
     # 3. Deduplication: Ignore identical events within CACHE_TTL_SECONDS
     # FIX #5: uses EVENT_STREAM_SUPPRESS_SECONDS (30s) instead of hardcoded 1s
     cache_key = (event.camera_id, event.event_type, event.region_id or event.crossing_direction)
-    now = datetime.utcnow().timestamp()
+    now = datetime.now(UTC).timestamp()
     if cache_key in _processed_events_cache:
         last_time = _processed_events_cache[cache_key]
         if now - last_time < CACHE_TTL_SECONDS:
@@ -239,3 +252,4 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
         logger.info(f"[UC3] OVERALL STATUS | {' | '.join(summary_parts)}")
 
     return cache_key
+

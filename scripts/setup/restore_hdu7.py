@@ -43,7 +43,7 @@ try:
         snapshot_path     = cdn_url,
         raw_payload       = None,
         is_test           = False,
-        created_at        = datetime.utcnow(),
+        created_at        = datetime.now(UTC),
     )
     db.add(ev)
     db.flush()
@@ -57,7 +57,7 @@ try:
         event_time    = EVENT_TIME,
         snapshot_path = cdn_url,
         is_test       = False,
-        created_at    = datetime.utcnow(),
+        created_at    = datetime.now(UTC),
     )
     db.add(log)
     db.flush()
@@ -73,3 +73,4 @@ except Exception as e:
     raise
 finally:
     db.close()
+

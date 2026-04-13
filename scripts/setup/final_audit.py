@@ -27,3 +27,4 @@ with engine.connect() as conn:
     )).fetchall()
     for r in rows2:
         print(f'  id={r[0]} plate={r[1]:12s} gate={r[2]} time={r[3]} snap={r[4]}')
+

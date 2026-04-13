@@ -21,3 +21,4 @@ with engine.connect() as conn:
     )).fetchall()
     for r in rows2:
         print(f'  id={r[0]}  cam={r[1]}  type={r[2]:25s}  time={r[3]}')
+

@@ -210,7 +210,7 @@ def main():
                     snapshot_path     = cdn_url,
                     raw_payload       = None,
                     is_test           = False,
-                    created_at        = datetime.utcnow(),
+                    created_at        = datetime.now(UTC),
                 )
                 db.add(ev)
                 db.flush()
@@ -230,3 +230,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

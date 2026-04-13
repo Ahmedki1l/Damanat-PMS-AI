@@ -12,7 +12,7 @@ Storage modes (controlled by STORAGE_MODE in .env):
 
 import httpx
 import os
-from datetime import datetime
+from datetime import datetime, UTC
 from app.config import settings
 from app.utils.logger import get_logger
 
@@ -35,7 +35,7 @@ async def fetch_snapshot(camera_id: str, event_type: str) -> str | None:
         return None
 
     url = f"http://{cam['ip']}{SNAPSHOT_PATH}"
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
     filename = f"snap_{event_type}_{camera_id}_{timestamp}.jpg"
 
     try:
@@ -63,3 +63,4 @@ async def fetch_snapshot(camera_id: str, event_type: str) -> str | None:
     except Exception as e:
         logger.error(f"[SNAPSHOT] Failed for {camera_id}: {e}")
         return None
+

@@ -76,7 +76,7 @@ JSON_ANPR_TEMPLATE = {
 
 def simulate_xml(event_type, zone, target, source_ip, direction):
     body = XML_TEMPLATES[event_type].format(
-        time=datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
+        time=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
         zone=zone, target=target, ip=source_ip, direction=direction
     )
     resp = requests.post(BACKEND_URL, data=body.encode(),
@@ -87,7 +87,7 @@ def simulate_xml(event_type, zone, target, source_ip, direction):
 
 def simulate_anpr(plate, gate_ip):
     payload = json.loads(json.dumps(JSON_ANPR_TEMPLATE))  # deep copy
-    payload["dateTime"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload["dateTime"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     payload["AccessControllerEvent"]["cardNo"] = plate
     resp = requests.post(BACKEND_URL, json=payload,
                          headers={"Content-Type": "application/json",
@@ -132,4 +132,5 @@ if __name__ == "__main__":
         simulate_anpr(args.plate, source_ip)
     else:
         simulate_xml(args.event, args.zone, args.target, source_ip, args.direction)
+
 

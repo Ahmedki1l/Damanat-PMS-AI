@@ -91,20 +91,8 @@ async def _handle_event(xml_bytes: bytes, cam_id: str, cam_ip: str):
         # Use a fresh DB session per event
         db = SessionLocal()
         try:
-            from datetime import datetime
-            from app.models.camera_event import CameraEvent
-            db.add(CameraEvent(
-                camera_id=event.camera_id,
-                device_serial=event.device_serial,
-                channel_id=event.channel_id,
-                event_type=event.event_type,
-                detection_target=event.detection_target,
-                region_id=event.region_id,
-                channel_name=event.channel_name,
-                trigger_time=event.trigger_time,
-                raw_payload=xml_bytes.decode("utf-8", errors="replace"),
-                created_at=datetime.utcnow(),
-            ))
+            from datetime import datetime, UTC
+           
             # dispatch_event commits raw event + handler changes atomically
             await dispatch_event(event, db)
         finally:
@@ -130,3 +118,4 @@ async def start_camera_polling(cameras: dict):
     ]
     # Run all pollers concurrently (they loop forever internally)
     await asyncio.gather(*tasks, return_exceptions=True)
+

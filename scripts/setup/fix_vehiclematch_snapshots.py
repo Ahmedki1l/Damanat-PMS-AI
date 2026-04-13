@@ -119,7 +119,7 @@ try:
                 event_time        = third_event.trigger_time,
                 snapshot_path     = third_event.snapshot_path,
                 is_test           = False,
-                created_at        = datetime.utcnow(),
+                created_at        = datetime.now(UTC),
             )
             db.add(new_entry)
             db.flush()
@@ -136,3 +136,4 @@ except Exception as e:
     raise
 finally:
     db.close()
+

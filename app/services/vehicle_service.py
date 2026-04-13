@@ -5,7 +5,7 @@ Handles registered vehicle management and lookup.
 """
 
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, UTC
 from sqlalchemy.orm import Session
 from app.models.vehicle import Vehicle
 from app.utils.logger import get_logger
@@ -19,6 +19,18 @@ except ImportError:
 logger = get_logger(__name__)
 
 
+def _default_title(vehicle_type: str) -> str:
+    if vehicle_type.lower() == "employee":
+        return "Employee"
+    if vehicle_type.lower() == "visitor":
+        return "Visitor"
+    return "Vehicle"
+
+
+def _default_is_employee(vehicle_type: str) -> bool:
+    return vehicle_type.lower() == "employee"
+
+
 def lookup_vehicle(db: Session, plate: str) -> Optional[Vehicle]:
     """Find a registered vehicle by plate number."""
     if vehicle_repo:
@@ -28,6 +40,10 @@ def lookup_vehicle(db: Session, plate: str) -> Optional[Vehicle]:
 
 def is_registered(db: Session, plate: str) -> bool:
     """Check if a plate number exists in the system."""
+    if vehicle_repo:
+        result = vehicle_repo.is_registered(db, plate)
+        if isinstance(result, bool):
+            return result
     return lookup_vehicle(db, plate) is not None
 
 
@@ -45,7 +61,9 @@ def list_vehicles(db: Session, vehicle_type: Optional[str] = None,
 
 def register_vehicle(db: Session, plate_number: str, owner_name: str,
                      vehicle_type: str, employee_id: Optional[str] = None,
-                     notes: Optional[str] = None) -> Vehicle:
+                     notes: Optional[str] = None, title: Optional[str] = None,
+                     is_employee: Optional[bool] = None, phone: Optional[str] = None,
+                     email: Optional[str] = None) -> Vehicle:
     """Register a new vehicle. Raises ValueError if plate already exists."""
     if is_registered(db, plate_number):
         raise ValueError(f"Plate {plate_number} already registered")
@@ -53,14 +71,21 @@ def register_vehicle(db: Session, plate_number: str, owner_name: str,
     vehicle = Vehicle(
         plate_number=plate_number,
         owner_name=owner_name,
+        title=title or _default_title(vehicle_type),
         vehicle_type=vehicle_type,
         employee_id=employee_id,
+        is_employee=_default_is_employee(vehicle_type) if is_employee is None else is_employee,
+        phone=phone,
+        email=email,
         notes=notes,
         is_registered=True,
-        registered_at=datetime.utcnow(),
+        registered_at=datetime.now(UTC),
     )
-    
-    db.add(vehicle)
+
+    if vehicle_repo:
+        vehicle_repo.create(db, vehicle)
+    else:
+        db.add(vehicle)
     logger.info(f"Registered vehicle: {plate_number} ({vehicle_type}) owner={owner_name}")
     return vehicle
 
@@ -71,5 +96,51 @@ def remove_vehicle(db: Session, plate: str) -> None:
     if not vehicle:
         raise ValueError(f"Vehicle with plate {plate} not found")
     
-    db.delete(vehicle)
+    if vehicle_repo:
+        vehicle_repo.delete(db, vehicle)
+    else:
+        db.delete(vehicle)
     logger.info(f"Removed vehicle: {plate}")
+
+
+def update_vehicle(
+    db: Session,
+    plate: str,
+    *,
+    owner_name: Optional[str] = None,
+    title: Optional[str] = None,
+    vehicle_type: Optional[str] = None,
+    employee_id: Optional[str] = None,
+    is_employee: Optional[bool] = None,
+    phone: Optional[str] = None,
+    email: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> Vehicle:
+    vehicle = lookup_vehicle(db, plate)
+    if not vehicle:
+        raise ValueError(f"Vehicle with plate {plate} not found")
+
+    if owner_name is not None:
+        vehicle.owner_name = owner_name
+    if title is not None:
+        vehicle.title = title
+    if vehicle_type is not None:
+        vehicle.vehicle_type = vehicle_type
+        if title is None and not vehicle.title:
+            vehicle.title = _default_title(vehicle_type)
+    if employee_id is not None:
+        vehicle.employee_id = employee_id
+    if is_employee is not None:
+        vehicle.is_employee = is_employee
+    elif vehicle_type is not None:
+        vehicle.is_employee = _default_is_employee(vehicle_type)
+    if phone is not None:
+        vehicle.phone = phone
+    if email is not None:
+        vehicle.email = email
+    if notes is not None:
+        vehicle.notes = notes
+
+    logger.info("Updated vehicle profile: %s", plate)
+    return vehicle
+

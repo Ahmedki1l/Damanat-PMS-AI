@@ -51,7 +51,7 @@ def seed():
                 employee_id=v.get("employee_id"),
                 notes=v.get("notes"),
                 is_registered=True,
-                registered_at=datetime.utcnow(),
+                registered_at=datetime.now(UTC),
             ))
             added += 1
         db.commit()
@@ -62,3 +62,4 @@ def seed():
 
 if __name__ == "__main__":
     seed()
+

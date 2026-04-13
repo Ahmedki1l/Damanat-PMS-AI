@@ -9,3 +9,4 @@ with engine.connect() as conn:
     conn.execute(text("DELETE FROM alerts WHERE description LIKE '%TST-1234%'"))
     conn.commit()
     print("Test record cleaned up")
+

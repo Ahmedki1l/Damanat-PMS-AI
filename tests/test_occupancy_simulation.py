@@ -55,7 +55,7 @@ if not logger.handlers:
 
 def ts():
     """Compact timestamp for inline log messages."""
-    return datetime.utcnow().strftime("%H:%M:%S.%f")[:-3]
+    return datetime.now(UTC).strftime("%H:%M:%S.%f")[:-3]
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -121,7 +121,7 @@ def seed_zones(db, total=0, b1=0, b2=0, capacity=100):
             camera_id=cam,
             current_count=count,
             max_capacity=capacity,
-            last_updated=datetime.utcnow(),
+            last_updated=datetime.now(UTC),
         ))
     db.commit()
     logger.info(f"[{ts()}] Seeded zones: {TOTAL}={total}, {B1}={b1}, {B2}={b2}")
@@ -162,7 +162,7 @@ def make_event(
         detection_target=target,
         region_id=region_id,
         channel_name=f"Test {cam_id}",
-        trigger_time=datetime.utcnow(),
+        trigger_time=datetime.now(UTC),
         raw_xml="<test/>",
         crossing_direction=direction,
     )
@@ -529,3 +529,4 @@ class TestScenario6_ClampToZeroRace:
             f"[{ts()}] PASS FIX #3 verified: atomic clamp held. "
             f"No negative SQL counts. TOTAL={t2}, B1={b1_2}"
         )
+

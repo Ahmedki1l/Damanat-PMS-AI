@@ -9,8 +9,8 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from app.routers import (
-    events, occupancy, 
-    health, alerts, vehicles, entry_exit, parking_stats,
+    events, occupancy,
+    health, alerts, vehicles, entry_exit, parking_stats, parking_sessions_internal,
 )
 from app.database import create_tables 
 from app.config import settings
@@ -92,6 +92,8 @@ app.include_router(alerts.router,        prefix="/api/v1", tags=["🔔 Alerts"])
 app.include_router(entry_exit.router,    prefix="/api/v1", tags=["🚗 Entry/Exit — UC1"])
 app.include_router(parking_stats.router, prefix="/api/v1", tags=["📊 Stats — UC2"])
 app.include_router(vehicles.router,      prefix="/api/v1", tags=["🔍 Vehicles — UC4"])
+
+app.include_router(parking_sessions_internal.router, prefix="/api/v1", tags=["Internal Sessions"])
 
 import asyncio
 from app.database import SessionLocal

@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 URL = "http://localhost:8081/api/v1/events/camera"
 
-ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 # Use regionEntrance on emergency-exit zone (CAM-02 / 10.1.13.20) — triggers an intrusion alert
 body = (
     '<?xml version="1.0" encoding="utf-8"?>'
@@ -53,3 +53,4 @@ print(f"  id={event.id}  type={event.event_type}  camera={event.camera_id}")
 print(f"  snapshot_path={event.snapshot_path}")
 
 db.close()
+

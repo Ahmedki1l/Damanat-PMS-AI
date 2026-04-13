@@ -16,8 +16,12 @@ class Vehicle(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     plate_number = Column(String(50), unique=True, nullable=False, index=True)
     owner_name = Column(String(200), nullable=False)
+    title = Column(String(50), nullable=False)
     vehicle_type = Column(String(50), nullable=False)  # employee | visitor
     employee_id = Column(String(100))
+    is_employee = Column(Boolean, default=False, nullable=False)
+    phone = Column(String(50))
+    email = Column(String(255))
     is_registered = Column(Boolean, default=True, nullable=False)
     registered_at = Column(DateTime)
     notes = Column(Text)

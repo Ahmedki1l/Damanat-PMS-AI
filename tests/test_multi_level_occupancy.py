@@ -28,7 +28,7 @@
 #         detection_target="vehicle",
 #         region_id=region_id,
 #         channel_name=f"Test {cam_id}",
-#         trigger_time=datetime.utcnow(),
+#         trigger_time=datetime.now(UTC),
 #         raw_xml="<test/>",
 #         crossing_direction=direction,
 #         plate_number=plate
@@ -122,7 +122,7 @@
 #     # Hack timestamps to be 10s old
 #     for key in list(_pending_exits.keys()):
 #         zid, cid, delta, ts = _pending_exits[key]
-#         _pending_exits[key] = (zid, cid, delta, datetime.utcnow() - timedelta(seconds=10))
+#         _pending_exits[key] = (zid, cid, delta, datetime.now(UTC) - timedelta(seconds=10))
     
 #     await process_pending_exits(db)
     
@@ -148,3 +148,4 @@
 #     assert len(_pending_exits) == 0
 #     total = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id == settings.GARAGE_TOTAL_ZONE).first()
 #     assert total.current_count == 10 # No change
+
