@@ -83,6 +83,8 @@ async def create_alert(
         snapshot_path: CDN URL or local file path for the evidence image.
 
     Note: The caller (event_dispatcher) is responsible for committing the transaction.
+    Uses a nested savepoint for the DB insert so that a constraint failure on the
+    alert table does NOT roll back the parent transaction (entry_exit_log, parking_session).
     """
     try:
         severity = _resolve_severity(alert_type)
@@ -112,11 +114,24 @@ async def create_alert(
             triggered_at=datetime.now(UTC),
         )
 
-        db.add(new_alert)
         logger.warning(
             f"[ALERT][{alert_type.upper()}] Cam: {camera_id} | Zone: {zone_name or zone_id} "
             f"| Region: {region_id} | Slot: {slot_number} | {description}"
         )
+
+        # Use a nested savepoint so that a DB-level failure (e.g. stale FK constraint)
+        # only rolls back the alert INSERT — not the parent transaction that holds
+        # the entry_exit_log and parking_session inserts.
+        try:
+            with db.begin_nested():
+                db.add(new_alert)
+        except Exception as db_err:
+            logger.error(
+                f"[ALERT] DB insert failed for {alert_type} (plate={plate_number}): {db_err}. "
+                "Alert was NOT saved but the event transaction will continue."
+            )
+            # Fall through to publish the SSE event even without DB persistence.
+            new_alert = None
 
         import json
         event_bus.publish(json.dumps({
@@ -134,7 +149,7 @@ async def create_alert(
             "event_type": event_type,
             "description": description,
             "snapshot_path": snapshot_path,
-            "triggered_at": new_alert.triggered_at.isoformat(),
+            "triggered_at": (new_alert.triggered_at if new_alert else datetime.now(UTC)).isoformat(),
         }))
 
     except Exception as e:

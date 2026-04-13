@@ -39,7 +39,6 @@ def create_tables():
     Kept for scripts (init_db.py) that don't need full Alembic.
     """
     # Phase 1 models
-    from app.models.camera_event import CameraEvent       # noqa
     from app.models.zone_occupancy import ZoneOccupancy   # noqa
     from app.models.alert import Alert                     # noqa
     # Phase 2 models
