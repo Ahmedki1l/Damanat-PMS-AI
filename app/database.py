@@ -5,16 +5,21 @@ Uses SQLAlchemy with PostgreSQL. All models are auto-imported here
 so create_tables() creates every table in one call.
 """
 
+import os as _os
+
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool as _NullPool
 from app.config import settings
+
+_is_serverless = _os.environ.get("VERCEL") == "1"
 
 engine = create_engine(
     settings.db_url,
     pool_pre_ping=True,          # Auto-reconnect if DB connection drops
-    pool_size=10,
-    max_overflow=20,
+    poolclass=_NullPool if _is_serverless else None,
+    **({} if _is_serverless else {"pool_size": 10, "max_overflow": 20}),
     echo=False,                  # Set True to log all SQL queries (debug only)
 )
 

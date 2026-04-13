@@ -1,25 +1,25 @@
 # docker-compose.yml
-# Starts PostgreSQL + the FastAPI backend together.
+# Starts SQL Server + the FastAPI backend together.
 # Usage: docker-compose up -d
 
 version: "3.9"
 
 services:
 
-  db:
-    image: postgres:16-alpine
-    container_name: damanat_db
+  sql-server:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: damanat_sql
     restart: unless-stopped
     environment:
-      POSTGRES_USER: damanat
-      POSTGRES_PASSWORD: damanat
-      POSTGRES_DB: damanat_db
+      - ACCEPT_EULA=Y
+      - SA_PASSWORD=DamanatPms2026!
+      - MSSQL_PID=Express
     ports:
-      - "5434:5432"
+      - "1433:1433"
     volumes:
-      - db_data:/var/lib/postgresql/data
+      - sql_data:/var/opt/mssql
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U damanat" ]
+      test: [ "CMD-SHELL", "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P DamanatPms2026! -Q 'SELECT 1'" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -29,7 +29,7 @@ services:
     container_name: damanat_backend
     restart: unless-stopped
     depends_on:
-      db:
+      sql-server:
         condition: service_healthy
     ports:
       - "8080:8080"
@@ -37,8 +37,8 @@ services:
       - ./logs:/app/logs
       - ./.env:/app/.env
     environment:
-      DATABASE_URL: postgresql://damanat:damanat@db:5432/damanat_db
+      DATABASE_URL: mssql+pyodbc://sa:DamanatPms2026!@sql-server:1433/master?driver=ODBC+Driver+17+for+SQL+Server
     command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 2
 
 volumes:
-  db_data:
+  sql_data:

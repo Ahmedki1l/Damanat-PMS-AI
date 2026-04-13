@@ -50,8 +50,8 @@ cp .env.example .env        # Edit with real IPs + DB URL
 
 ### 3. Start Database
 ```bash
-# Option A: Docker (recommended)
-docker-compose up -d db
+# Option A: Docker (SQL Server Express or Developer)
+docker-compose up -d sql-server
 
 # Option B: Local SQL Server
 # Ensure SQL Server Authentication is enabled
@@ -77,7 +77,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
 ```bash
 # Start everything (DB + Backend)
 docker-compose up -d
-docker-compose up -d db
+docker-compose up -d sql-server
 docker-compose down -v
 # View logs
 docker-compose logs -f backend
@@ -168,7 +168,7 @@ damanat-backend/
 │   └── test/                   # Event simulation + connectivity
 ├── tests/                      # Unit tests
 ├── logs/                       # Application logs (auto-created)
-├── docker-compose.yml          # PostgreSQL + Backend
+├── docker-compose.yml          # SQL Server + Backend
 ├── Dockerfile                  # Container build
 ├── requirements.txt            # Python dependencies
 └── .env.example                # Environment template
@@ -199,6 +199,7 @@ When ANPR cameras are physically installed:
 - Never hardcode IPs — use `settings` from `config.py`
 - Always add docstrings explaining: Purpose, Camera, Event type
 - Always return HTTP 200 from the camera webhook
+- **SQL Server Note**: Always specify a length for `String()` columns that are used in indexes or unique constraints (e.g., `String(255)`), as SQL Server does not support indexing columns with unlimited length.
 - Phase 2 files: full working implementations, commented out in `main.py`
 
 ## 📚 Full Documentation
