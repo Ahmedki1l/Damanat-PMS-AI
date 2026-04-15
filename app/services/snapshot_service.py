@@ -50,15 +50,20 @@ async def fetch_snapshot(camera_id: str, event_type: str) -> str | None:
         image_bytes = response.content
         logger.info(f"[SNAPSHOT] Fetched {filename} ({len(image_bytes)} bytes)")
 
+        # Always save locally first as a fallback
+        filepath = os.path.join(SNAPSHOT_DIR, filename)
+        with open(filepath, "wb") as f:
+            f.write(image_bytes)
+        logger.info(f"[SNAPSHOT] Saved locally → {filepath}")
+
         if settings.STORAGE_MODE == "spaces":
             from app.utils.spaces_client import upload_image
-            return upload_image(image_bytes, filename)
-        else:
-            filepath = os.path.join(SNAPSHOT_DIR, filename)
-            with open(filepath, "wb") as f:
-                f.write(image_bytes)
-            logger.info(f"[SNAPSHOT] Saved locally → {filepath}")
-            return filepath
+            cdn_url = upload_image(image_bytes, filename)
+            if cdn_url:
+                return cdn_url
+            logger.warning(f"[SNAPSHOT] Spaces upload failed for {filename}, falling back to local path")
+        
+        return filepath
 
     except Exception as e:
         logger.error(f"[SNAPSHOT] Failed for {camera_id}: {e}")
