@@ -4,6 +4,7 @@
 from app.services.event_parser import ParsedCameraEvent
 from app.services.occupancy_service import handle_occupancy_event
 from app.services.entry_exit_service import handle_anpr_event
+from app.services.camera_feed_service import add_event_to_feed
 from app.services.snapshot_service import fetch_snapshot
 from app.utils.event_bus import event_bus
 from app.utils.logger import get_logger
@@ -54,12 +55,11 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
                         event.snapshot_path = cdn_url
                         logger.info(f"[Spaces] Multipart image uploaded: {cdn_url}")
                     else:
-                        event.snapshot_path = None  # don't store local path in DB
+                        logger.warning(f"[Spaces] Multipart upload returned no URL for {_filename}, keeping local path")
                 else:
-                    event.snapshot_path = None
+                    logger.warning(f"[Spaces] Local multipart file not found: {local_path}")
             except Exception as e:
                 logger.warning(f"Multipart upload to Spaces failed for {event.camera_id}: {e}")
-                event.snapshot_path = None
 
         # Step 2: No CDN URL yet — try fetching a fresh snapshot from the camera
         if not event.snapshot_path or not event.snapshot_path.startswith("http"):
@@ -105,6 +105,12 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
                 "timestamp": event.trigger_time.isoformat() if event.trigger_time else None,
                 "snapshot_path": event.snapshot_path
             }))
+
+        # ── CAMERA FEED ──────────────────────────────────────────────────────
+        # Log all entry/exit related smart events to the CameraFeed table.
+        FEED_EVENT_TYPES = ("ANPR", "vehicleMatchResult", "AccessControllerEvent", "linedetection")
+        if event.event_type in FEED_EVENT_TYPES:
+            add_event_to_feed(db, event)
 
         # ── PHASE 1 ───────────────────────────────────────────────────────────
         

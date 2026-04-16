@@ -9,7 +9,7 @@ from app.config import settings
 from app.database import Base
 
 # Import all models so Alembic can detect them
-from app.models import zone_occupancy, alert, vehicle, entry_exit_log
+from app.models import zone_occupancy, alert, vehicle, entry_exit_log, parking_session, camera_feed
 
 config = context.config
 
