@@ -6,38 +6,60 @@ version: "3.9"
 
 services:
 
-  sql-server:
+  pms-mssql:
     image: mcr.microsoft.com/mssql/server:2022-latest
-    container_name: damanat_sql
+    container_name: pms-mssql
     restart: unless-stopped
     environment:
       - ACCEPT_EULA=Y
-      - SA_PASSWORD=DamanatPms2026!
+      - SA_PASSWORD=Damanat@123
       - MSSQL_PID=Express
     ports:
       - "1433:1433"
     volumes:
       - sql_data:/var/opt/mssql
+      - ./init-db.sql:/init-db.sql
     healthcheck:
-      test: [ "CMD-SHELL", "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P DamanatPms2026! -Q 'SELECT 1'" ]
+      test: [ "CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Damanat@123' -Q 'SELECT 1' -C -N" ]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
+
+  db-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: pms-db-init
+    depends_on:
+      pms-mssql:
+        condition: service_healthy
+    environment:
+      - SA_PASSWORD=Damanat@123
+    volumes:
+      - ./init-db.sql:/init-db.sql
+    command: >
+      /bin/bash -c "
+        /opt/mssql-tools18/bin/sqlcmd -S pms-mssql -U sa -P 'Damanat@123' -i /init-db.sql -C -N &&
+        echo '✅ Database initialized successfully'
+      "
+    restart: "no"
 
   backend:
     build: .
     container_name: damanat_backend
     restart: unless-stopped
     depends_on:
-      sql-server:
+      pms-mssql:
         condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
     ports:
       - "8080:8080"
     volumes:
       - ./logs:/app/logs
       - ./.env:/app/.env
     environment:
-      DATABASE_URL: mssql+pyodbc://sa:DamanatPms2026!@sql-server:1433/master?driver=ODBC+Driver+17+for+SQL+Server
+      DATABASE_URL: mssql://damanat:damanat@pms-mssql:1433
+      DB_NAME: damanat_pms
     command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 2
 
 volumes:

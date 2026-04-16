@@ -14,7 +14,7 @@ from app.models import zone_occupancy, alert, vehicle, entry_exit_log, parking_s
 config = context.config
 
 # Override sqlalchemy.url from app settings (so .env is the single source of truth)
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+config.set_main_option("sqlalchemy.url", settings.db_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

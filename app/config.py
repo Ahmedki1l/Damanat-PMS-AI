@@ -4,20 +4,47 @@ Application configuration using Pydantic-Settings.
 All settings can be overridden via environment variables or .env file.
 """
 
-from pydantic import model_validator, ConfigDict, ConfigDict
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from pydantic import model_validator, ConfigDict
 from pydantic_settings import BaseSettings
 from typing import Optional, Dict, List, Any
 
 
 class Settings(BaseSettings):
     # ── Database ──────────────────────────────────────────────────────────
-    DATABASE_URL: str = "mssql+pyodbc://sa:DamanatPms2026!@localhost:1433/damanat_pms?driver=ODBC+Driver+17+for+SQL+Server"
+    DATABASE_URL: str = "mssql://damanat:damanat@pms-mssql:1433"
+    DB_NAME: str = "damanat_pms"
+    DB_DRIVER: str = "ODBC Driver 18 for SQL Server"
 
     @property
     def db_url(self) -> str:
-        """Return DATABASE_URL with correct prefix for SQLAlchemy.
-        Render provides postgres:// — SQLAlchemy 2.0 requires postgresql://."""
-        return self.DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        """Return a SQLAlchemy-ready database URL.
+
+        Supports:
+        - postgres://... -> postgresql://...
+        - mssql://user:pass@host:port with DB_NAME provided separately
+        - mssql+pyodbc://... with missing driver/query defaults
+        """
+        raw_url = self.DATABASE_URL.strip()
+
+        if raw_url.startswith("postgres://"):
+            return raw_url.replace("postgres://", "postgresql://", 1)
+
+        if raw_url.startswith(("mssql://", "mssql+pyodbc://")):
+            split = urlsplit(raw_url)
+            path = split.path or f"/{self.DB_NAME}"
+            if path in {"", "/"}:
+                path = f"/{self.DB_NAME}"
+
+            query = dict(parse_qsl(split.query, keep_blank_values=True))
+            query.setdefault("driver", self.DB_DRIVER)
+            query.setdefault("Encrypt", "no")
+
+            scheme = "mssql+pyodbc"
+            return urlunsplit((scheme, split.netloc, path, urlencode(query), split.fragment))
+
+        return raw_url
 
     # ── Network ───────────────────────────────────────────────────────────
     BACKEND_IP: str = "127.0.0.1"  # override via .env per deployment

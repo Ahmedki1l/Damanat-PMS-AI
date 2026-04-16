@@ -107,7 +107,10 @@ async def startup():
         create_tables()     
         logger.info("✅ Database ready")
     except Exception as e:
-        logger.error(f"❌ Database initialization failed: {e}")
+        if "already an object named" in str(e):
+            logger.info("✅ Database ready (schema already initialized by another worker)")
+        else:
+            logger.error(f"❌ Database initialization failed: {e}")
 
 
 
