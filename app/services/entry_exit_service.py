@@ -152,19 +152,19 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
 
     # UC4: Clear logic for single notification/alert
     if vehicle:
-        # Registered vehicle — send single 'info' notification
-        from app.utils.event_bus import event_bus
-        import json
-        event_bus.publish(json.dumps({
-            "is_alert": False,
-            "severity": "info",
-            "alert_type": "AccessControllerEvent",
-            "camera_id": event.camera_id,
-            "description": f"Registered vehicle at {gate} gate: plate {plate}",
-            "plate_number": plate,
-            "timestamp": event_time.isoformat(),
-            "snapshot_path": event.snapshot_path
-        }))
+        # Registered vehicle — send single 'info' notification via unified broadcast
+        from app.services.alert_service import broadcast_event
+        await broadcast_event(
+            is_alert=False,
+            severity="info",
+            event_type="AccessControllerEvent",
+            description=f"Registered vehicle at {gate} gate: plate {plate}",
+            camera_id=event.camera_id,
+            zone_id=gate,
+            plate_number=plate,
+            snapshot_path=event.snapshot_path,
+            triggered_at=event_time
+        )
     else:
         # Unregistered vehicle — send single 'critical' alert
         logger.info(f"[UC4] Triggering alert for unknown vehicle: {plate}")
@@ -181,4 +181,3 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
 
     if log_entry not in db.new:
         db.add(log_entry)
-

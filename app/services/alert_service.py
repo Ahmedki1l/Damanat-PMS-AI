@@ -29,6 +29,59 @@ def _resolve_severity(alert_type: str) -> str:
     return ALERT_SEVERITY_MAP.get(alert_type, "warning")
 
 
+async def broadcast_event(
+    is_alert: bool,
+    severity: str,
+    event_type: str,
+    description: str,
+    camera_id: str,
+    alert_type: str | None = None,
+    alert_id: int | None = None,
+    plate_number: str | None = None,
+    snapshot_path: str | None = None,
+    zone_id: str | None = None,
+    zone_name: str | None = None,
+    slot_number: int | None = None,
+    triggered_at: datetime | None = None,
+):
+    """
+    Standardized broadcast function for all real-time events.
+    Ensures consistent JSON schema for api_gateway.
+    """
+    import json
+    
+    # Resolve location display name
+    location_display = _resolve_location_display(
+        camera_id=camera_id,
+        zone_id=zone_id,
+        zone_name=zone_name,
+        slot_number=slot_number,
+    )
+
+    payload = {
+        "is_alert": is_alert,
+        "alert_id": alert_id,
+        "severity": severity,
+        "event_type": event_type,
+        "alert_type": alert_type or event_type,
+        "camera_id": camera_id,
+        "location_display": location_display,
+        "description": description,
+        "plate_number": plate_number,
+        "snapshot_path": snapshot_path,
+        "triggered_at": (triggered_at or datetime.now(UTC)).isoformat(),
+        # Breadcrumbs for internal debugging
+        "internal_meta": {
+            "zone_id": zone_id,
+            "region_id": slot_number,
+        }
+    }
+
+    event_bus.publish(json.dumps(payload))
+    logger.debug(f"[Broadcast] {event_type} | {'ALERT' if is_alert else 'INFO'} | {description}")
+
+
+
 def _resolve_location_display(
     camera_id: str,
     zone_id: str | None,
@@ -125,6 +178,8 @@ async def create_alert(
         try:
             with db.begin_nested():
                 db.add(new_alert)
+                db.flush()
+            
         except Exception as db_err:
             logger.error(
                 f"[ALERT] DB insert failed for {alert_type} (plate={plate_number}): {db_err}. "
@@ -134,23 +189,23 @@ async def create_alert(
             new_alert = None
 
         import json
-        event_bus.publish(json.dumps({
-            "is_alert": True,
-            "severity": severity,
-            "alert_type": alert_type,
-            "camera_id": camera_id,
-            "zone_id": zone_id,
-            "zone_name": resolved_zone_name,
-            "slot_id": slot_id,
-            "region_id": region_id,
-            "slot_number": slot_number,
-            "plate_number": plate_number,
-            "location_display": location_display,
-            "event_type": event_type,
-            "description": description,
-            "snapshot_path": snapshot_path,
-            "triggered_at": (new_alert.triggered_at if new_alert else datetime.now(UTC)).isoformat(),
-        }))
+        alert_id = new_alert.id if new_alert else None
+        
+        await broadcast_event(
+            is_alert=True,
+            severity=severity,
+            event_type=event_type,
+            alert_type=alert_type,
+            alert_id=alert_id,
+            description=description,
+            camera_id=camera_id,
+            zone_id=zone_id,
+            zone_name=resolved_zone_name,
+            slot_number=slot_number,
+            plate_number=plate_number,
+            snapshot_path=snapshot_path,
+            triggered_at=new_alert.triggered_at if new_alert else datetime.now(UTC),
+        )
 
     except Exception as e:
         logger.error(f"Failed to create alert: {e}", exc_info=True)
