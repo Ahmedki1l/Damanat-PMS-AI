@@ -1,5 +1,8 @@
 import asyncio
 from typing import Any, AsyncGenerator
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 class EventBus:
     def __init__(self):
@@ -12,17 +15,22 @@ class EventBus:
         self.loop = asyncio.get_running_loop()
         queue = asyncio.Queue()
         self.subscribers.add(queue)
+        logger.info(f"[EventBus] New subscriber added. Total subscribers: {len(self.subscribers)}")
         try:
             while True:
                 item = await queue.get()
                 yield item
         finally:
             self.subscribers.remove(queue)
+            logger.info(f"[EventBus] Subscriber removed. Total subscribers: {len(self.subscribers)}")
 
     def publish(self, data: Any):
         """Sends data to all active queues. Thread-safe."""
         if not self.subscribers:
+            logger.debug("[EventBus] No active subscribers. Dropping event.")
             return
+
+        logger.debug(f"[EventBus] Publishing to {len(self.subscribers)} subscribers")
 
         def _put(q, d):
             q.put_nowait(d)

@@ -94,17 +94,17 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
 
         if should_log and not is_gate and (is_occupancy_event or event.event_type in ("fielddetection", "linedetection", "regionEntrance")):
             logger.info(f"Event: type={event.event_type} | camera={event.camera_id} | plate={event.plate_number}")
-            import json
-            event_bus.publish(json.dumps({
-                "is_alert": False,
-                "severity": "info",
-                "alert_type": event.event_type,
-                "camera_id": event.camera_id,
-                "description": f"Live Event from {event.camera_id}",
-                "plate_number": event.plate_number,
-                "timestamp": event.trigger_time.isoformat() if event.trigger_time else None,
-                "snapshot_path": event.snapshot_path
-            }))
+            from app.services.alert_service import broadcast_event
+            await broadcast_event(
+                is_alert=False,
+                severity="info",
+                event_type=event.event_type,
+                description=f"Live Event from {event.camera_id}",
+                camera_id=event.camera_id,
+                plate_number=event.plate_number,
+                triggered_at=event.trigger_time,
+                snapshot_path=event.snapshot_path
+            )
 
         # ── CAMERA FEED ──────────────────────────────────────────────────────
         # Log all entry/exit related smart events to the CameraFeed table.
