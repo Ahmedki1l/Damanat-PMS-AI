@@ -52,18 +52,19 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         logger.debug(f"[UC1] Duplicate suppressed for plate={plate} gate={gate}")
         return
 
-    # Anti-bounce: if this is an entry event but the plate just exited within the
-    # last 2 minutes, the entry camera is likely capturing the car driving away
-    # from the exit gate — suppress the false re-entry.
-    if gate == "entry":
-        # Forward plate + snapshot to PMS tracking API (fire-and-forget)
-        # Use local_snapshot_path because snapshot_path may be CDN URL or None after Spaces upload
+    # Forward plate + snapshot to PMS tracking API (fire-and-forget)
+    if gate in ["entry", "exit"]:
         try:
             await core_backend_client.notify_pms_anpr(
                 plate, gate, image_path=event.local_snapshot_path or event.snapshot_path,
             )
         except Exception as e:
             logger.warning(f"[UC1] PMS API forwarding failed for plate={plate}: {e}")
+
+    # Anti-bounce: if this is an entry event but the plate just exited within the
+    # last 2 minutes, the entry camera is likely capturing the car driving away
+    # from the exit gate — suppress the false re-entry.
+    if gate == "entry":
         recent_exit_window = event_time - timedelta(seconds=120)
         recent_exit = (
             db.query(EntryExitLog)

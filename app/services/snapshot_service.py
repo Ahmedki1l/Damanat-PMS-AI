@@ -5,9 +5,7 @@ immediately after a detection event fires.
 
 Endpoint: GET http://{cam_ip}/ISAPI/Streaming/channels/1/picture
 
-Storage modes (controlled by STORAGE_MODE in .env):
-  - "local"  → saves to detection_images/ on disk, returns local file path
-  - "spaces" → uploads to DigitalOcean Spaces, returns public CDN URL
+Storage: always saves to detection_images/ on disk, returns local file path.
 """
 
 import httpx
@@ -26,8 +24,8 @@ os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
 async def fetch_snapshot(camera_id: str, event_type: str) -> str | None:
     """
-    Fetch a snapshot from the camera.
-    Returns a CDN URL (Spaces mode) or local file path (local mode), or None on failure.
+    Fetch a snapshot from the camera and save it locally.
+    Returns the local file path, or None on failure.
     """
     cam = settings.CAMERAS.get(camera_id)
     if not cam:
@@ -50,19 +48,11 @@ async def fetch_snapshot(camera_id: str, event_type: str) -> str | None:
         image_bytes = response.content
         logger.info(f"[SNAPSHOT] Fetched {filename} ({len(image_bytes)} bytes)")
 
-        # Always save locally first as a fallback
         filepath = os.path.join(SNAPSHOT_DIR, filename)
         with open(filepath, "wb") as f:
             f.write(image_bytes)
         logger.info(f"[SNAPSHOT] Saved locally → {filepath}")
 
-        if settings.STORAGE_MODE == "spaces":
-            from app.utils.spaces_client import upload_image
-            cdn_url = upload_image(image_bytes, filename)
-            if cdn_url:
-                return cdn_url
-            logger.warning(f"[SNAPSHOT] Spaces upload failed for {filename}, falling back to local path")
-        
         return filepath
 
     except Exception as e:
