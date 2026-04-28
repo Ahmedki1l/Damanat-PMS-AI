@@ -24,6 +24,8 @@ def mock_vehicle():
     v.vehicle_type = "employee"
     v.is_employee = True
     v.title = "Employee"
+    v.is_registered = True
+    v.registered_at = None
     return v
 
 
@@ -73,6 +75,29 @@ class TestVehicleService:
         mock_repo.create.assert_not_called()
 
     @patch("app.services.vehicle_service.vehicle_repo")
+    def test_ensure_unregistered_vehicle_creates_placeholder(self, mock_repo, db):
+        mock_repo.get_by_plate.return_value = None
+        mock_repo.create.side_effect = lambda db, v: v
+
+        result = vehicle_service.ensure_unregistered_vehicle(db, "NEW-404")
+
+        assert result.plate_number == "NEW-404"
+        assert result.owner_name == "Unknown"
+        assert result.vehicle_type == "unknown"
+        assert result.is_registered is False
+        assert result.notes == "Not registered"
+        mock_repo.create.assert_called_once()
+
+    @patch("app.services.vehicle_service.vehicle_repo")
+    def test_ensure_unregistered_vehicle_returns_existing(self, mock_repo, db, mock_vehicle):
+        mock_repo.get_by_plate.return_value = mock_vehicle
+
+        result = vehicle_service.ensure_unregistered_vehicle(db, "A-1001")
+
+        assert result == mock_vehicle
+        mock_repo.create.assert_not_called()
+
+    @patch("app.services.vehicle_service.vehicle_repo")
     def test_remove_vehicle(self, mock_repo, db, mock_vehicle):
         mock_repo.get_by_plate.return_value = mock_vehicle
         vehicle_service.remove_vehicle(db, "A-1001")
@@ -106,4 +131,17 @@ class TestVehicleService:
         assert result.owner_name == "Updated Owner"
         assert result.phone == "12345"
         assert result.email == "owner@example.com"
+
+    @patch("app.services.vehicle_service.vehicle_repo")
+    def test_update_vehicle_can_mark_registered(self, mock_repo, db, mock_vehicle):
+        mock_repo.get_by_plate.return_value = mock_vehicle
+
+        result = vehicle_service.update_vehicle(
+            db,
+            "A-1001",
+            is_registered=True,
+        )
+
+        assert result.is_registered is True
+        assert result.registered_at is not None
 

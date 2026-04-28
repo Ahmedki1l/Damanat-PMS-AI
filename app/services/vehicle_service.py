@@ -90,6 +90,36 @@ def register_vehicle(db: Session, plate_number: str, owner_name: str,
     return vehicle
 
 
+def ensure_unregistered_vehicle(db: Session, plate_number: str) -> Vehicle:
+    """Return an existing vehicle or create a placeholder unregistered profile."""
+    vehicle = lookup_vehicle(db, plate_number)
+    if vehicle:
+        return vehicle
+
+    vehicle = Vehicle(
+        plate_number=plate_number,
+        owner_name="Unknown",
+        title="Vehicle",
+        vehicle_type="unknown",
+        employee_id=None,
+        is_employee=False,
+        phone=None,
+        email=None,
+        notes="Not registered",
+        is_registered=False,
+        registered_at=None,
+    )
+
+    if vehicle_repo:
+        vehicle_repo.create(db, vehicle)
+    else:
+        db.add(vehicle)
+        db.flush()
+
+    logger.info("Created placeholder vehicle for unregistered plate: %s", plate_number)
+    return vehicle
+
+
 def remove_vehicle(db: Session, plate: str) -> None:
     """Remove a vehicle by plate. Raises ValueError if not found."""
     vehicle = lookup_vehicle(db, plate)
@@ -115,6 +145,7 @@ def update_vehicle(
     phone: Optional[str] = None,
     email: Optional[str] = None,
     notes: Optional[str] = None,
+    is_registered: Optional[bool] = None,
 ) -> Vehicle:
     vehicle = lookup_vehicle(db, plate)
     if not vehicle:
@@ -140,6 +171,9 @@ def update_vehicle(
         vehicle.email = email
     if notes is not None:
         vehicle.notes = notes
+    if is_registered is not None:
+        vehicle.is_registered = is_registered
+        vehicle.registered_at = datetime.now(UTC) if is_registered else None
 
     logger.info("Updated vehicle profile: %s", plate)
     return vehicle
