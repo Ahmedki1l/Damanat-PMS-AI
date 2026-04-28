@@ -10,6 +10,9 @@ class VehicleCreate(BaseModel):
     title: str
     vehicle_type: str        # employee | visitor
     employee_id: Optional[str] = None
+    is_employee: Optional[bool] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
     notes: Optional[str] = None
 
 class VehicleUpdate(BaseModel):
@@ -18,6 +21,9 @@ class VehicleUpdate(BaseModel):
     title: Optional[str] = None
     vehicle_type: Optional[str] = None
     employee_id: Optional[str] = None
+    is_employee: Optional[bool] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
     notes: Optional[str] = None
     is_registered: Optional[bool] = None
 

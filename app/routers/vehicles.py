@@ -47,6 +47,7 @@ def update_vehicle(plate: str, body: VehicleUpdate, db: Session = Depends(get_db
             phone=body.phone,
             email=body.email,
             notes=body.notes,
+            is_registered=body.is_registered,
         )
         db.commit()
         db.refresh(vehicle)
@@ -70,5 +71,5 @@ def lookup_vehicle(plate: str, db: Session = Depends(get_db)):
     vehicle = vehicle_service.lookup_vehicle(db, plate)
     if not vehicle:
         return {"plate": plate, "status": "unknown", "registered": False}
-    return {"plate": plate, "status": "known", "registered": True,
+    return {"plate": plate, "status": "known", "registered": vehicle.is_registered,
             "owner": vehicle.owner_name, "type": vehicle.vehicle_type}

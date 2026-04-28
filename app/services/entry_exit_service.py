@@ -82,6 +82,8 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
     # UC4: Resolve vehicle identity via vehicle_service
     logger.debug(f"[UC4] Looking up vehicle for plate {plate}...")
     vehicle = vehicle_service.lookup_vehicle(db, plate)
+    if gate == "entry" and not vehicle:
+        vehicle = vehicle_service.ensure_unregistered_vehicle(db, plate)
     vehicle_type = vehicle.vehicle_type if vehicle else "unknown"
     owner_name = vehicle.owner_name if vehicle else "Unknown"
 
@@ -152,7 +154,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         )
 
     # UC4: Clear logic for single notification/alert
-    if vehicle:
+    if vehicle and vehicle.is_registered:
         # Registered vehicle — send single 'info' notification via unified broadcast
         from app.services.alert_service import broadcast_event
         await broadcast_event(
@@ -168,7 +170,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         )
     else:
         # Unregistered vehicle — send single 'critical' alert
-        logger.info(f"[UC4] Triggering alert for unknown vehicle: {plate}")
+        logger.info(f"[UC4] Triggering alert for unknown/unregistered vehicle: {plate}")
         await create_alert(
             db=db,
             alert_type="unknown_vehicle",
