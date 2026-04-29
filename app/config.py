@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     BACKEND_IP: str = "127.0.0.1"  # override via .env per deployment
     BACKEND_PORT: int = 8080
 
+    # Externally-reachable origin used to build full snapshot URLs.
+    # Snapshots are written into detection_images/ and served by the
+    # /snapshots StaticFiles mount; consumers store the full URL form
+    # (e.g. http://pms-ai:8080/snapshots/foo.jpg) directly in the DB.
+    PUBLIC_BASE_URL: str = "http://localhost:8080"
+
     # ── Security ──────────────────────────────────────────────────────────
     API_KEY: Optional[str] = None   # Set in .env to enable auth on API endpoints
 
