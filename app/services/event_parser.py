@@ -223,7 +223,9 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
     # Prefer the <ipAddress> from XML body over the HTTP request's client IP.
     # This allows manual testing from localhost while still correctly identifying the camera.
     xml_ip = find_text("ipAddress") or camera_ip
-    resolved_camera_id = settings.CAMERA_IP_MAP.get(xml_ip) \
+    device_serial = find_text("deviceSerial") or "unknown"
+    resolved_camera_id = settings.CAMERA_SERIAL_MAP.get(device_serial) \
+        or settings.CAMERA_IP_MAP.get(xml_ip) \
         or settings.CAMERA_IP_MAP.get(camera_ip) \
         or f"UNKNOWN-{camera_ip}"
 
@@ -245,7 +247,7 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
          pass  # plate search continues below in the ANPR extraction block
 
     event_type = find_text("eventType") or "unknown"
-    camera_id = settings.CAMERA_IP_MAP.get(camera_ip, f"UNKNOWN-{camera_ip}")
+    camera_id = resolved_camera_id
 
 
 
@@ -389,8 +391,10 @@ def _parse_json_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
     # Prefer the ipAddress declared inside the JSON body over the HTTP source IP.
     # This handles NAT/proxy scenarios where the HTTP client IP differs from the camera IP.
     json_ip = data.get("ipAddress") or camera_ip
+    device_serial = data.get("deviceSerial", data.get("deviceID", "unknown"))
     camera_id = (
-        settings.CAMERA_IP_MAP.get(json_ip)
+        settings.CAMERA_SERIAL_MAP.get(device_serial)
+        or settings.CAMERA_IP_MAP.get(json_ip)
         or settings.CAMERA_IP_MAP.get(camera_ip)
         or f"UNKNOWN-{camera_ip}"
     )
