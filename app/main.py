@@ -4,16 +4,20 @@ FastAPI application entry point.
 Includes security middleware, global error handlers, and all routers.
 """
 
+from pathlib import Path
+
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from app.routers import (
     events, occupancy,
     health, alerts, vehicles, entry_exit, parking_stats, parking_sessions_internal,
 )
-from app.database import create_tables 
+from app.database import create_tables
 from app.config import settings
+from app.services.snapshot_service import SNAPSHOT_DIR
 from app.utils.logger import get_logger
 import time
 
@@ -57,6 +61,17 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 
 if settings.API_KEY:
     app.add_middleware(APIKeyMiddleware)
+
+# ── Static snapshot serving ──────────────────────────────────────────────
+# Expose detection_images/ over HTTP so consumers (frontend / API gateway)
+# can fetch the JPEGs that get referenced by snapshot_path columns.
+_snapshots_dir = Path(SNAPSHOT_DIR)
+_snapshots_dir.mkdir(exist_ok=True)
+app.mount(
+    "/snapshots",
+    StaticFiles(directory=_snapshots_dir, check_dir=False),
+    name="snapshots",
+)
 
 # ── Request Timing & Logging Middleware ──────────────────────────────────────
 @app.middleware("http")

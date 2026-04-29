@@ -32,17 +32,14 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
         "AccessControllerEvent", "vehicleMatchResult", "ANPR",
     )
     if event.event_type in SNAPSHOT_EVENT_TYPES:
-        # Preserve the original local file path (always local now)
-        if event.snapshot_path:
-            event.local_snapshot_path = event.snapshot_path
-
-        # If no multipart image was attached, try fetching a fresh snapshot from the camera
+        # event_parser.parse_camera_event already sets snapshot_path (URL) and
+        # local_snapshot_path on multipart events. If neither is set, fall
+        # back to fetching a fresh JPEG from the camera here.
         if not event.snapshot_path:
             try:
                 fresh = await fetch_snapshot(event.camera_id, event.event_type)
                 if fresh:
-                    event.snapshot_path = fresh
-                    event.local_snapshot_path = fresh
+                    event.snapshot_path, event.local_snapshot_path = fresh
             except Exception as e:
                 logger.warning(f"Snapshot fetch failed for {event.camera_id}: {e}")
 

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, UTC
 from typing import Optional, List, Dict
 from app.config import settings
+from app.services.snapshot_service import to_public_snapshot_url
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -164,9 +165,14 @@ def parse_camera_event(raw_body: bytes, camera_ip: str, content_type: str = "") 
                 snapshot_path = correct_filename
             except Exception as e:
                 logger.warning(f"Could not rename multipart image from {snapshot_path}: {e}")
-        
-        event.snapshot_path = snapshot_path
-    
+
+        # snapshot_path on the event is the publicly-fetchable URL — that's
+        # what gets persisted into entry_exit_log / parking_sessions / alerts.
+        # local_snapshot_path keeps the on-disk filename so downstream code
+        # (e.g. PMS tracking API forwarding) can read the file directly.
+        event.local_snapshot_path = snapshot_path
+        event.snapshot_path = to_public_snapshot_url(snapshot_path)
+
     return event
 
 
