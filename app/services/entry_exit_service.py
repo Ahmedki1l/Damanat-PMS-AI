@@ -85,9 +85,9 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
 
     # UC4: Resolve vehicle identity via vehicle_service
     logger.debug(f"[UC4] Looking up vehicle for plate {plate}...")
-    vehicle = vehicle_service.lookup_vehicle(db, plate)
-    if gate == "entry" and not vehicle:
-        vehicle = vehicle_service.ensure_unregistered_vehicle(db, plate)
+    # FIX: Always ensure a vehicle record exists (registered or placeholder)
+    # so that log entries have a valid vehicle_id, even on exit.
+    vehicle = vehicle_service.ensure_unregistered_vehicle(db, plate)
     vehicle_type = vehicle.vehicle_type if vehicle else "unknown"
     owner_name = vehicle.owner_name if vehicle else "Unknown"
 
