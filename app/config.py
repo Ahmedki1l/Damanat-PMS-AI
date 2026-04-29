@@ -200,9 +200,14 @@ class Settings(BaseSettings):
     CAM_EXIT_PASSWORD: str = ""
     CAM_EXIT_NAME: str = "EXIT-GATE"
 
+    # Serial Number mapping (for environments where IP is masked/proxied)
+    CAM_ENTRY_SERIAL: str = ""
+    CAM_EXIT_SERIAL: str = ""
+
     # ── Derived camera dicts (built from env vars above) ──────────────────
     CAMERAS: dict = {}
     CAMERA_IP_MAP: dict = {}
+    CAMERA_SERIAL_MAP: dict = {}
 
     @model_validator(mode="after")
     def _build_camera_dicts(self) -> "Settings":
@@ -265,6 +270,14 @@ class Settings(BaseSettings):
 
         self.CAMERAS = cameras
         self.CAMERA_IP_MAP = ip_map
+
+        # Build Serial Number map
+        serial_map = {}
+        if self.CAM_ENTRY_SERIAL:
+            serial_map[self.CAM_ENTRY_SERIAL] = "CAM-ENTRY"
+        if self.CAM_EXIT_SERIAL:
+            serial_map[self.CAM_EXIT_SERIAL] = "CAM-EXIT"
+        self.CAMERA_SERIAL_MAP = serial_map
         return self
 
     # ── Zone configuration ───────────────────────────────────────────────

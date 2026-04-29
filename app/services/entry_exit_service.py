@@ -26,6 +26,10 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
     camera_config = settings.CAMERAS.get(event.camera_id, {})
     gate = camera_config.get("gate", event.gate)
 
+    if not gate:
+        logger.warning(f"[Phase2] Dropped ANPR event from {event.camera_id} - no gate assigned (IP or Serial mapping missing)")
+        return
+
     if not plate:
         logger.debug(f"[Phase2] ANPR event with no plate from {event.camera_id} - skipped")
         return
