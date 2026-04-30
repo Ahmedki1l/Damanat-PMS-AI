@@ -157,9 +157,11 @@ def parse_camera_event(raw_body: bytes, camera_ip: str, content_type: str = "") 
         event = _parse_xml_event(raw_body, camera_ip)
 
     if snapshot_path:
-        # Rename "multipart" placeholder name to use actual event type for better file organization
+        # Rename the placeholder image file to use actual event type and resolved camera_id
         if "multipart" in snapshot_path:
-            correct_filename = snapshot_path.replace("multipart", event.event_type)
+            # We reconstruct the filename because temp_camera_id might have been UNKNOWN if IP was masked
+            timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
+            correct_filename = os.path.join(SNAPSHOT_DIR, f"snapshot_{event.event_type}_{event.camera_id}_{timestamp}.jpg")
             try:
                 os.rename(snapshot_path, correct_filename)
                 snapshot_path = correct_filename
