@@ -68,7 +68,7 @@ if settings.API_KEY:
 _snapshots_dir = Path(SNAPSHOT_DIR)
 _snapshots_dir.mkdir(exist_ok=True)
 app.mount(
-    "/pms-api/snapshots",
+    "/pms-ai/snapshots",
     StaticFiles(directory=_snapshots_dir, check_dir=False),
     name="snapshots",
 )

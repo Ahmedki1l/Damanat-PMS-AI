@@ -36,7 +36,7 @@ def to_public_snapshot_url(local_path: str | None) -> str | None:
         return None
     filename = os.path.basename(local_path)
     base = (settings.PUBLIC_BASE_URL or "").rstrip("/")
-    return f"{base}/pms-api/snapshots/{filename}" if base else f"/pms-api/snapshots/{filename}"
+    return f"{base}/pms-ai/snapshots/{filename}" if base else f"/pms-ai/snapshots/{filename}"
 
 
 async def fetch_snapshot(camera_id: str, event_type: str) -> tuple[str, str] | None:
