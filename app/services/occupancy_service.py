@@ -41,7 +41,7 @@ async def push_db_update(db: Session, zone_id: str, delta: int):
     db.flush()
 
 
-async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Session):
+async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Session, snapshot_path: str = None):
     """
     Update a zone's occupancy count using the atomic push function.
     """
@@ -95,6 +95,7 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
             zone_name=zone.zone_name,
             event_type="occupancy_update",
             description=f"Zone {zone_id} is nearly full: {pct}% ({zone.current_count}/{zone.max_capacity})",
+            snapshot_path=snapshot_path,
         )
 
 
@@ -211,17 +212,17 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
     savepoint = db.begin_nested()
     try:
         if cam_id == "CAM-03":
-            await _update_zone_count(settings.GARAGE_TOTAL_ZONE, cam_id,  1 * multiplier, db)
-            await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id,  1 * multiplier, db)
+            await _update_zone_count(settings.GARAGE_TOTAL_ZONE, cam_id,  1 * multiplier, db, event.snapshot_path)
+            await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id,  1 * multiplier, db, event.snapshot_path)
         elif cam_id == "CAM-08":
-            await _update_zone_count(settings.GARAGE_TOTAL_ZONE, cam_id, -1 * multiplier, db)
-            await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id, -1 * multiplier, db)
+            await _update_zone_count(settings.GARAGE_TOTAL_ZONE, cam_id, -1 * multiplier, db, event.snapshot_path)
+            await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id, -1 * multiplier, db, event.snapshot_path)
         elif cam_id == "CAM-09":
-            await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id, -1 * multiplier, db)
-            await _update_zone_count(settings.B2_PARKING_ZONE,   cam_id,  1 * multiplier, db)
+            await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id, -1 * multiplier, db, event.snapshot_path)
+            await _update_zone_count(settings.B2_PARKING_ZONE,   cam_id,  1 * multiplier, db, event.snapshot_path)
         elif cam_id == "CAM-10":
-            await _update_zone_count(settings.B2_PARKING_ZONE,   cam_id, -1 * multiplier, db)
-            await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id,  1 * multiplier, db)
+            await _update_zone_count(settings.B2_PARKING_ZONE,   cam_id, -1 * multiplier, db, event.snapshot_path)
+            await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id,  1 * multiplier, db, event.snapshot_path)
 
         savepoint.commit()
     except Exception as e:
