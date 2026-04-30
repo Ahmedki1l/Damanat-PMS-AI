@@ -26,5 +26,10 @@ class Vehicle(Base):
     registered_at = Column(DateTime)
     notes = Column(Text)
 
+    # Set by parking_session_service.bind_slot when VA reports the vehicle
+    # parked in a slot, cleared by unbind_slot when it leaves. Matches the
+    # varchar slot_id used in parking_sessions / parking_slots / slot_status.
+    current_slot_id = Column(String(50), index=True)
+
     def __repr__(self):
         return f"<Vehicle {self.plate_number} owner={self.owner_name} type={self.vehicle_type}>"
