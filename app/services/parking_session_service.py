@@ -22,6 +22,22 @@ def _naive(dt: Optional[datetime]) -> datetime:
     return value
 
 
+def _resolve_vehicle(db: Session, session: ParkingSession) -> Optional[Vehicle]:
+    """Find the Vehicle row referenced by a parking session.
+
+    Prefers `session.vehicle_id` when set; falls back to plate-matching
+    for legacy sessions written before the FK was always populated.
+    Returns None if no matching vehicle exists.
+    """
+    if session.vehicle_id:
+        v = db.query(Vehicle).filter(Vehicle.id == session.vehicle_id).first()
+        if v:
+            return v
+    if session.plate_number:
+        return db.query(Vehicle).filter(Vehicle.plate_number == session.plate_number).first()
+    return None
+
+
 def get_latest_open_session(db: Session, plate_number: str) -> Optional[ParkingSession]:
     return (
         db.query(ParkingSession)
@@ -116,6 +132,14 @@ def bind_slot(
     if snapshot_path:
         session.slot_snapshot_path = snapshot_path
     session.updated_at = datetime.now(UTC)
+
+    # Mirror the slot binding onto the vehicle row so callers that only
+    # have the Vehicle (not the open session) can still answer
+    # "where is this vehicle right now?".
+    vehicle = _resolve_vehicle(db, session)
+    if vehicle is not None:
+        vehicle.current_slot_id = slot_id
+
     db.flush()
     return session
 
@@ -146,6 +170,14 @@ def unbind_slot(
     if snapshot_path:
         session.slot_snapshot_path = snapshot_path
     session.updated_at = datetime.now(UTC)
+
+    # Clear the slot binding on the vehicle, but only if it still points
+    # at the slot we're unbinding — otherwise we'd clobber a concurrent
+    # bind that already moved the vehicle to another slot.
+    vehicle = _resolve_vehicle(db, session)
+    if vehicle is not None and vehicle.current_slot_id == session.slot_id:
+        vehicle.current_slot_id = None
+
     db.flush()
     return session
 
