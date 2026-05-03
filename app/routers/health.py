@@ -44,20 +44,29 @@ def health_check(db: Session = Depends(get_db)):
         result["database"] = f"error: {str(e)}"
         result["status"] = "degraded"
 
-    # Ping each camera — log per-camera status but don't include in response
-    for cam_id, cam in settings.CAMERAS.items():
+    # Ping cameras in parallel to avoid linear timeouts (G-24)
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def check_cam(cam_id_info):
+        cam_id, cam = cam_id_info
         try:
             resp = requests.get(
                 f"http://{cam['ip']}/ISAPI/System/deviceInfo",
                 auth=HTTPDigestAuth(cam["user"], cam["password"]),
-                timeout=3,
+                timeout=2.0,
             )
-            cam_status = "ok" if resp.status_code == 200 else f"http_{resp.status_code}"
+            return cam_id, "ok" if resp.status_code == 200 else f"http_{resp.status_code}"
         except requests.exceptions.ConnectionError:
-            cam_status = "unreachable"
-            result["status"] = "degraded"
+            return cam_id, "unreachable"
         except Exception as e:
-            cam_status = f"error: {str(e)}"
+            return cam_id, f"error: {str(e)}"
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        camera_results = list(executor.map(check_cam, settings.CAMERAS.items()))
+
+    for cam_id, cam_status in camera_results:
+        if cam_status != "ok":
+            result["status"] = "degraded"
         logger.debug(f"[health] camera={cam_id} status={cam_status}")
 
     return result
