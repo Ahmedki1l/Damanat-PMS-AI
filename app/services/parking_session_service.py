@@ -2,12 +2,12 @@
 Service helpers for the parking_sessions read model.
 """
 
-from datetime import datetime, UTC
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.config import settings
+from app.config import settings, facility_now_naive, facility_tz
 from app.models.parking_session import ParkingSession
 from app.models.vehicle import Vehicle
 from app.utils.logger import get_logger
@@ -16,14 +16,15 @@ logger = get_logger(__name__)
 
 
 def _naive(dt: Optional[datetime]) -> datetime:
-    """Normalize a (possibly tz-aware) datetime to naive UTC for DB columns.
-    Convert tz-aware values to UTC before stripping tzinfo — `replace(tzinfo=None)`
-    on its own silently drops the offset and would store facility-local pretending
-    to be UTC. See `entry_exit_service.py:41` for the same fix and the historical
-    data migration script `sql/migrate_facility_local_to_utc.sql`."""
-    value = dt or datetime.now(UTC)
+    """Normalize a (possibly tz-aware) datetime to NAIVE FACILITY-LOCAL for DB
+    columns. Convert tz-aware values to facility tz before stripping tzinfo
+    so the stored value matches the operator's wall clock. The DB convention
+    shifted 2026-05-07 from naive UTC to naive facility-local — every writer
+    must agree, otherwise sessions and entry-exit rows drift apart by the
+    facility offset."""
+    value = dt or facility_now_naive()
     if value.tzinfo is not None:
-        return value.astimezone(UTC).replace(tzinfo=None)
+        return value.astimezone(facility_tz()).replace(tzinfo=None)
     return value
 
 
@@ -65,12 +66,12 @@ def open_session(
 ) -> ParkingSession:
     existing = get_latest_open_session(db, plate_number)
     if existing:
-        existing.updated_at = datetime.now(UTC)
+        existing.updated_at = facility_now_naive()
         if snapshot_path and not existing.entry_snapshot_path:
             existing.entry_snapshot_path = snapshot_path
         return existing
 
-    now = datetime.now(UTC)
+    now = facility_now_naive()
     session = ParkingSession(
         plate_number=plate_number,
         vehicle_id=vehicle.id if vehicle else None,
@@ -106,7 +107,7 @@ def close_session(
     session.exit_snapshot_path = snapshot_path
     session.duration_seconds = max(0, int((exit_time - session.entry_time).total_seconds()))
     session.status = "closed"
-    session.updated_at = datetime.now(UTC)
+    session.updated_at = facility_now_naive()
     # If the car exited while still bound to a slot (no VA unbind before the
     # ANPR exit event), close_session is the last writer that knows when the
     # slot was vacated. Backfill slot_left_at so historical queries can rely
@@ -148,7 +149,7 @@ def bind_slot(
     session.zone_id = zone_id
     session.zone_name = zone_name or zone_meta.get("zone_name") or zone_id
     session.floor = floor or zone_meta.get("floor")
-    session.parked_at = _naive(parked_at) if parked_at else datetime.now(UTC)
+    session.parked_at = _naive(parked_at) if parked_at else facility_now_naive()
     session.slot_camera_id = camera_id
     if snapshot_path:
         session.slot_snapshot_path = snapshot_path
@@ -157,7 +158,7 @@ def bind_slot(
     # Without this, a B1->B2 move leaves the old unbind timestamp in place
     # and downstream consumers think the car has already left B16.
     session.slot_left_at = None
-    session.updated_at = datetime.now(UTC)
+    session.updated_at = facility_now_naive()
 
     # Mirror the slot binding onto the vehicle row so callers that only
     # have the Vehicle (not the open session) can still answer
@@ -195,11 +196,11 @@ def unbind_slot(
             f"Open parking session for plate {plate_number} is bound to slot id {session.slot_id}, not {slot_id}"
         )
 
-    session.slot_left_at = _naive(left_at) if left_at else datetime.now(UTC)
+    session.slot_left_at = _naive(left_at) if left_at else facility_now_naive()
     session.slot_camera_id = camera_id
     if snapshot_path:
         session.slot_snapshot_path = snapshot_path
-    session.updated_at = datetime.now(UTC)
+    session.updated_at = facility_now_naive()
 
     # Clear the slot binding on the vehicle, but only if it still points
     # at the slot we're unbinding — otherwise we'd clobber a concurrent

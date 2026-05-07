@@ -1,7 +1,7 @@
 from datetime import datetime, UTC
 from sqlalchemy.orm import Session
 from app.models.camera_feed import CameraFeed
-from app.config import settings
+from app.config import settings, facility_now_naive
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -61,7 +61,7 @@ def add_event_to_feed(db: Session, event):
             detection_source=detection_source,
             plate_number=getattr(event, "plate_number", None),
             snapshot_path=event.snapshot_path,
-            timestamp=event.trigger_time or datetime.now(UTC)
+            timestamp=event.trigger_time or facility_now_naive()
         )
 
         db.add(feed_entry)

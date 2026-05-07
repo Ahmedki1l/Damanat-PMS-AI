@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from app.models.zone_occupancy import ZoneOccupancy
 from app.services.event_parser import ParsedCameraEvent
 from app.services.alert_service import create_alert
-from app.config import settings
+from app.config import settings, facility_now_naive
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -57,7 +57,7 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
             camera_id=camera_id,
             current_count=0,
             max_capacity=zone_meta.get("max_capacity") or settings.DEFAULT_ZONE_CAPACITY,
-            last_updated=datetime.now(UTC),
+            last_updated=facility_now_naive(),
         )
         db.add(zone)
         db.flush()
@@ -80,7 +80,7 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
     # FIX #3: removed non-atomic ORM clamp (if zone.current_count < 0: zone.current_count = 0)
     # The atomic func.max() in push_db_update now handles this.
 
-    zone.last_updated = datetime.now(UTC)
+    zone.last_updated = facility_now_naive()
     occupancy_ratio = (zone.current_count / zone.max_capacity) if zone.max_capacity > 0 else 0
     pct = int(occupancy_ratio * 100)
 
@@ -104,7 +104,7 @@ def _cache_cleanup():
     FIX #4 (cache memory leak): evict entries older than CACHE_TTL_SECONDS.
     Called on every new cache insert to bound memory growth over long uptimes.
     """
-    now = datetime.now(UTC).timestamp()
+    now = facility_now_naive().timestamp()
     expired = [k for k, v in _processed_events_cache.items() if now - v >= CACHE_TTL_SECONDS]
     for k in expired:
         del _processed_events_cache[k]
@@ -117,7 +117,7 @@ def record_event_in_cache(cache_key: tuple):
     If the transaction rolls back, the cache stays clean and camera retries are accepted.
     """
     _cache_cleanup()  # FIX #4: prune stale entries on every insert
-    _processed_events_cache[cache_key] = datetime.now(UTC).timestamp()
+    _processed_events_cache[cache_key] = facility_now_naive().timestamp()
 
 
 async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
@@ -143,7 +143,7 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
     # 3. Deduplication: Ignore identical events within CACHE_TTL_SECONDS
     # FIX #5: uses EVENT_STREAM_SUPPRESS_SECONDS (30s) instead of hardcoded 1s
     cache_key = (event.camera_id, event.event_type, event.region_id or event.crossing_direction)
-    now = datetime.now(UTC).timestamp()
+    now = facility_now_naive().timestamp()
     if cache_key in _processed_events_cache:
         last_time = _processed_events_cache[cache_key]
         if now - last_time < CACHE_TTL_SECONDS:

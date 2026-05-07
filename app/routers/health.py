@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.database import get_db
-from app.config import settings
+from app.config import settings, facility_now_naive
 from app.schemas.responses import HealthResponse
 from app.utils.logger import get_logger
 from datetime import datetime, UTC
@@ -30,7 +30,7 @@ def health_check(db: Session = Depends(get_db)):
 
     result = {
         "status": "ok",
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": facility_now_naive().isoformat(),
         "backend": "ok",
         "database": "unknown",
         "cameras": list(settings.CAMERAS.keys()),

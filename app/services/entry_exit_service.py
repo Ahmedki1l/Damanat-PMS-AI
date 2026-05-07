@@ -11,14 +11,14 @@ behaviour identical to exit-camera behaviour: both rely on the inline image,
 neither hits the ISAPI snapshot endpoint.
 """
 
-from datetime import datetime, UTC, timedelta
+from datetime import timedelta
 from sqlalchemy.orm import Session
 from app.models.entry_exit_log import EntryExitLog
 from app.services import parking_session_service
 from app.services import vehicle_service
 from app.services.event_parser import ParsedCameraEvent
 from app.services.alert_service import create_alert
-from app.config import settings
+from app.config import settings, facility_now_naive, facility_tz
 from app.utils.logger import get_logger
 from app.utils import core_backend_client
 
@@ -42,16 +42,16 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         logger.debug(f"[Phase2] ANPR event with no plate from {event.camera_id} - skipped")
         return
 
-    # Convert to UTC then strip tzinfo: camera sends tz-aware timestamps (e.g.
-    # `2026-03-11T08:58+03:00`), but DB columns are naive UTC. The earlier code
-    # called `.replace(tzinfo=None)` directly, which silently dropped the offset
-    # and stored facility-local datetimes pretending to be UTC. Fix: convert
-    # first, then strip. Historical rows pre-fix are 3h ahead of true UTC
-    # (assuming Saudi +03:00 cameras) — see sql/migrate_facility_local_to_utc.sql
-    # for the one-time backfill that aligns the old data.
-    event_time = event.trigger_time or datetime.now(UTC)
-    # if event_time.tzinfo is not None:
-    #     event_time = event_time.astimezone(UTC).replace(tzinfo=None)
+    # Camera sends tz-aware timestamps like `2026-05-07T12:14:51+03:00`. The
+    # DB convention (since 2026-05-07) is NAIVE FACILITY-LOCAL — the wall
+    # clock the operator sees, NOT UTC. Convert to facility tz first, then
+    # strip tzinfo, so 12:14:51+03:00 stays 12:14:51 in the column. Earlier
+    # code converted to UTC and stored 09:14:51, which made the dashboard
+    # display 3h behind. astimezone(facility_tz) is idempotent if the value
+    # is already in facility tz.
+    event_time = event.trigger_time or facility_now_naive()
+    if event_time.tzinfo is not None:
+        event_time = event_time.astimezone(facility_tz()).replace(tzinfo=None)
 
     # Deduplication: check for recent events
     logger.debug(f"[UC1] Checking dedup for plate {plate}...")
@@ -129,7 +129,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         camera_id=event.camera_id,
         event_time=event_time,
         snapshot_path=event.snapshot_path,
-        created_at=datetime.now(UTC),
+        created_at=facility_now_naive(),
     )
 
     if gate == "entry":
@@ -156,12 +156,13 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         )
 
         if matching_entry:
-            # event_time is already naive (normalized above); matching_entry may
-            # still be tz-aware if stored before the fix, so strip it defensively.
+            # event_time is already naive facility-local (normalized above);
+            # matching_entry may still be tz-aware if stored before the fix,
+            # so strip it defensively. Convert to facility tz first to keep
+            # the wall-clock value, matching the new DB convention.
             t2 = matching_entry.event_time
             if t2.tzinfo is not None:
-                # Convert to UTC before stripping — see comment at line 41.
-                t2 = t2.astimezone(UTC).replace(tzinfo=None)
+                t2 = t2.astimezone(facility_tz()).replace(tzinfo=None)
 
             duration_seconds = int((event_time - t2).total_seconds())
             log_entry.parking_duration = max(0, duration_seconds)
