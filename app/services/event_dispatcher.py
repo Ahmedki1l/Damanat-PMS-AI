@@ -27,9 +27,19 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
     # 1. Use multipart image if the camera attached one to the event (already saved locally)
     # 2. If no image → try fetching a fresh snapshot from the camera (saves locally)
     # 3. If camera is unreachable → leave snapshot_path as None
+    #
+    # `vehicleMatchResult` is intentionally excluded: it arrives WITHOUT an
+    # inline multipart image, which forces the ISAPI snapshot fetch path —
+    # the path that 401s on entry cameras whose ISAPI ACL differs from the
+    # exit camera's. Hikvision always fires a follow-on `ANPR` event ~1-5s
+    # later that DOES carry the multipart JPEG, and that's what we use.
+    # Treating both event types as canonical led to duplicate snapshot
+    # attempts and the row being created from the imageless event first
+    # (then dedup-suppressing the imageful event). See engine_dispatcher
+    # commit history for the customer-prod RDJ-9640 case.
     SNAPSHOT_EVENT_TYPES = (
         "fielddetection", "linedetection", "regionEntrance",
-        "AccessControllerEvent", "vehicleMatchResult", "ANPR",
+        "AccessControllerEvent", "ANPR",
     )
     if event.event_type in SNAPSHOT_EVENT_TYPES:
         # event_parser.parse_camera_event already sets snapshot_path (URL) and
@@ -49,6 +59,17 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
         # VMD = Video Motion Detection: basic motion, not a Smart Event.
         # Ignore it completely per user request — fires constantly and has no zone info.
         if event.event_type == "VMD":
+            return
+
+        # vehicleMatchResult: the imageless precursor to ANPR. We deliberately
+        # don't process it here — see SNAPSHOT_EVENT_TYPES comment above. Just
+        # log at DEBUG so we can confirm the camera fired it but we ignored it.
+        if event.event_type == "vehicleMatchResult":
+            logger.debug(
+                "[dispatch] Skipping vehicleMatchResult from %s plate=%s — "
+                "follow-on ANPR event will carry the multipart image",
+                event.camera_id, event.plate_number,
+            )
             return
 
         is_gate = settings.CAMERAS.get(event.camera_id, {}).get("gate") in ("entry", "exit")
@@ -81,7 +102,9 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
 
         # ── CAMERA FEED ──────────────────────────────────────────────────────
         # Log all entry/exit related smart events to the CameraFeed table.
-        FEED_EVENT_TYPES = ("ANPR", "vehicleMatchResult", "AccessControllerEvent", "linedetection")
+        # `vehicleMatchResult` excluded — ANPR follows ~1-5s later with the
+        # same plate + an inline image, so it's the canonical row to log.
+        FEED_EVENT_TYPES = ("ANPR", "AccessControllerEvent", "linedetection")
         if event.event_type in FEED_EVENT_TYPES:
             add_event_to_feed(db, event)
 
@@ -102,8 +125,12 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
              logger.debug(f"[UC3] Gate camera {event.camera_id} sent non-occupancy event: {event.event_type}")
 
         # ── PHASE 2 ───────────────────────────────────────────────────────────
-        # UC1 + UC2 + UC4: ANPR gate events (JSON=AccessControllerEvent, XML=ANPR/vehicleMatchResult)
-        if event.event_type in ("ANPR", "vehicleMatchResult", "AccessControllerEvent") and event.plate_number:
+        # UC1 + UC2 + UC4: ANPR gate events (JSON=AccessControllerEvent, XML=ANPR).
+        # `vehicleMatchResult` is suppressed at the top of this function — only
+        # ANPR (with multipart JPEG) drives entry_exit_log creation. This makes
+        # the entry-camera flow identical to the exit-camera flow: both rely on
+        # the inline multipart image, neither needs the ISAPI snapshot fetch.
+        if event.event_type in ("ANPR", "AccessControllerEvent") and event.plate_number:
             await handle_anpr_event(event, db)
 
         # ── MAINTENANCE ───────────────────────────────────────────────────────
