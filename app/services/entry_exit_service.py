@@ -1,6 +1,14 @@
 """
 Phase 2: UC1 (Entry/Exit Counting), UC2 (Parking Time), and UC4 (Vehicle ID).
-Handles AccessControllerEvent / vehicleMatchResult / ANPR from ANPR cameras.
+Handles AccessControllerEvent / ANPR from ANPR cameras.
+
+Note: `vehicleMatchResult` is intentionally NOT handled here. The dispatcher
+suppresses it (see event_dispatcher.py) because Hikvision fires it without
+an inline multipart image, which forces an ISAPI snapshot pull that some
+camera ACL configs reject. The follow-on `ANPR` event (~1-5s later) carries
+the multipart JPEG and drives row creation here. This makes entry-camera
+behaviour identical to exit-camera behaviour: both rely on the inline image,
+neither hits the ISAPI snapshot endpoint.
 """
 
 from datetime import datetime, UTC, timedelta
