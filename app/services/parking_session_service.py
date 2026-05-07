@@ -16,9 +16,14 @@ logger = get_logger(__name__)
 
 
 def _naive(dt: Optional[datetime]) -> datetime:
+    """Normalize a (possibly tz-aware) datetime to naive UTC for DB columns.
+    Convert tz-aware values to UTC before stripping tzinfo — `replace(tzinfo=None)`
+    on its own silently drops the offset and would store facility-local pretending
+    to be UTC. See `entry_exit_service.py:41` for the same fix and the historical
+    data migration script `sql/migrate_facility_local_to_utc.sql`."""
     value = dt or datetime.now(UTC)
     if value.tzinfo is not None:
-        return value.replace(tzinfo=None)
+        return value.astimezone(UTC).replace(tzinfo=None)
     return value
 
 
@@ -102,6 +107,22 @@ def close_session(
     session.duration_seconds = max(0, int((exit_time - session.entry_time).total_seconds()))
     session.status = "closed"
     session.updated_at = datetime.now(UTC)
+    # If the car exited while still bound to a slot (no VA unbind before the
+    # ANPR exit event), close_session is the last writer that knows when the
+    # slot was vacated. Backfill slot_left_at so historical queries can rely
+    # on `slot_left_at IS NOT NULL` for closed sessions.
+    if session.slot_id is not None and session.slot_left_at is None:
+        session.slot_left_at = exit_time
+
+    # The car has left the garage entirely — clear all "where is it now"
+    # mirrors on the vehicle row. Without this, the vehicles row keeps
+    # pointing at the last slot/floor indefinitely.
+    vehicle = _resolve_vehicle(db, session)
+    if vehicle is not None:
+        vehicle.current_slot_id = None
+        vehicle.floor = None
+        vehicle.floor_id = None
+
     return session
 
 
@@ -131,14 +152,23 @@ def bind_slot(
     session.slot_camera_id = camera_id
     if snapshot_path:
         session.slot_snapshot_path = snapshot_path
+    # Clear slot_left_at on (re-)bind so the Gateway can rely on
+    # `slot_left_at IS NOT NULL` meaning "currently between slots".
+    # Without this, a B1->B2 move leaves the old unbind timestamp in place
+    # and downstream consumers think the car has already left B16.
+    session.slot_left_at = None
     session.updated_at = datetime.now(UTC)
 
     # Mirror the slot binding onto the vehicle row so callers that only
     # have the Vehicle (not the open session) can still answer
-    # "where is this vehicle right now?".
+    # "where is this vehicle right now?". Write floor too — VA also writes
+    # it on every track confirmation, but a fresh bind is the latest
+    # signal so it should win.
     vehicle = _resolve_vehicle(db, session)
     if vehicle is not None:
         vehicle.current_slot_id = slot_id
+        if session.floor:
+            vehicle.floor = session.floor
 
     db.flush()
     return session

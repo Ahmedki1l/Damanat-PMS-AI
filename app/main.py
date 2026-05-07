@@ -3,6 +3,7 @@
 FastAPI application entry point.
 Includes security middleware, global error handlers, and all routers.
 """
+# (no-op edit: 2026-05-05 to trigger uvicorn --reload — rev 3 for close_session vehicle clear)
 
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
@@ -118,6 +119,10 @@ async def startup():
 
 
     logger.info(f"📡 Cameras configured: {list(settings.CAMERAS.keys())}")
+    logger.info(
+        f"🕐 Facility TZ offset: UTC+{settings.FACILITY_TIMEZONE_OFFSET_HOURS} "
+        "(env FACILITY_TIMEZONE_OFFSET_HOURS). Gateway must run with the same value."
+    )
     logger.info(f"🌐 Listening on http://{settings.BACKEND_IP}:{settings.BACKEND_PORT}")
 
 @app.on_event("shutdown")
