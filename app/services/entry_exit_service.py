@@ -50,8 +50,8 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
     # (assuming Saudi +03:00 cameras) — see sql/migrate_facility_local_to_utc.sql
     # for the one-time backfill that aligns the old data.
     event_time = event.trigger_time or datetime.now(UTC)
-    if event_time.tzinfo is not None:
-        event_time = event_time.astimezone(UTC).replace(tzinfo=None)
+    # if event_time.tzinfo is not None:
+    #     event_time = event_time.astimezone(UTC).replace(tzinfo=None)
 
     # Deduplication: check for recent events
     logger.debug(f"[UC1] Checking dedup for plate {plate}...")
