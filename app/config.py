@@ -307,6 +307,24 @@ class Settings(BaseSettings):
     USE_EXIT_DIRECTION_VALIDATION: bool = True
     USE_EXIT_CONFIRM_WINDOW: bool = True
 
+    # ── Anti-bounce on entry events (UC1) ────────────────────────────────
+    # Suppress an entry-camera ANPR firing if the same plate had an exit
+    # within this many seconds — handles the case where the entry camera
+    # captures a car driving away from the exit gate. Default 30s
+    # (empirical minimum gap between physically passing one camera and
+    # then the other). Set to 0 to disable suppression entirely. Was
+    # 120s historically; reduced after customer-prod cycling traffic
+    # (taxis / delivery vans) lost legitimate re-entries — see
+    # entry_exit_service.py:73-103.
+    ENTRY_ANTIBOUNCE_SECONDS: int = 30
+
+    # ── Snapshot fetch auth fallback ─────────────────────────────────────
+    # Default empty = Digest only (Hikvision standard). Set to "basic" to
+    # try Basic auth as a second pass when Digest gets 401/403. Used to
+    # diagnose firmwares that reject Digest, without changing code.
+    # See snapshot_service.py:fetch_snapshot.
+    SNAPSHOT_AUTH_FALLBACK: str = ""
+
     # ── UC3: Occupancy Zone Config ───────────────────────────────────────
     GARAGE_TOTAL_ZONE: str = "GARAGE-TOTAL"
     B1_PARKING_ZONE: str = "B1-PARKING"

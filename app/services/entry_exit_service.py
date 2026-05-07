@@ -70,11 +70,20 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         except Exception as e:
             logger.warning(f"[UC1] PMS API forwarding failed for plate={plate}: {e}")
 
-    # Anti-bounce: if this is an entry event but the plate just exited within the
-    # last 2 minutes, the entry camera is likely capturing the car driving away
-    # from the exit gate — suppress the false re-entry.
-    if gate == "entry":
-        recent_exit_window = event_time - timedelta(seconds=120)
+    # Anti-bounce: if this is an entry event but the plate just exited within
+    # the last `entry_antibounce_seconds`, the entry camera is likely capturing
+    # the car driving away from the exit gate — suppress the false re-entry.
+    #
+    # Window is env-tunable so deployments with cycling traffic (taxis,
+    # delivery vans) don't lose legitimate re-entries. Default 30s — empirical
+    # minimum gap between physically passing the exit camera and physically
+    # passing the entry camera. Set 0 to disable entirely.
+    #
+    # The suppression log is INFO (not DEBUG) so ops can see it in default
+    # log levels and distinguish anti-bounce from any other silent failure.
+    antibounce_s = settings.ENTRY_ANTIBOUNCE_SECONDS
+    if gate == "entry" and antibounce_s > 0:
+        recent_exit_window = event_time - timedelta(seconds=antibounce_s)
         recent_exit = (
             db.query(EntryExitLog)
             .filter(
@@ -82,10 +91,16 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
                 EntryExitLog.gate == "exit",
                 EntryExitLog.event_time >= recent_exit_window,
             )
+            .order_by(EntryExitLog.event_time.desc())
             .first()
         )
         if recent_exit:
-            logger.debug(f"[UC1] Anti-bounce: suppressed false entry for plate={plate}")
+            gap_s = (event_time - recent_exit.event_time).total_seconds()
+            logger.info(
+                "[UC1] Anti-bounce: suppressed entry for plate=%s "
+                "(last exit %.1fs ago, window=%ds)",
+                plate, gap_s, antibounce_s,
+            )
             return
 
     # UC4: Resolve vehicle identity via vehicle_service
