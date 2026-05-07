@@ -34,11 +34,16 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         logger.debug(f"[Phase2] ANPR event with no plate from {event.camera_id} - skipped")
         return
 
-    # Strip timezone info: camera sends tz-aware timestamps but DB stores naive UTC.
-    # Mixing the two in subtraction raises "can't subtract offset-naive and offset-aware".
+    # Convert to UTC then strip tzinfo: camera sends tz-aware timestamps (e.g.
+    # `2026-03-11T08:58+03:00`), but DB columns are naive UTC. The earlier code
+    # called `.replace(tzinfo=None)` directly, which silently dropped the offset
+    # and stored facility-local datetimes pretending to be UTC. Fix: convert
+    # first, then strip. Historical rows pre-fix are 3h ahead of true UTC
+    # (assuming Saudi +03:00 cameras) — see sql/migrate_facility_local_to_utc.sql
+    # for the one-time backfill that aligns the old data.
     event_time = event.trigger_time or datetime.now(UTC)
     if event_time.tzinfo is not None:
-        event_time = event_time.replace(tzinfo=None)
+        event_time = event_time.astimezone(UTC).replace(tzinfo=None)
 
     # Deduplication: check for recent events
     logger.debug(f"[UC1] Checking dedup for plate {plate}...")
@@ -132,7 +137,8 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
             # still be tz-aware if stored before the fix, so strip it defensively.
             t2 = matching_entry.event_time
             if t2.tzinfo is not None:
-                t2 = t2.replace(tzinfo=None)
+                # Convert to UTC before stripping — see comment at line 41.
+                t2 = t2.astimezone(UTC).replace(tzinfo=None)
 
             duration_seconds = int((event_time - t2).total_seconds())
             log_entry.parking_duration = max(0, duration_seconds)

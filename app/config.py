@@ -292,6 +292,14 @@ class Settings(BaseSettings):
     # ── Thresholds ────────────────────────────────────────────────────────
     OCCUPANCY_ALERT_THRESHOLD: float = 0.90
     DEFAULT_ZONE_CAPACITY: int = 9
+
+    # ── Facility timezone (must match the Gateway) ───────────────────────
+    # Offset from UTC for "today"/"since-local-midnight" math. The Gateway
+    # carries the same env var; both services must use the same value or
+    # per-service "today" windows diverge. See Damanat PMS Cameras audit
+    # `HIGH_SEVERITY_FIX_PLAN.md` Fix #2 for the operational caveat about
+    # Hikvision camera clocks and when 0.0 is the right value.
+    FACILITY_TIMEZONE_OFFSET_HOURS: float = 3.0
     
     # False Exit Prevention (Bug #23)
     EXIT_CONFIRM_SECONDS: int = 5
@@ -340,4 +348,52 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+# ── Facility-local "today" helpers ─────────────────────────────────────────
+# Mirrors the Gateway's `app/config.py:facility_tz()` / `facility_today_utc()`
+# so PMS-AI's `/api/v1/entry-exit/count/today` and `/api/v1/stats/*` use the
+# same window the dashboard shows. Import via:
+#     from app.config import settings, facility_today_utc
+def facility_tz():
+    """The local timezone for "today"-style date math. Configured via
+    FACILITY_TIMEZONE_OFFSET_HOURS env var (default 3.0 = UTC+3, Saudi Arabia).
+    DB columns are stored as UTC-naive; this offset only affects boundary
+    calculations like "since local midnight today"."""
+    from datetime import timezone, timedelta
+    return timezone(timedelta(hours=settings.FACILITY_TIMEZONE_OFFSET_HOURS))
+
+
+def facility_today_utc():
+    """Naive UTC datetime of facility-local midnight today. Use this when
+    filtering DB columns stored as UTC-naive datetimes against "since local
+    midnight today" — pair with `facility_tomorrow_utc()` for an exclusive
+    upper bound."""
+    from datetime import datetime, timezone
+    now_local = datetime.now(facility_tz())
+    midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight_local.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def facility_tomorrow_utc():
+    """Naive UTC datetime of facility-local midnight at the END of today
+    (start of tomorrow). Pairs with facility_today_utc() for range filters."""
+    from datetime import timedelta
+    return facility_today_utc() + timedelta(days=1)
+
+
+def facility_day_range_utc(target_date_str: str | None = None):
+    """Return (start_utc, end_utc) range for a facility-local day. If
+    target_date_str is None, uses today. Pass a string like "2026-04-13" to
+    get any date's window. Both bounds are naive UTC datetimes suitable for
+    filtering DB columns stored as UTC-naive."""
+    from datetime import datetime, timezone, date as date_cls, timedelta
+    if target_date_str is None:
+        start = facility_today_utc()
+    else:
+        d = date_cls.fromisoformat(target_date_str)
+        start_local = datetime(d.year, d.month, d.day, tzinfo=facility_tz())
+        start = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+    end = start + timedelta(days=1)
+    return start, end
 

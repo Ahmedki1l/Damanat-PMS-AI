@@ -31,5 +31,12 @@ class Vehicle(Base):
     # varchar slot_id used in parking_sessions / parking_slots / slot_status.
     current_slot_id = Column(String(50), index=True)
 
+    # "Where is this car right now?" — written by VA on every track
+    # confirmation (across cameras, parked or moving) and kept in sync by
+    # bind_slot / close_session. Lets the Gateway answer presence without
+    # JOINing parking_sessions, which only has floor info while bound.
+    floor = Column(String(50))
+    floor_id = Column(Integer)
+
     def __repr__(self):
         return f"<Vehicle {self.plate_number} owner={self.owner_name} type={self.vehicle_type}>"
