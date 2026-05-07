@@ -376,42 +376,63 @@ settings = Settings()
 def facility_tz():
     """The local timezone for "today"-style date math. Configured via
     FACILITY_TIMEZONE_OFFSET_HOURS env var (default 3.0 = UTC+3, Saudi Arabia).
-    DB columns are stored as UTC-naive; this offset only affects boundary
-    calculations like "since local midnight today"."""
+
+    NEW (2026-05-07): the DB convention shifted from UTC-naive to
+    facility-local-naive — every writer now stores the wall-clock time
+    operators see, so the customer's dashboard shows the right values
+    without any UTC->local math on the frontend. This `facility_tz()`
+    helper is still useful for parsing tz-aware camera timestamps before
+    stripping the tz."""
     from datetime import timezone, timedelta
     return timezone(timedelta(hours=settings.FACILITY_TIMEZONE_OFFSET_HOURS))
 
 
+def facility_now_naive():
+    """Current facility-local datetime, NAIVE (no tzinfo). Use this for
+    every DB write where you used to call `datetime.now(UTC)` or
+    `datetime.utcnow()`. The DB convention is "naive datetime is the
+    facility wall clock"; calling utcnow() in a UTC-tzed container
+    silently subtracts the facility offset and lands rows 3h behind.
+
+    Equivalent (but explicit) to `datetime.now(facility_tz()).replace(tzinfo=None)`,
+    works regardless of the host OS / container TZ."""
+    from datetime import datetime
+    return datetime.now(facility_tz()).replace(tzinfo=None)
+
+
 def facility_today_utc():
-    """Naive UTC datetime of facility-local midnight today. Use this when
-    filtering DB columns stored as UTC-naive datetimes against "since local
-    midnight today" — pair with `facility_tomorrow_utc()` for an exclusive
-    upper bound."""
-    from datetime import datetime, timezone
+    """[name kept for back-compat; semantics shifted 2026-05-07]
+    Naive facility-local datetime of midnight today. Use this when
+    filtering DB columns stored as facility-local-naive datetimes
+    against "since local midnight today" — pair with
+    `facility_tomorrow_utc()` for an exclusive upper bound. Despite the
+    name, this no longer involves UTC."""
+    from datetime import datetime
     now_local = datetime.now(facility_tz())
     midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    return midnight_local.astimezone(timezone.utc).replace(tzinfo=None)
+    return midnight_local.replace(tzinfo=None)
 
 
 def facility_tomorrow_utc():
-    """Naive UTC datetime of facility-local midnight at the END of today
-    (start of tomorrow). Pairs with facility_today_utc() for range filters."""
+    """Naive facility-local datetime of midnight at the END of today
+    (start of tomorrow). Pairs with `facility_today_utc()` for range
+    filters."""
     from datetime import timedelta
     return facility_today_utc() + timedelta(days=1)
 
 
 def facility_day_range_utc(target_date_str: str | None = None):
-    """Return (start_utc, end_utc) range for a facility-local day. If
-    target_date_str is None, uses today. Pass a string like "2026-04-13" to
-    get any date's window. Both bounds are naive UTC datetimes suitable for
-    filtering DB columns stored as UTC-naive."""
-    from datetime import datetime, timezone, date as date_cls, timedelta
+    """Return (start, end) naive facility-local range for a given day. If
+    target_date_str is None, uses today. Pass a string like "2026-04-13"
+    to get any date's window. Both bounds are naive facility-local
+    datetimes suitable for filtering DB columns stored facility-local-naive."""
+    from datetime import datetime, date as date_cls, timedelta
     if target_date_str is None:
         start = facility_today_utc()
     else:
         d = date_cls.fromisoformat(target_date_str)
-        start_local = datetime(d.year, d.month, d.day, tzinfo=facility_tz())
-        start = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+        # Naive facility-local datetime at midnight of the target date.
+        start = datetime(d.year, d.month, d.day)
     end = start + timedelta(days=1)
     return start, end
 

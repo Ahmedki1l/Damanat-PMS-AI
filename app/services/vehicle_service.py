@@ -9,6 +9,7 @@ from datetime import datetime, UTC
 from sqlalchemy.orm import Session
 from app.models.vehicle import Vehicle
 from app.utils.logger import get_logger
+from app.config import facility_now_naive
 
 # Note: Assuming vehicle_repo is implemented in app.repositories
 try:
@@ -79,7 +80,7 @@ def register_vehicle(db: Session, plate_number: str, owner_name: str,
         email=email,
         notes=notes,
         is_registered=True,
-        registered_at=datetime.now(UTC),
+        registered_at=facility_now_naive(),
     )
 
     if vehicle_repo:
@@ -173,7 +174,7 @@ def update_vehicle(
         vehicle.notes = notes
     if is_registered is not None:
         vehicle.is_registered = is_registered
-        vehicle.registered_at = datetime.now(UTC) if is_registered else None
+        vehicle.registered_at = facility_now_naive() if is_registered else None
 
     logger.info("Updated vehicle profile: %s", plate)
     return vehicle

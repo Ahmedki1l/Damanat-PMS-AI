@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from typing import Optional, List, Dict
-from app.config import settings
+from app.config import settings, facility_now_naive
 from app.services.snapshot_service import to_public_snapshot_url
 from app.utils.logger import get_logger
 
@@ -111,7 +111,7 @@ def _extract_from_multipart(raw_body: bytes, content_type: str, camera_id: str, 
     for p in parts:
         ct = p["content_type"]
         if "image/" in ct.lower():
-            timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
+            timestamp = facility_now_naive().strftime("%Y%m%d_%H%M%S_%f")
             filename = f"part_{event_type}_{camera_id}_{timestamp}.jpg"
             filepath = os.path.join(SNAPSHOT_DIR, filename)
             try:
@@ -160,7 +160,7 @@ def parse_camera_event(raw_body: bytes, camera_ip: str, content_type: str = "") 
         # Rename the placeholder image file to use actual event type and resolved camera_id
         if "multipart" in snapshot_path:
             # We reconstruct the filename because temp_camera_id might have been UNKNOWN if IP was masked
-            timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
+            timestamp = facility_now_naive().strftime("%Y%m%d_%H%M%S_%f")
             correct_filename = os.path.join(SNAPSHOT_DIR, f"snapshot_{event.event_type}_{event.camera_id}_{timestamp}.jpg")
             try:
                 os.rename(snapshot_path, correct_filename)
@@ -203,7 +203,7 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
         return el.text.strip() if el is not None and el.text else None
 
     # Resolve Trigger Time
-    trigger_time = datetime.now(UTC)
+    trigger_time = facility_now_naive()
     t_str = find_text("triggerTime") or find_text("dateTime")
     if t_str:
         try:
@@ -385,7 +385,7 @@ def _parse_json_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
         raise
 
     # Resolve Trigger Time
-    trigger_time = datetime.now(UTC)
+    trigger_time = facility_now_naive()
     dt_str = data.get("dateTime", "")
     if dt_str:
         try:

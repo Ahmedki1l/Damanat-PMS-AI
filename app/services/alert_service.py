@@ -6,7 +6,7 @@ Used by occupancy_service, violation_service, intrusion_service, and entry_exit_
 
 from datetime import datetime, UTC
 from sqlalchemy.orm import Session
-from app.config import settings
+from app.config import settings, facility_now_naive
 from app.models.alert import Alert
 from app.models.vehicle import Vehicle
 from app.utils.logger import get_logger
@@ -70,7 +70,7 @@ async def broadcast_event(
         "description": description,
         "plate_number": plate_number,
         "snapshot_path": snapshot_path,
-        "triggered_at": (triggered_at or datetime.now(UTC)).isoformat(),
+        "triggered_at": (triggered_at or facility_now_naive()).isoformat(),
         # Breadcrumbs for internal debugging
         "internal_meta": {
             "zone_id": zone_id,
@@ -180,7 +180,7 @@ async def create_alert(
             severity=severity,
             location_display=location_display,
             is_resolved=False,
-            triggered_at=datetime.now(UTC),
+            triggered_at=facility_now_naive(),
         )
 
         logger.warning(
@@ -220,7 +220,7 @@ async def create_alert(
             slot_number=slot_number,
             plate_number=plate_number,
             snapshot_path=snapshot_path,
-            triggered_at=new_alert.triggered_at if new_alert else datetime.now(UTC),
+            triggered_at=new_alert.triggered_at if new_alert else facility_now_naive(),
         )
 
     except Exception as e:

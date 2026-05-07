@@ -4,7 +4,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from datetime import datetime, UTC
-from app.config import settings
+from app.config import settings, facility_now_naive
 from app.database import get_db
 from app.models.zone_occupancy import ZoneOccupancy
 from app.schemas.zone_occupancy import ZoneOccupancyOut, ZoneCapacityUpdate
@@ -47,7 +47,7 @@ def set_zone_capacity(zone_id: str, body: ZoneCapacityUpdate, db: Session = Depe
                              zone_name=zone_meta.get("zone_name"),
                              floor=zone_meta.get("floor"),
                              current_count=0, max_capacity=body.max_capacity,
-                             last_updated=datetime.now(UTC))
+                             last_updated=facility_now_naive())
         db.add(zone)
     else:
         zone.max_capacity = body.max_capacity
@@ -66,7 +66,7 @@ def reset_zone_count(zone_id: str, db: Session = Depends(get_db)):
     if not zone:
         raise HTTPException(status_code=404, detail=f"Zone '{zone_id}' not found")
     zone.current_count = 0
-    zone.last_updated = datetime.now(UTC)
+    zone.last_updated = facility_now_naive()
     db.commit()
     return {"zone_id": zone_id, "current_count": 0, "status": "reset"}
 
