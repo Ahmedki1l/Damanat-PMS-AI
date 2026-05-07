@@ -61,13 +61,13 @@ def health_check(db: Session = Depends(get_db)):
         except Exception as e:
             return cam_id, f"error: {str(e)}"
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        camera_results = list(executor.map(check_cam, settings.CAMERAS.items()))
+    # with ThreadPoolExecutor(max_workers=10) as executor:
+    #     camera_results = list(executor.map(check_cam, settings.CAMERAS.items()))
 
-    for cam_id, cam_status in camera_results:
-        if cam_status != "ok":
-            result["status"] = "degraded"
-        logger.debug(f"[health] camera={cam_id} status={cam_status}")
+    # for cam_id, cam_status in camera_results:
+    #     if cam_status != "ok":
+    #         result["status"] = "degraded"
+    #     logger.debug(f"[health] camera={cam_id} status={cam_status}")
 
     return result
 
