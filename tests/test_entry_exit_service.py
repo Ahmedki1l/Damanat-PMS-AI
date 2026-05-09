@@ -9,7 +9,11 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from datetime import datetime, UTC, timedelta
 from app.models.vehicle import Vehicle
-from app.services.entry_exit_service import handle_anpr_event
+from app.services.entry_exit_service import (
+    handle_anpr_event,
+    confirm_pending_entry,
+    _pending_entries,
+)
 from app.services.event_parser import ParsedCameraEvent
 
 def make_anpr_event(plate="ABC-1234", gate="entry", trigger_time=None):
@@ -29,12 +33,15 @@ def make_anpr_event(plate="ABC-1234", gate="entry", trigger_time=None):
     )
 
 class TestEntryExitService:
+    def setup_method(self):
+        _pending_entries.clear()
+
     @pytest.mark.asyncio
     @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
     @patch("app.services.entry_exit_service.parking_session_service.open_session")
     @patch("app.services.entry_exit_service.vehicle_service")
     async def test_entry_event_creates_log(self, mock_vs, mock_open_session, mock_alert):
-        """UC1: Entry event should create a log record in the database."""
+        """UC1: ANPR entry defers DB write to pending cache; CAM-03 confirm writes the log."""
         placeholder_vehicle = MagicMock(spec=Vehicle)
         placeholder_vehicle.id = 42
         placeholder_vehicle.plate_number = "ABC-1234"
@@ -42,14 +49,21 @@ class TestEntryExitService:
         placeholder_vehicle.owner_name = "Unknown"
         placeholder_vehicle.is_employee = False
         placeholder_vehicle.is_registered = False
-        mock_vs.lookup_vehicle.return_value = None  # Unknown vehicle
         mock_vs.ensure_unregistered_vehicle.return_value = placeholder_vehicle
         db = MagicMock()
         query_chain = db.query.return_value
         query_chain.filter.return_value = query_chain
-        query_chain.first.side_effect = [None, None]
+        query_chain.order_by.return_value = query_chain
+        query_chain.first.return_value = None  # no dedup hit, no anti-bounce hit
 
+        # Phase 1: ANPR fires — no DB write yet, plate sits in pending cache
         await handle_anpr_event(make_anpr_event(), db)
+
+        db.add.assert_not_called()
+        assert "ABC-1234" in _pending_entries
+
+        # Phase 2: CAM-03 confirms entry — log is written to DB
+        await confirm_pending_entry(db)
 
         db.add.assert_called_once()
         log = db.add.call_args[0][0]
@@ -66,6 +80,7 @@ class TestEntryExitService:
             snapshot_path=None,
             vehicle=placeholder_vehicle,
         )
+        assert "ABC-1234" not in _pending_entries
 
     @pytest.mark.asyncio
     @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
@@ -80,10 +95,9 @@ class TestEntryExitService:
 
     @pytest.mark.asyncio
     @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
-    @patch("app.services.entry_exit_service.parking_session_service.open_session")
     @patch("app.services.entry_exit_service.vehicle_service")
-    async def test_unknown_vehicle_triggers_alert(self, mock_vs, mock_open_session, mock_alert):
-        """UC4: Detecting an unregistered vehicle must trigger an alert."""
+    async def test_unknown_vehicle_triggers_alert(self, mock_vs, mock_alert):
+        """UC4: Unregistered vehicle at entry must trigger an alert (fires before CAM-03 confirm)."""
         placeholder_vehicle = MagicMock(spec=Vehicle)
         placeholder_vehicle.id = 42
         placeholder_vehicle.plate_number = "ABC-1234"
@@ -91,12 +105,12 @@ class TestEntryExitService:
         placeholder_vehicle.owner_name = "Unknown"
         placeholder_vehicle.is_employee = False
         placeholder_vehicle.is_registered = False
-        mock_vs.lookup_vehicle.return_value = None
         mock_vs.ensure_unregistered_vehicle.return_value = placeholder_vehicle
         db = MagicMock()
         query_chain = db.query.return_value
         query_chain.filter.return_value = query_chain
-        query_chain.first.side_effect = [None, None]
+        query_chain.order_by.return_value = query_chain
+        query_chain.first.return_value = None  # no dedup, no anti-bounce
 
         await handle_anpr_event(make_anpr_event(), db)
 
@@ -107,9 +121,10 @@ class TestEntryExitService:
 
     @pytest.mark.asyncio
     @patch("app.services.alert_service.broadcast_event", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.close_session")
     @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
     @patch("app.services.entry_exit_service.vehicle_service")
-    async def test_existing_unregistered_vehicle_still_triggers_alert(self, mock_vs, mock_alert, mock_broadcast):
+    async def test_existing_unregistered_vehicle_still_triggers_alert(self, mock_vs, mock_alert, mock_close_session, mock_broadcast):
         vehicle = MagicMock(spec=Vehicle)
         vehicle.id = 7
         vehicle.plate_number = "ABC-1234"
@@ -117,12 +132,13 @@ class TestEntryExitService:
         vehicle.owner_name = "Unknown"
         vehicle.is_employee = False
         vehicle.is_registered = False
-        mock_vs.lookup_vehicle.return_value = vehicle
+        mock_vs.ensure_unregistered_vehicle.return_value = vehicle
 
         db = MagicMock()
         query_chain = db.query.return_value
         query_chain.filter.return_value = query_chain
-        query_chain.first.side_effect = [None, None]
+        query_chain.order_by.return_value = query_chain
+        query_chain.first.return_value = None  # no dedup, no matching entry
 
         await handle_anpr_event(make_anpr_event(gate="exit"), db)
 

@@ -103,6 +103,7 @@ def test_bind_and_unbind_slot(db):
     session = parking_session_service.bind_slot(
         db,
         plate_number="ABC-1234",
+        slot_id="SLOT-B1-12",
         slot_number="B1-12",
         zone_id="B1-PARKING",
         zone_name=None,
@@ -132,6 +133,7 @@ def test_bind_slot_requires_open_session(db):
         parking_session_service.bind_slot(
             db,
             plate_number="ABC-1234",
+            slot_id="SLOT-B1-12",
             slot_number="B1-12",
             zone_id="B1-PARKING",
             zone_name=None,

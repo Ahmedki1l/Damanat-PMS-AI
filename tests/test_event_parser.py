@@ -46,8 +46,12 @@ class TestXMLEventParsing:
           </DetectionRegionEntry></DetectionRegionList>
         </EventNotificationAlert>"""
 
+        from unittest.mock import patch
         from app.config import settings
-        event = parse_camera_event(xml, settings.CAM_35_IP, "application/xml")
+        fake_ip = "192.168.99.35"
+        fake_map = {**settings.CAMERA_IP_MAP, fake_ip: "CAM-35"}
+        with patch.object(settings, "CAMERA_IP_MAP", fake_map):
+            event = parse_camera_event(xml, fake_ip, "application/xml")
         assert event.event_type == "regionEntrance"
         assert event.region_id == "parking-row-A"
         assert event.camera_id == "CAM-35"

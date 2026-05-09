@@ -19,7 +19,7 @@ import sys
 import os
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, UTC
 from unittest.mock import AsyncMock, patch
 
 import pytest

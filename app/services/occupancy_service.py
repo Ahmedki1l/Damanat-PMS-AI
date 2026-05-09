@@ -214,6 +214,9 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
         if cam_id == "CAM-03":
             await _update_zone_count(settings.GARAGE_TOTAL_ZONE, cam_id,  1 * multiplier, db, event.snapshot_path)
             await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id,  1 * multiplier, db, event.snapshot_path)
+            if multiplier == 1:  # entry direction only — confirm pending ANPR
+                from app.services.entry_exit_service import confirm_pending_entry
+                await confirm_pending_entry(db)
         elif cam_id == "CAM-08":
             await _update_zone_count(settings.GARAGE_TOTAL_ZONE, cam_id, -1 * multiplier, db, event.snapshot_path)
             await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id, -1 * multiplier, db, event.snapshot_path)
