@@ -2,7 +2,7 @@
 import sys
 import os
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from unittest.mock import AsyncMock, patch
@@ -13,6 +13,8 @@ from app.database import Base
 from app.models.entry_exit_log import EntryExitLog
 from app.services.entry_exit_service import handle_anpr_event
 from app.services.event_parser import ParsedCameraEvent
+from app.models.entry_exit_log import EntryExitLog as _EntryExitLogModel
+from app.config import facility_tz
 from app.routers.parking_stats import get_avg_parking_time, get_daily_stats
 
 # Setup in-memory SQLite for testing
@@ -49,19 +51,28 @@ def db():
 async def test_parking_duration_calculation(db):
     """Verify that exit event matches entry and calculates duration."""
     plate = "TEST-123"
-    entry_time = datetime.now(UTC) - timedelta(minutes=30)
+    # Naive facility-local timestamps (DB convention)
+    entry_time_naive = (datetime.now(UTC) - timedelta(minutes=30)).astimezone(facility_tz()).replace(tzinfo=None)
     exit_time = datetime.now(UTC)
-    
-    # 1. Entry Event
-    entry_event = make_anpr_event("CAM-ENTRY", plate, "entry", entry_time)
-    with patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock):
-        await handle_anpr_event(entry_event, db)
+
+    # Seed the entry log directly — this test covers duration/stats logic,
+    # not the two-phase ANPR detection flow (covered by test_entry_exit_service).
+    db.add(_EntryExitLogModel(
+        plate_number=plate,
+        vehicle_id=None,
+        vehicle_type="unknown",
+        gate="entry",
+        camera_id="CAM-ENTRY",
+        event_time=entry_time_naive,
+        created_at=entry_time_naive,
+    ))
     db.commit()
-    
-    # 2. Exit Event
+
+    # Exit Event — drives duration calculation and matching
     exit_event = make_anpr_event("CAM-EXIT", plate, "exit", exit_time)
     with patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock):
-        await handle_anpr_event(exit_event, db)
+        with patch("app.services.entry_exit_service.parking_session_service.close_session"):
+            await handle_anpr_event(exit_event, db)
     db.commit()
     
     # Verify records
@@ -76,7 +87,7 @@ async def test_parking_duration_calculation(db):
     assert exit_log.parking_duration == 1800 # 30 mins
     
     # 3. Verify Stats Endpoint logic
-    target_dt = entry_time.strftime("%Y-%m-%d")
+    target_dt = entry_time_naive.strftime("%Y-%m-%d")
     stats = get_avg_parking_time(target_date=target_dt, db=db)
     assert stats["avg_parking_minutes"] == 30.0
     

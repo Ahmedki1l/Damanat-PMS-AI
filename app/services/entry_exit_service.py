@@ -24,6 +24,61 @@ from app.utils import core_backend_client
 
 logger = get_logger(__name__)
 
+# Pending entry cache: ANPR fired but car hasn't crossed CAM-03 yet.
+# Key: plate_number. Value: dict with all data needed to write entry_exit_log.
+# Entries expire after PENDING_ENTRY_TTL_SECONDS if CAM-03 never fires (false trigger).
+_pending_entries: dict = {}
+PENDING_ENTRY_TTL_SECONDS = 120
+
+
+def _cleanup_pending():
+    now = facility_now_naive()
+    expired = [
+        p for p, d in _pending_entries.items()
+        if (now - d["event_time"]).total_seconds() > PENDING_ENTRY_TTL_SECONDS
+    ]
+    for p in expired:
+        logger.debug(f"[UC1] Pending entry expired (no CAM-03 confirmation): plate={p}")
+        del _pending_entries[p]
+
+
+async def confirm_pending_entry(db: Session):
+    """
+    Called by occupancy_service when CAM-03 fires in the entry direction.
+    Consumes the oldest pending ANPR event and writes it to entry_exit_log.
+    FIFO: the car that triggered ANPR first is the one physically at the ramp now.
+    """
+    _cleanup_pending()
+    if not _pending_entries:
+        logger.info("[UC1] CAM-03 entry confirmed — no pending ANPR, unidentified vehicle skipped")
+        return
+
+    oldest_plate = min(_pending_entries, key=lambda p: _pending_entries[p]["event_time"])
+    pending = _pending_entries.pop(oldest_plate)
+
+    log_entry = EntryExitLog(
+        plate_number=pending["plate"],
+        vehicle_id=pending["vehicle"].id if pending["vehicle"] else None,
+        vehicle_type=pending["vehicle_type"],
+        gate="entry",
+        camera_id=pending["camera_id"],
+        event_time=pending["event_time"],
+        snapshot_path=pending["snapshot_path"],
+        created_at=facility_now_naive(),
+    )
+    db.add(log_entry)
+
+    parking_session_service.open_session(
+        db,
+        plate_number=pending["plate"],
+        event_time=pending["event_time"],
+        camera_id=pending["camera_id"],
+        snapshot_path=pending["snapshot_path"],
+        vehicle=pending["vehicle"],
+    )
+    logger.info(f"[UC1] Entry CONFIRMED by CAM-03 for plate={oldest_plate}")
+
+
 async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
     """
     Process ANPR events to log vehicle movement, identify owners,
@@ -121,6 +176,48 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
 
     logger.info(f"[UC1] Gate={gate} | Plate={plate} | Type={vehicle_type}")
 
+    # ── ENTRY: defer DB write until CAM-03 confirms car actually entered ──
+    if gate == "entry":
+        _cleanup_pending()
+        _pending_entries[plate] = {
+            "plate": plate,
+            "camera_id": event.camera_id,
+            "event_time": event_time,
+            "snapshot_path": event.snapshot_path,
+            "vehicle": vehicle,
+            "vehicle_type": vehicle_type,
+        }
+        logger.info(f"[UC1] ANPR entry pending CAM-03 confirmation: plate={plate}")
+
+        # UC4: alert/notification fires immediately even though DB write is deferred
+        if vehicle and vehicle.is_registered:
+            from app.services.alert_service import broadcast_event
+            await broadcast_event(
+                is_alert=False,
+                severity="info",
+                event_type="AccessControllerEvent",
+                description=f"Registered vehicle at entry gate: plate {plate}",
+                camera_id=event.camera_id,
+                zone_id=gate,
+                plate_number=plate,
+                snapshot_path=event.snapshot_path,
+                triggered_at=event_time
+            )
+        else:
+            logger.info(f"[UC4] Triggering alert for unknown/unregistered vehicle: {plate}")
+            await create_alert(
+                db=db,
+                alert_type="unknown_vehicle",
+                camera_id=event.camera_id,
+                zone_id=gate,
+                event_type="AccessControllerEvent",
+                description=f"Unregistered vehicle at entry gate: plate {plate}",
+                plate_number=plate,
+                snapshot_path=event.snapshot_path,
+            )
+        return
+
+    # ── EXIT: log immediately, no confirmation needed ─────────────────────
     log_entry = EntryExitLog(
         plate_number=plate,
         vehicle_id=vehicle.id if vehicle else None,
@@ -132,70 +229,53 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         created_at=facility_now_naive(),
     )
 
-    if gate == "entry":
-        parking_session_service.open_session(
-            db,
-            plate_number=plate,
-            event_time=event_time,
-            camera_id=event.camera_id,
-            snapshot_path=event.snapshot_path,
-            vehicle=vehicle,
-        )
-
     # UC2: Calculation of Parking Duration on Exit
-    if gate == "exit":
-        matching_entry = (
-            db.query(EntryExitLog)
-            .filter(
-                EntryExitLog.plate_number == plate,
-                EntryExitLog.gate == "entry",
-                EntryExitLog.matched_entry_id.is_(None)
-            )
-            .order_by(EntryExitLog.event_time.desc())
-            .first()
+    matching_entry = (
+        db.query(EntryExitLog)
+        .filter(
+            EntryExitLog.plate_number == plate,
+            EntryExitLog.gate == "entry",
+            EntryExitLog.matched_entry_id.is_(None)
         )
+        .order_by(EntryExitLog.event_time.desc())
+        .first()
+    )
 
-        if matching_entry:
-            # event_time is already naive facility-local (normalized above);
-            # matching_entry may still be tz-aware if stored before the fix,
-            # so strip it defensively. Convert to facility tz first to keep
-            # the wall-clock value, matching the new DB convention.
-            t2 = matching_entry.event_time
-            if t2.tzinfo is not None:
-                t2 = t2.astimezone(facility_tz()).replace(tzinfo=None)
+    if matching_entry:
+        t2 = matching_entry.event_time
+        if t2.tzinfo is not None:
+            t2 = t2.astimezone(facility_tz()).replace(tzinfo=None)
 
-            duration_seconds = int((event_time - t2).total_seconds())
-            log_entry.parking_duration = max(0, duration_seconds)
+        duration_seconds = int((event_time - t2).total_seconds())
+        log_entry.parking_duration = max(0, duration_seconds)
 
-            db.add(log_entry)
-            db.flush()
+        db.add(log_entry)
+        db.flush()
 
-            log_entry.matched_entry_id = matching_entry.id
-            matching_entry.matched_entry_id = log_entry.id
+        log_entry.matched_entry_id = matching_entry.id
+        matching_entry.matched_entry_id = log_entry.id
 
-            # Calculate minutes and seconds for a clearer log
-            mins, secs = divmod(duration_seconds, 60)
-            logger.info(f"[UC2] MATCH FOUND! Vehicle {plate} parked for {mins}m {secs}s")
-        else:
-            logger.warning(f"[UC2] No matching entry found for vehicle {plate}")
+        mins, secs = divmod(duration_seconds, 60)
+        logger.info(f"[UC2] MATCH FOUND! Vehicle {plate} parked for {mins}m {secs}s")
+    else:
+        logger.warning(f"[UC2] No matching entry found for vehicle {plate}")
 
-        parking_session_service.close_session(
-            db,
-            plate_number=plate,
-            event_time=event_time,
-            camera_id=event.camera_id,
-            snapshot_path=event.snapshot_path,
-        )
+    parking_session_service.close_session(
+        db,
+        plate_number=plate,
+        event_time=event_time,
+        camera_id=event.camera_id,
+        snapshot_path=event.snapshot_path,
+    )
 
-    # UC4: Clear logic for single notification/alert
+    # UC4
     if vehicle and vehicle.is_registered:
-        # Registered vehicle — send single 'info' notification via unified broadcast
         from app.services.alert_service import broadcast_event
         await broadcast_event(
             is_alert=False,
             severity="info",
             event_type="AccessControllerEvent",
-            description=f"Registered vehicle at {gate} gate: plate {plate}",
+            description=f"Registered vehicle at exit gate: plate {plate}",
             camera_id=event.camera_id,
             zone_id=gate,
             plate_number=plate,
@@ -203,7 +283,6 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
             triggered_at=event_time
         )
     else:
-        # Unregistered vehicle — send single 'critical' alert
         logger.info(f"[UC4] Triggering alert for unknown/unregistered vehicle: {plate}")
         await create_alert(
             db=db,
@@ -211,7 +290,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
             camera_id=event.camera_id,
             zone_id=gate,
             event_type="AccessControllerEvent",
-            description=f"Unregistered vehicle at {gate} gate: plate {plate}",
+            description=f"Unregistered vehicle at exit gate: plate {plate}",
             plate_number=plate,
             snapshot_path=event.snapshot_path,
         )
