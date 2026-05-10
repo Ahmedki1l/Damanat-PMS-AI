@@ -22,7 +22,7 @@ class Vehicle(Base):
     is_employee = Column(Boolean, default=False, nullable=False)
     phone = Column(String(50))
     email = Column(String(255))
-    is_registered = Column(Boolean, default=True, nullable=False)
+    is_registered = Column(Boolean, default=False, nullable=False)
     registered_at = Column(DateTime)
     notes = Column(Text)
 
