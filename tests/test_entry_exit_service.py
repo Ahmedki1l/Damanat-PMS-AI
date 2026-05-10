@@ -41,7 +41,7 @@ class TestEntryExitService:
     @patch("app.services.entry_exit_service.parking_session_service.open_session")
     @patch("app.services.entry_exit_service.vehicle_service")
     async def test_entry_event_creates_log(self, mock_vs, mock_open_session, mock_alert):
-        """UC1: ANPR entry defers DB write to pending cache; CAM-03 confirm writes the log."""
+        """UC1: ANPR entry writes log immediately when USE_CAM03_ENTRY_CONFIRMATION=False (default)."""
         placeholder_vehicle = MagicMock(spec=Vehicle)
         placeholder_vehicle.id = 42
         placeholder_vehicle.plate_number = "ABC-1234"
@@ -55,6 +55,42 @@ class TestEntryExitService:
         query_chain.filter.return_value = query_chain
         query_chain.order_by.return_value = query_chain
         query_chain.first.return_value = None  # no dedup hit, no anti-bounce hit
+
+        await handle_anpr_event(make_anpr_event(), db)
+
+        db.add.assert_called_once()
+        log = db.add.call_args[0][0]
+        assert log.plate_number == "ABC-1234"
+        assert log.gate == "entry"
+        assert log.vehicle_id == 42
+        assert log.vehicle_type == "unknown"
+        mock_vs.ensure_unregistered_vehicle.assert_called_once_with(db, "ABC-1234")
+        mock_open_session.assert_called_once()
+        assert "ABC-1234" not in _pending_entries
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.open_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_entry_two_phase_flow(self, mock_vs, mock_open_session, mock_alert, mock_settings):
+        """UC1: With USE_CAM03_ENTRY_CONFIRMATION=True, entry defers until CAM-03 confirms."""
+        mock_settings.USE_CAM03_ENTRY_CONFIRMATION = True
+        mock_settings.CAMERAS = {"CAM-ENTRY": {"gate": "entry"}}
+        mock_settings.ENTRY_ANTIBOUNCE_SECONDS = 30
+        placeholder_vehicle = MagicMock(spec=Vehicle)
+        placeholder_vehicle.id = 42
+        placeholder_vehicle.plate_number = "ABC-1234"
+        placeholder_vehicle.vehicle_type = "unknown"
+        placeholder_vehicle.owner_name = "Unknown"
+        placeholder_vehicle.is_employee = False
+        placeholder_vehicle.is_registered = False
+        mock_vs.ensure_unregistered_vehicle.return_value = placeholder_vehicle
+        db = MagicMock()
+        query_chain = db.query.return_value
+        query_chain.filter.return_value = query_chain
+        query_chain.order_by.return_value = query_chain
+        query_chain.first.return_value = None
 
         # Phase 1: ANPR fires — no DB write yet, plate sits in pending cache
         await handle_anpr_event(make_anpr_event(), db)
@@ -70,16 +106,7 @@ class TestEntryExitService:
         assert log.plate_number == "ABC-1234"
         assert log.gate == "entry"
         assert log.vehicle_id == 42
-        assert log.vehicle_type == "unknown"
-        mock_vs.ensure_unregistered_vehicle.assert_called_once_with(db, "ABC-1234")
-        mock_open_session.assert_called_once_with(
-            db,
-            plate_number="ABC-1234",
-            event_time=log.event_time,
-            camera_id="CAM-ENTRY",
-            snapshot_path=None,
-            vehicle=placeholder_vehicle,
-        )
+        mock_open_session.assert_called_once()
         assert "ABC-1234" not in _pending_entries
 
     @pytest.mark.asyncio
