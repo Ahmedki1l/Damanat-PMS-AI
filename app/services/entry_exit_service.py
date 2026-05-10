@@ -176,20 +176,44 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
 
     logger.info(f"[UC1] Gate={gate} | Plate={plate} | Type={vehicle_type}")
 
-    # ── ENTRY: defer DB write until CAM-03 confirms car actually entered ──
+    # ── ENTRY ─────────────────────────────────────────────────────────────
     if gate == "entry":
-        _cleanup_pending()
-        _pending_entries[plate] = {
-            "plate": plate,
-            "camera_id": event.camera_id,
-            "event_time": event_time,
-            "snapshot_path": event.snapshot_path,
-            "vehicle": vehicle,
-            "vehicle_type": vehicle_type,
-        }
-        logger.info(f"[UC1] ANPR entry pending CAM-03 confirmation: plate={plate}")
+        if settings.USE_CAM03_ENTRY_CONFIRMATION:
+            # Defer DB write — CAM-03 linedetection will call confirm_pending_entry()
+            _cleanup_pending()
+            _pending_entries[plate] = {
+                "plate": plate,
+                "camera_id": event.camera_id,
+                "event_time": event_time,
+                "snapshot_path": event.snapshot_path,
+                "vehicle": vehicle,
+                "vehicle_type": vehicle_type,
+            }
+            logger.info(f"[UC1] ANPR entry pending CAM-03 confirmation: plate={plate}")
+        else:
+            # Immediate write (USE_CAM03_ENTRY_CONFIRMATION=False, the default)
+            log_entry = EntryExitLog(
+                plate_number=plate,
+                vehicle_id=vehicle.id if vehicle else None,
+                vehicle_type=vehicle_type,
+                gate="entry",
+                camera_id=event.camera_id,
+                event_time=event_time,
+                snapshot_path=event.snapshot_path,
+                created_at=facility_now_naive(),
+            )
+            db.add(log_entry)
+            parking_session_service.open_session(
+                db,
+                plate_number=plate,
+                event_time=event_time,
+                camera_id=event.camera_id,
+                snapshot_path=event.snapshot_path,
+                vehicle=vehicle,
+            )
+            logger.info(f"[UC1] Entry LOGGED immediately: plate={plate}")
 
-        # UC4: alert/notification fires immediately even though DB write is deferred
+        # UC4: alert/notification fires regardless of two-phase mode
         if vehicle and vehicle.is_registered:
             from app.services.alert_service import broadcast_event
             await broadcast_event(
