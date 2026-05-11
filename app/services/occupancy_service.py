@@ -93,11 +93,10 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
 
     if occupancy_ratio >= 1:
         now_ts = facility_now_naive().timestamp()
-        last_alert_ts = _capacity_alert_cache.get(zone_id, 0)
+        cooldown_key = (camera_id, zone_id)
+        last_alert_ts = _capacity_alert_cache.get(cooldown_key, 0)
         if now_ts - last_alert_ts >= CAPACITY_ALERT_COOLDOWN:
-            floor = zone.floor or zone_meta.get("floor", "")
-            label = f"{floor} floor" if floor and floor != "ALL" else "Total parking"
-            _capacity_alert_cache[zone_id] = now_ts
+            _capacity_alert_cache[cooldown_key] = now_ts
             await create_alert(
                 db,
                 alert_type="capacity_exceeded",
@@ -105,12 +104,12 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
                 zone_id=zone_id,
                 zone_name=zone.zone_name,
                 event_type="occupancy_update",
-                description=f"{label} has reached capacity: {pct}% ({zone.current_count}/{zone.max_capacity})",
+                description=f"Zone {zone_id} is nearly full: {pct}% ({zone.current_count}/{zone.max_capacity})",
                 snapshot_path=snapshot_path,
             )
         else:
             remaining = int(CAPACITY_ALERT_COOLDOWN - (now_ts - last_alert_ts))
-            logger.debug(f"[UC3] {zone_id}: capacity_exceeded alert suppressed (cooldown {remaining}s remaining)")
+            logger.debug(f"[UC3] {camera_id}/{zone_id}: capacity_exceeded alert suppressed (cooldown {remaining}s remaining)")
 
 
 def _cache_cleanup():
