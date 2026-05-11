@@ -306,7 +306,7 @@ class Settings(BaseSettings):
     FORWARD_DIRECTION_FIELD: str = "B-to-A"  # Primary flow (entry/exit/transition)
     USE_EXIT_DIRECTION_VALIDATION: bool = True
     USE_EXIT_CONFIRM_WINDOW: bool = True
-    USE_CAM03_ENTRY_CONFIRMATION: bool = False
+    USE_CAM03_ENTRY_CONFIRMATION: bool = True
 
     # ── Anti-bounce on entry events (UC1) ────────────────────────────────
     # Suppress an entry-camera ANPR firing if the same plate had an exit
