@@ -214,7 +214,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
             logger.info(f"[UC1] Entry LOGGED immediately: plate={plate}")
 
         # UC4: alert/notification fires regardless of two-phase mode
-        if vehicle:
+        if vehicle and vehicle.is_registered:
             from app.services.alert_service import broadcast_event
             await broadcast_event(
                 is_alert=False,
@@ -293,7 +293,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
     )
 
     # UC4
-    if vehicle:
+    if vehicle and vehicle.is_registered:
         from app.services.alert_service import broadcast_event
         await broadcast_event(
             is_alert=False,
