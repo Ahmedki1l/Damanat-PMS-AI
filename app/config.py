@@ -351,6 +351,9 @@ class Settings(BaseSettings):
     EVENT_STREAM_SUPPRESS_SECONDS: int = 30      # Suppress duplicate events within this window
     EVENT_STREAM_MAX_DURATION_SECONDS: int = 300  # Reset session after this elapsed time
 
+    # ── Alert Cooldowns ───────────────────────────────────────────────────
+    CAPACITY_ALERT_COOLDOWN_SECONDS: int = 300  # Min seconds between capacity_exceeded alerts per zone
+
     # ── Logging ───────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 

@@ -19,6 +19,11 @@ logger = get_logger(__name__)
 _processed_events_cache = {}
 CACHE_TTL_SECONDS = settings.EVENT_STREAM_SUPPRESS_SECONDS
 
+# Cooldown cache for capacity_exceeded alerts: prevents firing the same alert
+# repeatedly while a zone stays full. Key: zone_id, Value: last alert timestamp.
+_capacity_alert_cache: dict[str, float] = {}
+CAPACITY_ALERT_COOLDOWN = settings.CAPACITY_ALERT_COOLDOWN_SECONDS
+
 
 async def push_db_update(db: Session, zone_id: str, delta: int):
     """
@@ -87,16 +92,25 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
     logger.info(f"[UC3] {zone_id} Updated via Push: {zone.current_count}/{zone.max_capacity} ({pct}%)")
 
     if occupancy_ratio >= 1:
-        await create_alert(
-            db,
-            alert_type="capacity_exceeded",
-            camera_id=camera_id,
-            zone_id=zone_id,
-            zone_name=zone.zone_name,
-            event_type="occupancy_update",
-            description=f"Zone {zone_id} is nearly full: {pct}% ({zone.current_count}/{zone.max_capacity})",
-            snapshot_path=snapshot_path,
-        )
+        now_ts = facility_now_naive().timestamp()
+        last_alert_ts = _capacity_alert_cache.get(zone_id, 0)
+        if now_ts - last_alert_ts >= CAPACITY_ALERT_COOLDOWN:
+            floor = zone.floor or zone_meta.get("floor", "")
+            label = f"{floor} floor" if floor and floor != "ALL" else "Total parking"
+            _capacity_alert_cache[zone_id] = now_ts
+            await create_alert(
+                db,
+                alert_type="capacity_exceeded",
+                camera_id=camera_id,
+                zone_id=zone_id,
+                zone_name=zone.zone_name,
+                event_type="occupancy_update",
+                description=f"{label} has reached capacity: {pct}% ({zone.current_count}/{zone.max_capacity})",
+                snapshot_path=snapshot_path,
+            )
+        else:
+            remaining = int(CAPACITY_ALERT_COOLDOWN - (now_ts - last_alert_ts))
+            logger.debug(f"[UC3] {zone_id}: capacity_exceeded alert suppressed (cooldown {remaining}s remaining)")
 
 
 def _cache_cleanup():
