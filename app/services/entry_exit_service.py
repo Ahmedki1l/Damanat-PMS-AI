@@ -80,9 +80,17 @@ async def confirm_pending_entry(db: Session):
     oldest_plate = min(_pending_entries, key=lambda p: _pending_entries[p]["event_time"])
     pending = _pending_entries.pop(oldest_plate)
 
+    # Re-query vehicle from the current session — the stored vehicle_id is a plain
+    # int so it survives across requests; the original ORM object is expired/detached.
+    from app.models.vehicle import Vehicle as VehicleModel
+    vehicle = (
+        db.query(VehicleModel).filter(VehicleModel.id == pending["vehicle_id"]).first()
+        if pending["vehicle_id"] else None
+    )
+
     log_entry = EntryExitLog(
         plate_number=pending["plate"],
-        vehicle_id=pending["vehicle"].id if pending["vehicle"] else None,
+        vehicle_id=pending["vehicle_id"],
         vehicle_type=pending["vehicle_type"],
         gate="entry",
         camera_id=pending["camera_id"],
@@ -98,7 +106,7 @@ async def confirm_pending_entry(db: Session):
         event_time=pending["event_time"],
         camera_id=pending["camera_id"],
         snapshot_path=pending["snapshot_path"],
-        vehicle=pending["vehicle"],
+        vehicle=vehicle,
     )
     logger.info(f"[UC1] Entry CONFIRMED by CAM-03 for plate={oldest_plate}")
 
@@ -227,14 +235,18 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
                 logger.info(f"[UC1] Entry CONFIRMED immediately (CAM-03 pre-confirmed): plate={plate}")
             else:
                 # No pre-confirmation — defer DB write; CAM-03 will call confirm_pending_entry()
+                # Store plain scalars only — the Vehicle ORM object is bound to this
+                # request's session, which closes after db.commit(). Storing the object
+                # itself causes a "detached instance" error in the next request's session.
                 _cleanup_pending()
                 _pending_entries[plate] = {
                     "plate": plate,
                     "camera_id": event.camera_id,
                     "event_time": event_time,
                     "snapshot_path": event.snapshot_path,
-                    "vehicle": vehicle,
+                    "vehicle_id": vehicle.id if vehicle else None,
                     "vehicle_type": vehicle_type,
+                    "is_employee": bool(vehicle.is_employee) if vehicle else False,
                 }
                 logger.info(f"[UC1] ANPR entry pending CAM-03 confirmation: plate={plate}")
         else:
