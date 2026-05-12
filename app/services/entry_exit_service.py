@@ -39,14 +39,33 @@ _cam03_pre_confirmations: list = []
 CAM03_PRE_CONFIRM_TTL_SECONDS = 10
 
 
-def _cleanup_pending():
+def _cleanup_pending(db=None):
     now = facility_now_naive()
     expired = [
         p for p, d in _pending_entries.items()
         if (now - d["event_time"]).total_seconds() > PENDING_ENTRY_TTL_SECONDS
     ]
     for p in expired:
-        logger.debug(f"[UC1] Pending entry expired (no CAM-03 confirmation): plate={p}")
+        pending = _pending_entries[p]
+        if db and pending.get("vehicle_newly_created") and pending.get("vehicle_id"):
+            # The vehicle row was inserted by this ANPR event and CAM-03 never
+            # confirmed — the car didn't actually enter. Delete the ghost row.
+            # is_registered guard: if the plate was registered between ANPR and
+            # TTL expiry (60s), skip deletion to avoid destroying real data.
+            try:
+                from app.models.vehicle import Vehicle as VehicleModel
+                db.query(VehicleModel).filter(
+                    VehicleModel.id == pending["vehicle_id"],
+                    VehicleModel.is_registered == False,
+                ).delete(synchronize_session=False)
+                logger.info(
+                    f"[UC1] Ghost vehicle deleted (CAM-03 never confirmed): "
+                    f"plate={p} vehicle_id={pending['vehicle_id']}"
+                )
+            except Exception as e:
+                logger.warning(f"[UC1] Could not delete ghost vehicle plate={p}: {e}")
+        else:
+            logger.debug(f"[UC1] Pending entry expired (no CAM-03 confirmation): plate={p}")
         del _pending_entries[p]
 
 
@@ -69,7 +88,7 @@ async def confirm_pending_entry(db: Session):
       - CAM-03 first → store a pre-confirmation token; the arriving ANPR will
         write immediately via _consume_pre_confirmation() instead of deferring.
     """
-    _cleanup_pending()
+    _cleanup_pending(db)
     if not _pending_entries:
         # CAM-03 fired before ANPR — store a token so the ANPR, when it arrives,
         # knows it is already confirmed and should write immediately.
@@ -80,9 +99,17 @@ async def confirm_pending_entry(db: Session):
     oldest_plate = min(_pending_entries, key=lambda p: _pending_entries[p]["event_time"])
     pending = _pending_entries.pop(oldest_plate)
 
+    # Re-query vehicle from the current session — the stored vehicle_id is a plain
+    # int so it survives across requests; the original ORM object is expired/detached.
+    from app.models.vehicle import Vehicle as VehicleModel
+    vehicle = (
+        db.query(VehicleModel).filter(VehicleModel.id == pending["vehicle_id"]).first()
+        if pending["vehicle_id"] else None
+    )
+
     log_entry = EntryExitLog(
         plate_number=pending["plate"],
-        vehicle_id=pending["vehicle"].id if pending["vehicle"] else None,
+        vehicle_id=pending["vehicle_id"],
         vehicle_type=pending["vehicle_type"],
         gate="entry",
         camera_id=pending["camera_id"],
@@ -98,7 +125,7 @@ async def confirm_pending_entry(db: Session):
         event_time=pending["event_time"],
         camera_id=pending["camera_id"],
         snapshot_path=pending["snapshot_path"],
-        vehicle=pending["vehicle"],
+        vehicle=vehicle,
     )
     logger.info(f"[UC1] Entry CONFIRMED by CAM-03 for plate={oldest_plate}")
 
@@ -192,9 +219,10 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
 
     # UC4: Resolve vehicle identity via vehicle_service
     logger.debug(f"[UC4] Looking up vehicle for plate {plate}...")
-    # FIX: Always ensure a vehicle record exists (registered or placeholder)
-    # so that log entries have a valid vehicle_id, even on exit.
+    from app.repositories.vehicle_repository import vehicle_repo
+    existing_vehicle = vehicle_repo.get_by_plate(db, plate)   # None = brand-new plate
     vehicle = vehicle_service.ensure_unregistered_vehicle(db, plate)
+    vehicle_newly_created = existing_vehicle is None           # we just inserted this row
     vehicle_type = vehicle.vehicle_type if vehicle else "unknown"
     owner_name = vehicle.owner_name if vehicle else "Unknown"
 
@@ -227,14 +255,19 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
                 logger.info(f"[UC1] Entry CONFIRMED immediately (CAM-03 pre-confirmed): plate={plate}")
             else:
                 # No pre-confirmation — defer DB write; CAM-03 will call confirm_pending_entry()
-                _cleanup_pending()
+                # Store plain scalars only — the Vehicle ORM object is bound to this
+                # request's session, which closes after db.commit(). Storing the object
+                # itself causes a "detached instance" error in the next request's session.
+                _cleanup_pending(db)
                 _pending_entries[plate] = {
                     "plate": plate,
                     "camera_id": event.camera_id,
                     "event_time": event_time,
                     "snapshot_path": event.snapshot_path,
-                    "vehicle": vehicle,
+                    "vehicle_id": vehicle.id if vehicle else None,
                     "vehicle_type": vehicle_type,
+                    "is_employee": bool(vehicle.is_employee) if vehicle else False,
+                    "vehicle_newly_created": vehicle_newly_created,
                 }
                 logger.info(f"[UC1] ANPR entry pending CAM-03 confirmation: plate={plate}")
         else:
