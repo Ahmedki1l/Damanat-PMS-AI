@@ -28,7 +28,15 @@ logger = get_logger(__name__)
 # Key: plate_number. Value: dict with all data needed to write entry_exit_log.
 # Entries expire after PENDING_ENTRY_TTL_SECONDS if CAM-03 never fires (false trigger).
 _pending_entries: dict = {}
-PENDING_ENTRY_TTL_SECONDS = 120
+PENDING_ENTRY_TTL_SECONDS = 60
+
+# Pre-confirmation cache: CAM-03 fired BEFORE the ANPR event arrived.
+# In practice, CAM-03 hardware line detection fires in milliseconds while
+# ANPR plate recognition takes 1–3 s on the camera — so CAM-03 almost always
+# wins the race. Storing a timestamp here lets the incoming ANPR event write
+# immediately instead of deferring (which would stall forever).
+_cam03_pre_confirmations: list = []
+CAM03_PRE_CONFIRM_TTL_SECONDS = 10
 
 
 def _cleanup_pending():
@@ -42,15 +50,31 @@ def _cleanup_pending():
         del _pending_entries[p]
 
 
+def _consume_pre_confirmation() -> bool:
+    """Consume the oldest valid CAM-03 pre-confirmation. Returns True if one existed."""
+    now = facility_now_naive()
+    cutoff = now - timedelta(seconds=CAM03_PRE_CONFIRM_TTL_SECONDS)
+    _cam03_pre_confirmations[:] = [ts for ts in _cam03_pre_confirmations if ts > cutoff]
+    if _cam03_pre_confirmations:
+        _cam03_pre_confirmations.pop(0)
+        return True
+    return False
+
+
 async def confirm_pending_entry(db: Session):
     """
     Called by occupancy_service when CAM-03 fires in the entry direction.
-    Consumes the oldest pending ANPR event and writes it to entry_exit_log.
-    FIFO: the car that triggered ANPR first is the one physically at the ramp now.
+    Handles both orderings:
+      - ANPR first → plate is in _pending_entries → consume and write now.
+      - CAM-03 first → store a pre-confirmation token; the arriving ANPR will
+        write immediately via _consume_pre_confirmation() instead of deferring.
     """
     _cleanup_pending()
     if not _pending_entries:
-        logger.info("[UC1] CAM-03 entry confirmed — no pending ANPR, unidentified vehicle skipped")
+        # CAM-03 fired before ANPR — store a token so the ANPR, when it arrives,
+        # knows it is already confirmed and should write immediately.
+        _cam03_pre_confirmations.append(facility_now_naive())
+        logger.info("[UC1] CAM-03 fired before ANPR — pre-confirmation stored (ANPR will write on arrival)")
         return
 
     oldest_plate = min(_pending_entries, key=lambda p: _pending_entries[p]["event_time"])
@@ -179,19 +203,42 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
     # ── ENTRY ─────────────────────────────────────────────────────────────
     if gate == "entry":
         if settings.USE_CAM03_ENTRY_CONFIRMATION:
-            # Defer DB write — CAM-03 linedetection will call confirm_pending_entry()
-            _cleanup_pending()
-            _pending_entries[plate] = {
-                "plate": plate,
-                "camera_id": event.camera_id,
-                "event_time": event_time,
-                "snapshot_path": event.snapshot_path,
-                "vehicle": vehicle,
-                "vehicle_type": vehicle_type,
-            }
-            logger.info(f"[UC1] ANPR entry pending CAM-03 confirmation: plate={plate}")
+            if _consume_pre_confirmation():
+                # CAM-03 already fired before this ANPR arrived — write immediately.
+                log_entry = EntryExitLog(
+                    plate_number=plate,
+                    vehicle_id=vehicle.id if vehicle else None,
+                    vehicle_type=vehicle_type,
+                    gate="entry",
+                    camera_id=event.camera_id,
+                    event_time=event_time,
+                    snapshot_path=event.snapshot_path,
+                    created_at=facility_now_naive(),
+                )
+                db.add(log_entry)
+                parking_session_service.open_session(
+                    db,
+                    plate_number=plate,
+                    event_time=event_time,
+                    camera_id=event.camera_id,
+                    snapshot_path=event.snapshot_path,
+                    vehicle=vehicle,
+                )
+                logger.info(f"[UC1] Entry CONFIRMED immediately (CAM-03 pre-confirmed): plate={plate}")
+            else:
+                # No pre-confirmation — defer DB write; CAM-03 will call confirm_pending_entry()
+                _cleanup_pending()
+                _pending_entries[plate] = {
+                    "plate": plate,
+                    "camera_id": event.camera_id,
+                    "event_time": event_time,
+                    "snapshot_path": event.snapshot_path,
+                    "vehicle": vehicle,
+                    "vehicle_type": vehicle_type,
+                }
+                logger.info(f"[UC1] ANPR entry pending CAM-03 confirmation: plate={plate}")
         else:
-            # Immediate write (USE_CAM03_ENTRY_CONFIRMATION=False, the default)
+            # Immediate write (USE_CAM03_ENTRY_CONFIRMATION=False)
             log_entry = EntryExitLog(
                 plate_number=plate,
                 vehicle_id=vehicle.id if vehicle else None,
