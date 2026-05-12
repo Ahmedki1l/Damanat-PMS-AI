@@ -15,6 +15,8 @@ from app.services.entry_exit_service import (
     _pending_entries,
     _cam03_pre_confirmations,
     CAM03_PRE_CONFIRM_TTL_SECONDS,
+    PENDING_ENTRY_TTL_SECONDS,
+    _cleanup_pending,
 )
 from app.services.event_parser import ParsedCameraEvent
 from app.config import facility_now_naive
@@ -78,6 +80,17 @@ class TestEntryExitService:
     def setup_method(self):
         _pending_entries.clear()
         _cam03_pre_confirmations.clear()
+        # Stub out the vehicle-repo lookup so it never touches the mock DB session.
+        # All tests treat the plate as "new" (None → vehicle_newly_created=True) by
+        # default; override per-test where needed.
+        self._vr_patch = patch(
+            "app.repositories.vehicle_repository.vehicle_repo.get_by_plate",
+            return_value=None,
+        )
+        self._vr_patch.start()
+
+    def teardown_method(self):
+        self._vr_patch.stop()
 
     # ── UC1: Two-phase disabled — immediate write ──────────────────────────
 
@@ -290,3 +303,54 @@ class TestEntryExitService:
         assert log.parking_duration is None
         assert log.matched_entry_id is None
         mock_close.assert_called_once()
+
+    # ── Ghost vehicle cleanup on TTL expiry ───────────────────────────────
+
+    def test_ghost_vehicle_deleted_on_expiry(self):
+        """When CAM-03 never confirms within PENDING_ENTRY_TTL_SECONDS,
+        _cleanup_pending should delete the freshly-created unregistered vehicle row."""
+        from app.models.vehicle import Vehicle as VehicleModel
+
+        expired_time = facility_now_naive() - timedelta(seconds=PENDING_ENTRY_TTL_SECONDS + 1)
+        _pending_entries["ABC-1234"] = {
+            "plate": "ABC-1234",
+            "camera_id": "CAM-ENTRY",
+            "event_time": expired_time,
+            "snapshot_path": None,
+            "vehicle_id": 42,
+            "vehicle_type": "unknown",
+            "is_employee": False,
+            "vehicle_newly_created": True,
+        }
+
+        db = make_db()
+
+        _cleanup_pending(db)
+
+        db.query.assert_called_with(VehicleModel)
+        q = db.query.return_value
+        q.filter.assert_called_once()
+        q.filter.return_value.delete.assert_called_once_with(synchronize_session=False)
+        assert "ABC-1234" not in _pending_entries
+
+    def test_no_ghost_deletion_for_existing_vehicle(self):
+        """When the plate already existed before the ANPR event (vehicle_newly_created=False),
+        _cleanup_pending must NOT delete the vehicles row."""
+        expired_time = facility_now_naive() - timedelta(seconds=PENDING_ENTRY_TTL_SECONDS + 1)
+        _pending_entries["XYZ-9999"] = {
+            "plate": "XYZ-9999",
+            "camera_id": "CAM-ENTRY",
+            "event_time": expired_time,
+            "snapshot_path": None,
+            "vehicle_id": 99,
+            "vehicle_type": "unknown",
+            "is_employee": False,
+            "vehicle_newly_created": False,
+        }
+
+        db = make_db()
+
+        _cleanup_pending(db)
+
+        db.query.assert_not_called()
+        assert "XYZ-9999" not in _pending_entries
