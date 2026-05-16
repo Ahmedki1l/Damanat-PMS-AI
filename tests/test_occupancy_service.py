@@ -154,29 +154,56 @@ class TestOccupancyService:
         assert get_count(db, settings.B1_PARKING_ZONE) == 0
 
     @pytest.mark.asyncio
-    async def test_alert_triggered_at_capacity(self, db):
-        """UC3: Alert fires when occupancy reaches or exceeds 100% capacity."""
+    async def test_alert_not_triggered_at_exact_capacity(self, db):
+        """UC3: At exactly 100% occupancy (=full) the alert does NOT fire.
+        `capacity_exceeded` is reserved for strict overflow (>100%) — full is
+        a normal operating state, not an exception."""
         seed_zones(db, total=9, b1=9, b2=0, capacity=10)
 
-        with patch("app.services.occupancy_service.create_alert", new_callable=AsyncMock) as mock_alert:
+        with patch("app.services.occupancy_service.create_alert", new_callable=AsyncMock) as mock_alert, \
+             patch("app.services.occupancy_service._real_capacity_state",
+                   new_callable=AsyncMock, return_value=(10, 10)):
             await handle_occupancy_event(make_event("1", "CAM-03"), db)
         db.commit()
 
-        # Alert should fire for both GARAGE-TOTAL and B1 (both hit 10/10 = 100%)
+        # Real-source check says 10 parked / 10 slots = full but not exceeded.
+        mock_alert.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_alert_triggered_when_exceeded(self, db):
+        """UC3: Alert fires when real parked vehicles strictly exceed slots."""
+        seed_zones(db, total=10, b1=10, b2=0, capacity=10)
+
+        with patch("app.services.occupancy_service.create_alert", new_callable=AsyncMock) as mock_alert, \
+             patch("app.services.occupancy_service._real_capacity_state",
+                   new_callable=AsyncMock, return_value=(10, 11)):
+            await handle_occupancy_event(make_event("1", "CAM-03"), db)
+        db.commit()
+
         assert mock_alert.call_count >= 1
-        # Verify at least one call has the right alert type
         alert_types = [
             call.kwargs.get("alert_type", call.args[1] if len(call.args) > 1 else None)
             for call in mock_alert.call_args_list
         ]
         assert "capacity_exceeded" in alert_types
+        # Description should carry the real numbers, not line-crossing.
+        descriptions = [
+            call.kwargs.get("description", "")
+            for call in mock_alert.call_args_list
+            if call.kwargs.get("alert_type") == "capacity_exceeded"
+        ]
+        assert any("11 parked / 10 slots" in d for d in descriptions), (
+            f"description should include real counts; got {descriptions!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_alert_not_triggered_below_threshold(self, db):
-        """No alert should be sent if occupancy is below 100%."""
+        """No alert when real occupancy is comfortably below capacity."""
         seed_zones(db, total=5, b1=5, b2=0, capacity=10)
 
-        with patch("app.services.occupancy_service.create_alert", new_callable=AsyncMock) as mock_alert:
+        with patch("app.services.occupancy_service.create_alert", new_callable=AsyncMock) as mock_alert, \
+             patch("app.services.occupancy_service._real_capacity_state",
+                   new_callable=AsyncMock, return_value=(10, 5)):
             await handle_occupancy_event(make_event("1", "CAM-03"), db)
         db.commit()
 
