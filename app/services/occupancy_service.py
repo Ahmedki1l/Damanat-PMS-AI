@@ -1,8 +1,10 @@
 # app/services/occupancy_service.py
 from datetime import datetime, UTC
-from sqlalchemy import update, func, case
+from typing import Optional
+from sqlalchemy import update, func, case, text
 from sqlalchemy.orm import Session
 from app.models.zone_occupancy import ZoneOccupancy
+from app.models.parking_session import ParkingSession
 from app.services.event_parser import ParsedCameraEvent
 from app.services.alert_service import create_alert
 from app.config import settings, facility_now_naive
@@ -23,6 +25,50 @@ CACHE_TTL_SECONDS = settings.EVENT_STREAM_SUPPRESS_SECONDS
 # repeatedly while a zone stays full. Key: zone_id, Value: last alert timestamp.
 _capacity_alert_cache: dict[str, float] = {}
 CAPACITY_ALERT_COOLDOWN = settings.CAPACITY_ALERT_COOLDOWN_SECONDS
+
+
+async def _real_capacity_state(db: Session, zone_id: str, floor: Optional[str]) -> tuple[int, int]:
+    """Return `(real_max_capacity, real_occupancy)` for a zone, sourced from
+    the same tables the gateway dashboard reads — so the alert text agrees
+    with what operators see on the cards.
+
+    `real_max_capacity` counts `parking_slots` rows (monitored + unmonitored)
+    excluding violation-zone slots — the true floor size, not the line-crossing
+    aggregate which can drift.
+
+    `real_occupancy` is the count of open `parking_sessions` rows — physical
+    cars in the garage right now (not the line-crossing tick count).
+
+    Scope:
+      - `GARAGE_TOTAL_ZONE` or unknown floor → garage-wide counts.
+      - per-floor zone with a configured `floor` → floor-scoped counts.
+
+    Defensive: the `parking_slots` table isn't owned by PMS-AI's Alembic
+    migrations (the gateway provisions it via `sql/bootstrap.sql`), so on
+    test rigs or fresh deployments where the table doesn't exist yet, the
+    query 500s. We catch + return (0, occ) so the trigger short-circuits
+    (no alert) rather than aborting the whole occupancy update.
+    """
+    try:
+        if zone_id == settings.GARAGE_TOTAL_ZONE or not floor:
+            real_max = db.execute(
+                text("SELECT COUNT(*) FROM parking_slots WHERE is_violation_zone = 0")
+            ).scalar() or 0
+        else:
+            real_max = db.execute(
+                text("SELECT COUNT(*) FROM parking_slots WHERE floor = :f AND is_violation_zone = 0"),
+                {"f": floor},
+            ).scalar() or 0
+    except Exception as e:
+        logger.debug(f"[UC3] parking_slots unavailable for {zone_id}: {e}; treating real_max as 0")
+        real_max = 0
+
+    sessions_q = db.query(func.count(ParkingSession.id)).filter(ParkingSession.status == "open")
+    if zone_id != settings.GARAGE_TOTAL_ZONE and floor:
+        sessions_q = sessions_q.filter(ParkingSession.floor == floor)
+    real_occupancy = sessions_q.scalar() or 0
+
+    return int(real_max), int(real_occupancy)
 
 
 async def push_db_update(db: Session, zone_id: str, delta: int):
@@ -86,17 +132,25 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
     # The atomic func.max() in push_db_update now handles this.
 
     zone.last_updated = facility_now_naive()
-    occupancy_ratio = (zone.current_count / zone.max_capacity) if zone.max_capacity > 0 else 0
-    pct = int(occupancy_ratio * 100)
+    line_pct = int((zone.current_count / zone.max_capacity) * 100) if zone.max_capacity > 0 else 0
+    logger.info(f"[UC3] {zone_id} Updated via Push: {zone.current_count}/{zone.max_capacity} ({line_pct}% line-crossing)")
 
-    logger.info(f"[UC3] {zone_id} Updated via Push: {zone.current_count}/{zone.max_capacity} ({pct}%)")
-
-    if occupancy_ratio >= 1:
+    # Capacity-exceeded alert — sourced from the true state (parking_slots +
+    # open parking_sessions), not the line-crossing aggregate. The aggregate
+    # is just the wake-up tick.
+    #
+    # Trigger: strict exceed. At occupancy == capacity ("full") no alert
+    # fires. An alert means there are MORE cars than slots — surplus the
+    # garage can't actually hold.
+    real_max, real_occupancy = await _real_capacity_state(db, zone_id, zone.floor)
+    if real_max > 0 and real_occupancy > real_max:
+        real_pct = int((real_occupancy / real_max) * 100)
         now_ts = facility_now_naive().timestamp()
         cooldown_key = (camera_id, zone_id)
         last_alert_ts = _capacity_alert_cache.get(cooldown_key, 0)
         if now_ts - last_alert_ts >= CAPACITY_ALERT_COOLDOWN:
             _capacity_alert_cache[cooldown_key] = now_ts
+            scope = "Garage" if zone_id == settings.GARAGE_TOTAL_ZONE else f"Floor {zone.floor or zone_id}"
             await create_alert(
                 db,
                 alert_type="capacity_exceeded",
@@ -104,7 +158,10 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
                 zone_id=zone_id,
                 zone_name=zone.zone_name,
                 event_type="occupancy_update",
-                description=f"Zone {zone_id} is nearly full: {pct}% ({zone.current_count}/{zone.max_capacity})",
+                description=(
+                    f"{scope} capacity exceeded: {real_pct}% "
+                    f"({real_occupancy} parked / {real_max} slots)"
+                ),
                 snapshot_path=snapshot_path,
             )
         else:
