@@ -21,11 +21,12 @@ logger = get_logger(__name__)
 
 
 def _default_title(vehicle_type: str) -> str:
-    if vehicle_type.lower() == "employee":
-        return "Employee"
-    if vehicle_type.lower() == "visitor":
-        return "Visitor"
-    return "Vehicle"
+    # ``title`` is a person's salutation (Mr./Mrs./Dr.) entered by the
+    # operator on the registration form, not a classification label.
+    # Auto-filling it from ``vehicle_type`` was overwriting real titles
+    # with "Vehicle"/"Employee"/"Visitor" on every gate event; leave the
+    # column blank when no human-entered value is supplied.
+    return ""
 
 
 def _default_is_employee(vehicle_type: str) -> bool:
@@ -100,7 +101,7 @@ def ensure_unregistered_vehicle(db: Session, plate_number: str) -> Vehicle:
     vehicle = Vehicle(
         plate_number=plate_number,
         owner_name="Unknown",
-        title="Vehicle",
+        title="",
         vehicle_type="unknown",
         employee_id=None,
         is_employee=False,
