@@ -336,11 +336,12 @@ def _normalize_plate(raw: str) -> Optional[str]:
     separators, spacing, or case silently creates duplicate sessions / vehicle
     rows (the "registered twice" bug).
 
-    Canonical form: upper-cased, with a SINGLE ``-`` between the digit-run and
-    the letter-run, and the camera's original order PRESERVED — Saudi plates are
-    reported both ways and we keep what the camera sent ("1198-SHR" stays
-    digits-letters, "SHR-1198" stays letters-digits). So "9444HUD", "9444 HUD",
-    and "9444-HUD" all canonicalize to "9444-HUD".
+    Canonical form: upper-cased LETTERS-DIGITS with a SINGLE ``-`` between the
+    letter-run and the digit-run, regardless of the order the camera reported.
+    The DB convention is letters-first ("HUD-9444"); the frontend flips it to
+    digits-first ("9444-HUD") for display. Storing one consistent order is what
+    fixes the "registered twice" duplicates, so "9444HUD", "9444 HUD",
+    "9444-HUD", "HUD9444", and "HUD-9444" ALL canonicalize to "HUD-9444".
 
     Returns None for reads that are not plausibly a plate:
       - explicit failure tokens (N/A / NONE / NULL / UNKNOWN / empty)
@@ -381,13 +382,13 @@ def _normalize_plate(raw: str) -> Optional[str]:
         logger.debug(f"[ANPR] Rejected implausible plate: {raw!r}")
         return None
 
-    # Single dash between the two runs, preserving the reported order.
+    # Canonical LETTERS-DIGITS, regardless of the order the camera reported.
     m = re.match(r"^(\d+)([A-Z]+)$", core)   # digits then letters — e.g. "9444HUD"
     if m:
-        return f"{m.group(1)}-{m.group(2)}"
+        return f"{m.group(2)}-{m.group(1)}"   # -> "HUD-9444"
     m = re.match(r"^([A-Z]+)(\d+)$", core)   # letters then digits — e.g. "HUD9444"
     if m:
-        return f"{m.group(1)}-{m.group(2)}"
+        return f"{m.group(1)}-{m.group(2)}"   # -> "HUD-9444"
 
     # Interleaved / multi-segment (e.g. "9H4U4D") isn't a real plate layout —
     # treat it as an OCR failure rather than storing a dash-less oddball.

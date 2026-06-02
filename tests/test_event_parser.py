@@ -157,20 +157,20 @@ class TestPlateNormalization:
     and malformed reads aren't stored as fake plates."""
 
     @pytest.mark.parametrize("raw,expected", [
-        # Same physical plate, varied separators/case → ONE canonical form
-        # (this is what fixes the "registered twice" duplicate sessions).
-        ("9444HUD", "9444-HUD"),
-        ("9444 HUD", "9444-HUD"),
-        ("9444-HUD", "9444-HUD"),
-        ("  9444-hud ", "9444-HUD"),
-        # Letter-first reads keep their order.
+        # Same physical plate, any order/separator/case → ONE canonical
+        # LETTERS-DIGITS form (this is what fixes the "registered twice"
+        # duplicate sessions). The frontend flips it to digits-first for display.
+        ("9444HUD", "HUD-9444"),
+        ("9444 HUD", "HUD-9444"),
+        ("9444-HUD", "HUD-9444"),
+        ("  9444-hud ", "HUD-9444"),
         ("HUD9444", "HUD-9444"),
         ("HUD-9444", "HUD-9444"),
-        # Already-canonical reads pass through unchanged (incl. production
-        # digits-letters format and existing test plates).
+        # Already letters-first reads pass through unchanged.
         ("ABC-1234", "ABC-1234"),
-        ("4918-AVD", "4918-AVD"),
         ("TEST-001", "TEST-001"),
+        # Digits-first reads are reordered to the stored letters-first form.
+        ("4918-AVD", "AVD-4918"),
     ])
     def test_canonicalizes_consistently(self, raw, expected):
         from app.services.event_parser import _normalize_plate
@@ -194,6 +194,6 @@ class TestPlateNormalization:
         from app.services.event_parser import _normalize_plate
         # "HUD" + Arabic-Indic 9444 (U+0669 U+0664 U+0664 U+0664)
         assert _normalize_plate("HUD٩٤٤٤") == "HUD-9444"
-        # digits-first Arabic-Indic 1198 + "SHR"
-        assert _normalize_plate("١١٩٨SHR") == "1198-SHR"
+        # digits-first Arabic-Indic 1198 + "SHR" -> stored letters-first
+        assert _normalize_plate("١١٩٨SHR") == "SHR-1198"
 
