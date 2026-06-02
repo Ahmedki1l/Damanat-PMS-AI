@@ -150,3 +150,39 @@ class TestJSONEventParsing:
         assert event.event_type == "AccessControllerEvent"
         assert event.plate_number == "TEST-001"
 
+
+class TestPlateNormalization:
+    """`_normalize_plate` canonicalizes reads + rejects OCR garbage so the same
+    physical plate always yields one string (dedup/matching rely on equality)
+    and malformed reads aren't stored as fake plates."""
+
+    @pytest.mark.parametrize("raw,expected", [
+        # Same physical plate, varied separators/case → ONE canonical form
+        # (this is what fixes the "registered twice" duplicate sessions).
+        ("9444HUD", "9444-HUD"),
+        ("9444 HUD", "9444-HUD"),
+        ("9444-HUD", "9444-HUD"),
+        ("  9444-hud ", "9444-HUD"),
+        # Letter-first reads keep their order.
+        ("HUD9444", "HUD-9444"),
+        ("HUD-9444", "HUD-9444"),
+        # Already-canonical reads pass through unchanged (incl. production
+        # digits-letters format and existing test plates).
+        ("ABC-1234", "ABC-1234"),
+        ("4918-AVD", "4918-AVD"),
+        ("TEST-001", "TEST-001"),
+    ])
+    def test_canonicalizes_consistently(self, raw, expected):
+        from app.services.event_parser import _normalize_plate
+        assert _normalize_plate(raw) == expected
+
+    @pytest.mark.parametrize("raw", [
+        "6466466",   # all-digit OCR misread
+        "1211",      # all-digit OCR misread
+        "HUDABC",    # all-letter (no digit)
+        "UNKNOWN", "N/A", "NONE", "NULL", "", "  ",
+    ])
+    def test_rejects_implausible_reads(self, raw):
+        from app.services.event_parser import _normalize_plate
+        assert _normalize_plate(raw) is None
+

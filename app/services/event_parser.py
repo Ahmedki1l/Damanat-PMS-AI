@@ -327,53 +327,56 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
     )
 
 
-def _normalize_plate(raw: str) -> str:
+def _normalize_plate(raw: str) -> Optional[str]:
     """
-    Normalize Saudi plate format from camera output to display format.
-    Examples: "9444HUD" → "HUD-9444",  "7800ERD" → "ERD-7800"
-    Returns None for unknown/partial/invalid plates.
+    Canonicalize an ANPR plate read so the SAME physical plate always yields the
+    SAME string. Entry/exit dedup, open-session matching, and vehicle lookup all
+    compare ``plate_number`` by exact string equality, so any drift in
+    separators, spacing, or case silently creates duplicate sessions / vehicle
+    rows (the "registered twice" bug).
+
+    Canonical form: upper-cased, with a SINGLE ``-`` between the digit-run and
+    the letter-run, and the camera's original order PRESERVED — Saudi plates are
+    reported both ways and we keep what the camera sent ("1198-SHR" stays
+    digits-letters, "SHR-1198" stays letters-digits). So "9444HUD", "9444 HUD",
+    and "9444-HUD" all canonicalize to "9444-HUD".
+
+    Returns None for reads that are not plausibly a plate:
+      - explicit failure tokens (N/A / NONE / NULL / UNKNOWN / empty)
+      - reads missing EITHER a letter or a digit — a real plate always has both,
+        so OCR garbage like "6466466" or "1211" is rejected rather than stored
+        (storing it is what produced the "plate mismatch" records on the
+        dashboard, where the saved number didn't match the snapshot).
     """
     if not raw:
         return None
     raw = raw.strip().upper()
 
-    # Camera explicitly couldn't read the plate
-    if raw in ("N/A", "NONE", "NULL", ""):
-        return None
-        
-    # If the plate is EXACTLY "UNKNOWN", it means the camera failed.
-    # But if it is "UNKNOWN-X", it's a valid test plate.
-    if raw == "UNKNOWN":
+    # Camera explicitly couldn't read the plate (and a bare "UNKNOWN" sentinel).
+    if raw in ("N/A", "NONE", "NULL", "", "UNKNOWN"):
         return None
 
-    # Already normalised (e.g. "HUD-9444") — validate full format 3 letters + 4 digits
-    if "-" in raw:
-        # 1. Strict match for official International format (e.g., ABC-1234)
-        m = re.match(r"^([A-Z]{2,3})-(\d{3,4})$", raw)
-        if m:
-            return raw
-        # 2. Allow test plates with dashes (e.g., TEST-OK, UNKNOWN-X)
-        if len(raw) >= 3:
-            return raw
+    # Plate "core" = letters and digits only (drop dashes, spaces, dots, …).
+    core = re.sub(r"[^A-Z0-9]", "", raw)
+    has_alpha = any(c.isalpha() for c in core)
+    has_digit = any(c.isdigit() for c in core)
+
+    # Reject OCR misreads: a valid plate has BOTH letters and digits.
+    if not core or not (has_alpha and has_digit):
+        logger.debug(f"[ANPR] Rejected implausible plate (needs letters+digits): {raw!r}")
         return None
 
-    # Saudi format: 1-4 digits then 2-3 letters  e.g. "9444HUD", "7HDU"
-    m = re.match(r"^(\d{1,4})([A-Z]{2,3})$", raw)
+    # Single dash between the two runs, preserving the reported order.
+    m = re.match(r"^(\d+)([A-Z]+)$", core)   # digits then letters — e.g. "9444HUD"
     if m:
-        return f"{m.group(2)}-{m.group(1)}"
-
-    # Letters then digits  e.g. "HUD9444", "HDU7"
-    m = re.match(r"^([A-Z]{2,3})(\d{1,4})$", raw)
+        return f"{m.group(1)}-{m.group(2)}"
+    m = re.match(r"^([A-Z]+)(\d+)$", core)   # letters then digits — e.g. "HUD9444"
     if m:
         return f"{m.group(1)}-{m.group(2)}"
 
-    # If no specific pattern matches, return as is (lenient for testing/non-Saudi plates)
-    if len(raw) >= 3:
-        return raw
-
-    # Partial or unrecognized — reject
-    logger.debug(f"[ANPR] Rejected too short/invalid plate: {raw!r}")
-    return None
+    # Interleaved / multi-segment (rare) — can't split cleanly; return the
+    # cleaned core so the value is still deterministic across reads.
+    return core
 
 
 def _parse_json_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
