@@ -150,3 +150,36 @@ class TestJSONEventParsing:
         assert event.event_type == "AccessControllerEvent"
         assert event.plate_number == "TEST-001"
 
+
+class TestPlateNormalization:
+    """`_normalize_plate` stores plates exactly as before (the frontend handles
+    digit/letter display order) and only adds the bug-5 rule: a plausible plate
+    must contain BOTH a letter and a digit, so OCR garbage isn't stored."""
+
+    @pytest.mark.parametrize("raw,expected", [
+        # No-separator reads get a dash inserted, as they always have.
+        ("9444HUD", "HUD-9444"),
+        ("HUD9444", "HUD-9444"),
+        # Dashed reads are kept AS STORED — order is not changed.
+        ("HUD-9444", "HUD-9444"),
+        ("9444-HUD", "9444-HUD"),
+        ("4918-AVD", "4918-AVD"),
+        ("ABC-1234", "ABC-1234"),
+        ("TEST-001", "TEST-001"),
+        # Case is normalized to upper.
+        ("  9444-hud ", "9444-HUD"),
+    ])
+    def test_stores_plates_unchanged(self, raw, expected):
+        from app.services.event_parser import _normalize_plate
+        assert _normalize_plate(raw) == expected
+
+    @pytest.mark.parametrize("raw", [
+        "6466466",   # all-digit OCR misread
+        "1211",      # all-digit OCR misread
+        "HUDABC",    # all-letter (no digit)
+        "UNKNOWN", "N/A", "NONE", "NULL", "", "  ",
+    ])
+    def test_rejects_implausible_reads(self, raw):
+        from app.services.event_parser import _normalize_plate
+        assert _normalize_plate(raw) is None
+

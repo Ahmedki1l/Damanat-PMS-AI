@@ -327,11 +327,18 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
     )
 
 
-def _normalize_plate(raw: str) -> str:
+def _normalize_plate(raw: str) -> Optional[str]:
     """
     Normalize Saudi plate format from camera output to display format.
     Examples: "9444HUD" → "HUD-9444",  "7800ERD" → "ERD-7800"
     Returns None for unknown/partial/invalid plates.
+
+    Plates are stored exactly as they always have been — this function does NOT
+    change the stored format (the frontend handles digit/letter display order).
+    The only added rule (bug 5) is that a plausible plate must contain BOTH a
+    letter and a digit; pure OCR garbage like "6466466" or "1211" is rejected
+    instead of being stored as a fake plate (which is what made saved numbers
+    not match their snapshot on the dashboard).
     """
     if not raw:
         return None
@@ -340,10 +347,18 @@ def _normalize_plate(raw: str) -> str:
     # Camera explicitly couldn't read the plate
     if raw in ("N/A", "NONE", "NULL", ""):
         return None
-        
+
     # If the plate is EXACTLY "UNKNOWN", it means the camera failed.
     # But if it is "UNKNOWN-X", it's a valid test plate.
     if raw == "UNKNOWN":
+        return None
+
+    # Bug 5: a real plate has BOTH letters and digits. Reject reads missing
+    # either (all-digit "6466466"/"1211", all-letter strings) so OCR garbage
+    # isn't stored. str.isdigit() is Unicode-aware, so Arabic-Indic numerals
+    # still count as digits. Storage of accepted plates is otherwise unchanged.
+    if not (any(c.isalpha() for c in raw) and any(c.isdigit() for c in raw)):
+        logger.debug(f"[ANPR] Rejected implausible plate (needs letters+digits): {raw!r}")
         return None
 
     # Already normalised (e.g. "HUD-9444") — validate full format 3 letters + 4 digits
@@ -352,7 +367,7 @@ def _normalize_plate(raw: str) -> str:
         m = re.match(r"^([A-Z]{2,3})-(\d{3,4})$", raw)
         if m:
             return raw
-        # 2. Allow test plates with dashes (e.g., TEST-OK, UNKNOWN-X)
+        # 2. Keep any other dashed read as-is (e.g. "9444-HUD", "TEST-001")
         if len(raw) >= 3:
             return raw
         return None
