@@ -152,48 +152,34 @@ class TestJSONEventParsing:
 
 
 class TestPlateNormalization:
-    """`_normalize_plate` canonicalizes reads + rejects OCR garbage so the same
-    physical plate always yields one string (dedup/matching rely on equality)
-    and malformed reads aren't stored as fake plates."""
+    """`_normalize_plate` stores plates exactly as before (the frontend handles
+    digit/letter display order) and only adds the bug-5 rule: a plausible plate
+    must contain BOTH a letter and a digit, so OCR garbage isn't stored."""
 
     @pytest.mark.parametrize("raw,expected", [
-        # Same physical plate, any order/separator/case → ONE canonical
-        # LETTERS-DIGITS form (this is what fixes the "registered twice"
-        # duplicate sessions). The frontend flips it to digits-first for display.
+        # No-separator reads get a dash inserted, as they always have.
         ("9444HUD", "HUD-9444"),
-        ("9444 HUD", "HUD-9444"),
-        ("9444-HUD", "HUD-9444"),
-        ("  9444-hud ", "HUD-9444"),
         ("HUD9444", "HUD-9444"),
+        # Dashed reads are kept AS STORED — order is not changed.
         ("HUD-9444", "HUD-9444"),
-        # Already letters-first reads pass through unchanged.
+        ("9444-HUD", "9444-HUD"),
+        ("4918-AVD", "4918-AVD"),
         ("ABC-1234", "ABC-1234"),
         ("TEST-001", "TEST-001"),
-        # Digits-first reads are reordered to the stored letters-first form.
-        ("4918-AVD", "AVD-4918"),
+        # Case is normalized to upper.
+        ("  9444-hud ", "9444-HUD"),
     ])
-    def test_canonicalizes_consistently(self, raw, expected):
+    def test_stores_plates_unchanged(self, raw, expected):
         from app.services.event_parser import _normalize_plate
         assert _normalize_plate(raw) == expected
 
     @pytest.mark.parametrize("raw", [
-        "6466466",     # all-digit OCR misread
-        "1211",        # all-digit OCR misread
-        "HUDABC",      # all-letter (no digit)
-        "99999999HUD", # concatenated / overlong misread
-        "9H4U4D",      # interleaved layout — not a real plate
+        "6466466",   # all-digit OCR misread
+        "1211",      # all-digit OCR misread
+        "HUDABC",    # all-letter (no digit)
         "UNKNOWN", "N/A", "NONE", "NULL", "", "  ",
     ])
     def test_rejects_implausible_reads(self, raw):
         from app.services.event_parser import _normalize_plate
         assert _normalize_plate(raw) is None
-
-    def test_arabic_indic_digits_folded_not_rejected(self):
-        """Digits the camera reports in Arabic-Indic numerals must fold to ASCII
-        and be accepted, not stripped to letters-only and rejected."""
-        from app.services.event_parser import _normalize_plate
-        # "HUD" + Arabic-Indic 9444 (U+0669 U+0664 U+0664 U+0664)
-        assert _normalize_plate("HUD٩٤٤٤") == "HUD-9444"
-        # digits-first Arabic-Indic 1198 + "SHR" -> stored letters-first
-        assert _normalize_plate("١١٩٨SHR") == "SHR-1198"
 

@@ -8,7 +8,6 @@ Handles multipart/form-data for image extraction.
 import json
 import os
 import re
-import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, UTC
@@ -330,69 +329,65 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
 
 def _normalize_plate(raw: str) -> Optional[str]:
     """
-    Canonicalize an ANPR plate read so the SAME physical plate always yields the
-    SAME string. Entry/exit dedup, open-session matching, and vehicle lookup all
-    compare ``plate_number`` by exact string equality, so any drift in
-    separators, spacing, or case silently creates duplicate sessions / vehicle
-    rows (the "registered twice" bug).
+    Normalize Saudi plate format from camera output to display format.
+    Examples: "9444HUD" → "HUD-9444",  "7800ERD" → "ERD-7800"
+    Returns None for unknown/partial/invalid plates.
 
-    Canonical form: upper-cased LETTERS-DIGITS with a SINGLE ``-`` between the
-    letter-run and the digit-run, regardless of the order the camera reported.
-    The DB convention is letters-first ("HUD-9444"); the frontend flips it to
-    digits-first ("9444-HUD") for display. Storing one consistent order is what
-    fixes the "registered twice" duplicates, so "9444HUD", "9444 HUD",
-    "9444-HUD", "HUD9444", and "HUD-9444" ALL canonicalize to "HUD-9444".
-
-    Returns None for reads that are not plausibly a plate:
-      - explicit failure tokens (N/A / NONE / NULL / UNKNOWN / empty)
-      - reads missing EITHER a letter or a digit — a real plate always has both,
-        so OCR garbage like "6466466" or "1211" is rejected rather than stored
-        (storing it is what produced the "plate mismatch" records on the
-        dashboard, where the saved number didn't match the snapshot).
-      - reads with an implausible length, or interleaved layouts that aren't a
-        single digit-run + letter-run — also OCR failures.
+    Plates are stored exactly as they always have been — this function does NOT
+    change the stored format (the frontend handles digit/letter display order).
+    The only added rule (bug 5) is that a plausible plate must contain BOTH a
+    letter and a digit; pure OCR garbage like "6466466" or "1211" is rejected
+    instead of being stored as a fake plate (which is what made saved numbers
+    not match their snapshot on the dashboard).
     """
     if not raw:
         return None
     raw = raw.strip().upper()
 
-    # Camera explicitly couldn't read the plate (and a bare "UNKNOWN" sentinel).
-    if raw in ("N/A", "NONE", "NULL", "", "UNKNOWN"):
+    # Camera explicitly couldn't read the plate
+    if raw in ("N/A", "NONE", "NULL", ""):
         return None
 
-    # Fold non-ASCII Unicode digits (e.g. Arabic-Indic ٠-٩, U+0660–0669) to ASCII
-    # BEFORE the [^A-Z0-9] cleanup — otherwise a plate whose digits the camera
-    # reported in Arabic-Indic numerals would be stripped to letters-only and
-    # wrongly rejected. (Python's str.isdigit() already treats them as digits.)
-    raw = "".join(
-        str(unicodedata.digit(c)) if (not c.isascii() and c.isdigit()) else c
-        for c in raw
-    )
-
-    # Plate "core" = letters and digits only (drop dashes, spaces, dots, …).
-    core = re.sub(r"[^A-Z0-9]", "", raw)
-    has_alpha = any(c.isalpha() for c in core)
-    has_digit = any(c.isdigit() for c in core)
-
-    # Reject OCR misreads: a real plate has BOTH letters and digits and a sane
-    # length (Saudi plates are ~5–7 alphanumerics; cap at 8 for slack). This
-    # drops all-digit garbage ("6466466", "1211") and concatenated misreads
-    # ("99999999HUD") rather than storing them as fake plates.
-    if not (3 <= len(core) <= 8) or not (has_alpha and has_digit):
-        logger.debug(f"[ANPR] Rejected implausible plate: {raw!r}")
+    # If the plate is EXACTLY "UNKNOWN", it means the camera failed.
+    # But if it is "UNKNOWN-X", it's a valid test plate.
+    if raw == "UNKNOWN":
         return None
 
-    # Canonical LETTERS-DIGITS, regardless of the order the camera reported.
-    m = re.match(r"^(\d+)([A-Z]+)$", core)   # digits then letters — e.g. "9444HUD"
-    if m:
-        return f"{m.group(2)}-{m.group(1)}"   # -> "HUD-9444"
-    m = re.match(r"^([A-Z]+)(\d+)$", core)   # letters then digits — e.g. "HUD9444"
-    if m:
-        return f"{m.group(1)}-{m.group(2)}"   # -> "HUD-9444"
+    # Bug 5: a real plate has BOTH letters and digits. Reject reads missing
+    # either (all-digit "6466466"/"1211", all-letter strings) so OCR garbage
+    # isn't stored. str.isdigit() is Unicode-aware, so Arabic-Indic numerals
+    # still count as digits. Storage of accepted plates is otherwise unchanged.
+    if not (any(c.isalpha() for c in raw) and any(c.isdigit() for c in raw)):
+        logger.debug(f"[ANPR] Rejected implausible plate (needs letters+digits): {raw!r}")
+        return None
 
-    # Interleaved / multi-segment (e.g. "9H4U4D") isn't a real plate layout —
-    # treat it as an OCR failure rather than storing a dash-less oddball.
-    logger.debug(f"[ANPR] Rejected non-plate layout: {raw!r}")
+    # Already normalised (e.g. "HUD-9444") — validate full format 3 letters + 4 digits
+    if "-" in raw:
+        # 1. Strict match for official International format (e.g., ABC-1234)
+        m = re.match(r"^([A-Z]{2,3})-(\d{3,4})$", raw)
+        if m:
+            return raw
+        # 2. Keep any other dashed read as-is (e.g. "9444-HUD", "TEST-001")
+        if len(raw) >= 3:
+            return raw
+        return None
+
+    # Saudi format: 1-4 digits then 2-3 letters  e.g. "9444HUD", "7HDU"
+    m = re.match(r"^(\d{1,4})([A-Z]{2,3})$", raw)
+    if m:
+        return f"{m.group(2)}-{m.group(1)}"
+
+    # Letters then digits  e.g. "HUD9444", "HDU7"
+    m = re.match(r"^([A-Z]{2,3})(\d{1,4})$", raw)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+
+    # If no specific pattern matches, return as is (lenient for testing/non-Saudi plates)
+    if len(raw) >= 3:
+        return raw
+
+    # Partial or unrecognized — reject
+    logger.debug(f"[ANPR] Rejected too short/invalid plate: {raw!r}")
     return None
 
 
