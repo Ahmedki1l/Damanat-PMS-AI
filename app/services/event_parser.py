@@ -8,6 +8,7 @@ Handles multipart/form-data for image extraction.
 import json
 import os
 import re
+import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, UTC
@@ -347,6 +348,8 @@ def _normalize_plate(raw: str) -> Optional[str]:
         so OCR garbage like "6466466" or "1211" is rejected rather than stored
         (storing it is what produced the "plate mismatch" records on the
         dashboard, where the saved number didn't match the snapshot).
+      - reads with an implausible length, or interleaved layouts that aren't a
+        single digit-run + letter-run — also OCR failures.
     """
     if not raw:
         return None
@@ -356,14 +359,26 @@ def _normalize_plate(raw: str) -> Optional[str]:
     if raw in ("N/A", "NONE", "NULL", "", "UNKNOWN"):
         return None
 
+    # Fold non-ASCII Unicode digits (e.g. Arabic-Indic ٠-٩, U+0660–0669) to ASCII
+    # BEFORE the [^A-Z0-9] cleanup — otherwise a plate whose digits the camera
+    # reported in Arabic-Indic numerals would be stripped to letters-only and
+    # wrongly rejected. (Python's str.isdigit() already treats them as digits.)
+    raw = "".join(
+        str(unicodedata.digit(c)) if (not c.isascii() and c.isdigit()) else c
+        for c in raw
+    )
+
     # Plate "core" = letters and digits only (drop dashes, spaces, dots, …).
     core = re.sub(r"[^A-Z0-9]", "", raw)
     has_alpha = any(c.isalpha() for c in core)
     has_digit = any(c.isdigit() for c in core)
 
-    # Reject OCR misreads: a valid plate has BOTH letters and digits.
-    if not core or not (has_alpha and has_digit):
-        logger.debug(f"[ANPR] Rejected implausible plate (needs letters+digits): {raw!r}")
+    # Reject OCR misreads: a real plate has BOTH letters and digits and a sane
+    # length (Saudi plates are ~5–7 alphanumerics; cap at 8 for slack). This
+    # drops all-digit garbage ("6466466", "1211") and concatenated misreads
+    # ("99999999HUD") rather than storing them as fake plates.
+    if not (3 <= len(core) <= 8) or not (has_alpha and has_digit):
+        logger.debug(f"[ANPR] Rejected implausible plate: {raw!r}")
         return None
 
     # Single dash between the two runs, preserving the reported order.
@@ -374,9 +389,10 @@ def _normalize_plate(raw: str) -> Optional[str]:
     if m:
         return f"{m.group(1)}-{m.group(2)}"
 
-    # Interleaved / multi-segment (rare) — can't split cleanly; return the
-    # cleaned core so the value is still deterministic across reads.
-    return core
+    # Interleaved / multi-segment (e.g. "9H4U4D") isn't a real plate layout —
+    # treat it as an OCR failure rather than storing a dash-less oddball.
+    logger.debug(f"[ANPR] Rejected non-plate layout: {raw!r}")
+    return None
 
 
 def _parse_json_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:

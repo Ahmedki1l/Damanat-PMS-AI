@@ -177,12 +177,23 @@ class TestPlateNormalization:
         assert _normalize_plate(raw) == expected
 
     @pytest.mark.parametrize("raw", [
-        "6466466",   # all-digit OCR misread
-        "1211",      # all-digit OCR misread
-        "HUDABC",    # all-letter (no digit)
+        "6466466",     # all-digit OCR misread
+        "1211",        # all-digit OCR misread
+        "HUDABC",      # all-letter (no digit)
+        "99999999HUD", # concatenated / overlong misread
+        "9H4U4D",      # interleaved layout — not a real plate
         "UNKNOWN", "N/A", "NONE", "NULL", "", "  ",
     ])
     def test_rejects_implausible_reads(self, raw):
         from app.services.event_parser import _normalize_plate
         assert _normalize_plate(raw) is None
+
+    def test_arabic_indic_digits_folded_not_rejected(self):
+        """Digits the camera reports in Arabic-Indic numerals must fold to ASCII
+        and be accepted, not stripped to letters-only and rejected."""
+        from app.services.event_parser import _normalize_plate
+        # "HUD" + Arabic-Indic 9444 (U+0669 U+0664 U+0664 U+0664)
+        assert _normalize_plate("HUD٩٤٤٤") == "HUD-9444"
+        # digits-first Arabic-Indic 1198 + "SHR"
+        assert _normalize_plate("١١٩٨SHR") == "1198-SHR"
 
