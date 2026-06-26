@@ -15,6 +15,7 @@ from app.services.entry_exit_service import (
     _pending_entries,
     _cam03_pre_confirmations,
     CAM03_PRE_CONFIRM_TTL_SECONDS,
+    CAM03_PMS_DIRECTION,
     PENDING_ENTRY_TTL_SECONDS,
     _cleanup_pending,
 )
@@ -180,6 +181,68 @@ class TestEntryExitService:
         mock_open.assert_called_once()
         assert len(_cam03_pre_confirmations) == 0  # token consumed
 
+    # ── CAM-03 confirmation snapshot forwarded to PMS (after the ANPR) ────
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.open_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_cam03_snapshot_forwarded_anpr_first(self, mock_vs, mock_open, mock_alert, mock_settings, mock_pms):
+        """ANPR-first ordering: CAM-03 confirms with its own snapshot → that image
+        is forwarded to the PMS API under the B-entry marker, after the gate image."""
+        configure_settings(mock_settings, two_phase=True)
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+        db = make_db()
+
+        await handle_anpr_event(make_anpr_event(), db)        # gate image forwarded here
+        await confirm_pending_entry(db, cam03_snapshot="detection_images/cam03.jpg")
+
+        # The last PMS call carries CAM-03's image under the B-entry marker
+        assert mock_pms.await_args.args == ("ABC-1234", CAM03_PMS_DIRECTION)
+        assert mock_pms.await_args.kwargs["image_path"] == "detection_images/cam03.jpg"
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.open_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_cam03_snapshot_forwarded_cam03_first(self, mock_vs, mock_open, mock_alert, mock_settings, mock_pms):
+        """CAM-03-first ordering: snapshot is stored in the pre-confirmation and
+        forwarded when the ANPR arrives — after the ANPR's own gate image."""
+        configure_settings(mock_settings, two_phase=True)
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+        db = make_db()
+
+        await confirm_pending_entry(db, cam03_snapshot="detection_images/cam03.jpg")
+        assert _cam03_pre_confirmations[0]["cam03_snapshot"] == "detection_images/cam03.jpg"
+
+        await handle_anpr_event(make_anpr_event(), db)        # gate image, then CAM-03 image
+
+        assert mock_pms.await_args.args == ("ABC-1234", CAM03_PMS_DIRECTION)
+        assert mock_pms.await_args.kwargs["image_path"] == "detection_images/cam03.jpg"
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.open_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_cam03_no_snapshot_no_extra_forward(self, mock_vs, mock_open, mock_alert, mock_settings, mock_pms):
+        """When CAM-03 has no snapshot, no B-entry forward is attempted."""
+        configure_settings(mock_settings, two_phase=True)
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+        db = make_db()
+
+        await handle_anpr_event(make_anpr_event(), db)
+        await confirm_pending_entry(db, cam03_snapshot=None)
+
+        # No PMS call ever used the B-entry marker
+        markers = [c.args[1] for c in mock_pms.await_args_list if len(c.args) > 1]
+        assert CAM03_PMS_DIRECTION not in markers
+
     # ── UC1: Expired pre-confirmation must not be consumed ────────────────
 
     @pytest.mark.asyncio
@@ -196,7 +259,7 @@ class TestEntryExitService:
 
         # Inject an already-expired token directly
         expired_ts = facility_now_naive() - timedelta(seconds=CAM03_PRE_CONFIRM_TTL_SECONDS + 1)
-        _cam03_pre_confirmations.append(expired_ts)
+        _cam03_pre_confirmations.append({"ts": expired_ts, "cam03_snapshot": None})
 
         await handle_anpr_event(make_anpr_event(), db)
 
