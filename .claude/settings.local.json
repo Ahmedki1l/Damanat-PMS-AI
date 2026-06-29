@@ -1,7 +1,23 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "PowerShell(node \"C:/Users/moham/.claude/plugins/cache/openai-codex/codex/1.0.4/scripts/codex-companion.mjs\" review \"\")",
+      "PowerShell(Get-Command *)",
+      "PowerShell(Get-ChildItem *)",
+      "Bash(where python *)",
+      "Bash(C:\\\\Users\\\\moham\\\\AppData\\\\Local\\\\Python\\\\bin\\\\python.exe -m pytest tests/ -v -k \"entry_exit or occupancy\")",
+      "PowerShell(& \"C:\\\\Users\\\\moham\\\\miniconda3\\\\python.exe\" -m pytest tests/ -v -k \"entry_exit or occupancy\" 2>&1 | Select-Object -Last 80)",
+      "PowerShell(& \"C:\\\\Users\\\\moham\\\\Desktop\\\\Damanat-PMS-AI\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest tests/ -v -k \"entry_exit or occupancy\" 2>&1 | Select-Object -Last 80)",
+      "PowerShell(& \"C:\\\\Users\\\\moham\\\\Desktop\\\\Damanat-PMS-AI\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest tests/test_entry_exit_service.py -v 2>&1 | Select-Object -Last 60)",
+      "PowerShell(& \"C:\\\\Users\\\\moham\\\\Desktop\\\\Damanat-PMS-AI\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest tests/test_entry_exit_service.py::TestEntryExitService::test_entry_event_creates_log -v 2>&1 | Select-Object -Last 40)",
+      "PowerShell(git stash *)",
+      "PowerShell(& \"C:\\\\Users\\\\moham\\\\Desktop\\\\Damanat-PMS-AI\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest tests/ -v -k \"entry_exit or occupancy\" 2>&1 | Select-Object -Last 40)",
+      "PowerShell(& \"C:\\\\Users\\\\moham\\\\Desktop\\\\Damanat-PMS-AI\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest tests/test_event_parser.py::TestXMLEventParsing::test_region_entrance_event -v 2>&1 | Select-Object -Last 30)",
+      "PowerShell(& \"C:\\\\Users\\\\moham\\\\Desktop\\\\Damanat-PMS-AI\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest tests/ -v 2>&1 | Select-Object -Last 30)",
+      "PowerShell(& \"C:\\\\Users\\\\moham\\\\Desktop\\\\Damanat-PMS-AI\\\\.venv\\\\Scripts\\\\python.exe\" -m pytest tests/ -v 2>&1 | Select-Object -Last 25)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
     ]
   }
 }

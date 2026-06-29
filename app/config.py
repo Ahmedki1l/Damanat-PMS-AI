@@ -11,6 +11,28 @@ from pydantic_settings import BaseSettings
 from typing import Optional, Dict, List, Any
 
 
+# Canonical gate assignments (entry/exit) for the internal floor-to-floor and
+# main entrance/exit cameras. Single source of truth shared by the .env
+# validator (_build_camera_dicts) and the DB loader (camera_loader.py) so both
+# code paths derive gates identically.
+GATE_RULES: dict[str, str] = {
+    "CAM-03": "entry",   # Main entrance internal
+    "CAM-08": "exit",    # Main exit internal
+    "CAM-09": "entry",   # To B2
+    "CAM-10": "exit",    # From B2
+    "CAM-ENTRY": "entry",
+    "CAM-EXIT": "exit",
+}
+
+
+def apply_gate_rules(cameras: dict) -> dict:
+    """Stamp the canonical entry/exit gate onto each known camera in-place."""
+    for cam_id, gate in GATE_RULES.items():
+        if cam_id in cameras:
+            cameras[cam_id]["gate"] = gate
+    return cameras
+
+
 class Settings(BaseSettings):
     # ── Database ──────────────────────────────────────────────────────────
     DATABASE_URL: str = "mssql://damanat:damanat@pms-mssql:1433"
@@ -66,6 +88,13 @@ class Settings(BaseSettings):
 
     # ── PMS Tracking API Integration ─────────────────────────────────────
     PMS_API_URL: str = ""           # e.g. "http://localhost:8000"; empty = disabled
+
+    # ── Camera credential decryption ─────────────────────────────────────
+    # Shared urlsafe-base64 Fernet key with the API Gateway. Used to decrypt
+    # cameras.password_encrypted when the inventory is loaded from the DB at
+    # startup (see app/services/camera_loader.py). Empty = DB passwords can't
+    # be decrypted and the loader falls back to the .env CAM_XX_PASSWORD values.
+    CAMERAS_ENCRYPTION_KEY: str = ""
 
     # ── Zone UUID mappings (from Node.js backend database) ────────────────
     # Camera ID → Zone UUID (used for alert zone_id in violation/intrusion/ANPR)
@@ -265,14 +294,7 @@ class Settings(BaseSettings):
             ip_map[self.CAM_EXIT_IP] = "CAM-EXIT"
 
         # Internal Floor-to-Floor and Main Entrance/Exit Internal Gates
-        if "CAM-03" in cameras:
-            cameras["CAM-03"]["gate"] = "entry"
-        if "CAM-08" in cameras:
-            cameras["CAM-08"]["gate"] = "exit"
-        if "CAM-09" in cameras:
-            cameras["CAM-09"]["gate"] = "entry"  # To B2
-        if "CAM-10" in cameras:
-            cameras["CAM-10"]["gate"] = "exit"   # From B2
+        apply_gate_rules(cameras)
 
         self.CAMERAS = cameras
         self.CAMERA_IP_MAP = ip_map

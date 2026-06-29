@@ -60,7 +60,7 @@ services:
     environment:
       DATABASE_URL: mssql://damanat:damanat@pms-mssql:1433
       DB_NAME: damanat_pms
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 2
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 1
 
 volumes:
   sql_data:

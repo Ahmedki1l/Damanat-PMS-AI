@@ -108,7 +108,7 @@ from app.database import SessionLocal
 async def startup():
     logger.info("🚀 Damanat Backend starting up...")
     try:
-        create_tables()     
+        create_tables()
         logger.info("✅ Database ready")
     except Exception as e:
         if "already an object named" in str(e):
@@ -116,7 +116,10 @@ async def startup():
         else:
             logger.error(f"❌ Database initialization failed: {e}")
 
-
+    # Load the camera inventory from the gateway-owned `cameras` table. Best
+    # effort: on any failure the .env-built inventory (config.py) stays in place.
+    from app.services.camera_loader import load_cameras_from_db
+    load_cameras_from_db()
 
     logger.info(f"📡 Cameras configured: {list(settings.CAMERAS.keys())}")
     logger.info(
