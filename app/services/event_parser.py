@@ -49,6 +49,10 @@ class ParsedCameraEvent:
     employee_id: Optional[str] = None
     gate: Optional[str] = None             # entry | exit (from settings mapping)
     crossing_direction: Optional[str] = None # A-to-B | B-to-A
+    # ANPR per-read burst fields (one car fires several reads as it approaches).
+    # picNum resets per vehicle; confidence is for audit / tie-break only.
+    plate_confidence: Optional[int] = None  # <confidenceLevel> 0-100
+    pic_num: Optional[int] = None           # <picNum> picture index within the burst
 
 
 
@@ -261,6 +265,8 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
 
     # ── ANPR XML extraction: try common Hikvision plate paths ──
     plate_number = None
+    plate_confidence = None
+    pic_num = None
     gate = None
     if event_type in ("ANPR", "vehicleMatchResult"):
         detection_target = "vehicle"
@@ -298,6 +304,18 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
         else:
             logger.debug(f"[ANPR] No plate found in XML for {event_type} from {camera_id}")
 
+        # Per-read burst fields: <confidenceLevel> (audit/tie-break) and <picNum>
+        # (resets to 1 per physical vehicle — the burst-grouping signal). Both are
+        # optional; a missing/non-numeric tag leaves the field None.
+        def _find_int(tag: str) -> Optional[int]:
+            val = find_text(tag)
+            try:
+                return int(val) if val is not None and str(val).strip() != "" else None
+            except (TypeError, ValueError):
+                return None
+        plate_confidence = _find_int("confidenceLevel")
+        pic_num = _find_int("picNum")
+
     crossing_direction = find_text("direction") or find_text("crossingDirection")
 
     # Diagnostic: log parsed linedetection fields so we can verify
@@ -324,6 +342,8 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
         event_description=find_text("eventDescription"),
         plate_number=plate_number,
         crossing_direction=crossing_direction,
+        plate_confidence=plate_confidence,
+        pic_num=pic_num,
     )
 
 
@@ -443,6 +463,22 @@ def _parse_json_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
     else:
         logger.debug(f"[ANPR] No plate found in JSON event from {camera_id}")
 
+    # Per-read burst fields (best-effort — JSON firmware may omit them).
+    def _json_int(*candidates) -> Optional[int]:
+        for c in candidates:
+            if c is None or str(c).strip() == "":
+                continue
+            try:
+                return int(c)
+            except (TypeError, ValueError):
+                continue
+        return None
+    plate_info = vmr.get("PlateInfo", {}) if isinstance(vmr, dict) else {}
+    plate_confidence = _json_int(
+        acs.get("confidenceLevel"), plate_info.get("confidenceLevel"),
+    )
+    pic_num = _json_int(acs.get("picNum"), plate_info.get("picNum"))
+
     return ParsedCameraEvent(
         camera_id=camera_id,
         device_serial=data.get("deviceSerial", data.get("deviceID", "unknown")),
@@ -458,4 +494,6 @@ def _parse_json_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
         person_name=acs.get("name"),
         employee_id=acs.get("employeeNoString"),
         gate=gate,
+        plate_confidence=plate_confidence,
+        pic_num=pic_num,
     )

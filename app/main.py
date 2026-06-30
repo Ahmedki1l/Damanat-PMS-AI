@@ -128,6 +128,42 @@ async def startup():
     )
     logger.info(f"🌐 Listening on http://{settings.BACKEND_IP}:{settings.BACKEND_PORT}")
 
+    # Background flusher for the ANPR entry-burst buffer. The CAM-23 ramp-top
+    # crossing CONFIRMS each car, but the correct plate read lands 1-3s after the
+    # crossing (recognition lag), so this task is what actually writes the entry:
+    # once the burst goes idle (the lagging correct read is in) AND it has been
+    # confirmed, it commits one entry on the winning plate and forwards it to the
+    # PMS. It also drops never-confirmed ghosts at the hard cap and reaps silent
+    # ramp crossings.
+    app.state.entry_burst_flusher = asyncio.create_task(_entry_burst_flusher_loop())
+    logger.info("🧹 Entry-burst flusher task started")
+
+
+async def _entry_burst_flusher_loop():
+    """Every ~0.5s flush any confirmed entry burst that has settled (idle window)
+    and reap silent ramp crossings. Uses its own DB session per tick."""
+    from app.services.entry_exit_service import flush_due_entry_bursts
+    while True:
+        try:
+            await asyncio.sleep(0.5)
+            db = SessionLocal()
+            try:
+                await flush_due_entry_bursts(db)
+            finally:
+                db.close()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[UC1] Entry-burst flusher tick failed: {e}", exc_info=True)
+
+
 @app.on_event("shutdown")
 async def shutdown():
     logger.info("🛑 Damanat Backend shutting down...")
+    task = getattr(app.state, "entry_burst_flusher", None)
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass

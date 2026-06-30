@@ -330,6 +330,31 @@ class Settings(BaseSettings):
     USE_EXIT_CONFIRM_WINDOW: bool = True
     USE_CAM03_ENTRY_CONFIRMATION: bool = True
 
+    # ── ANPR entry burst aggregation (UC1) ───────────────────────────────
+    # The entry ANPR camera fires several reads for one car as it approaches
+    # (each <picNum> with its own <licensePlate>/<confidenceLevel>). The early
+    # read is often wrong; a later read is correct. We buffer the burst and
+    # write ONE entry labeled by the LAST read, committed after a short debounce
+    # window (idle gap after the final read) — never the first/wrong read.
+    ANPR_BURST_WINDOW_SECONDS: float = 2.5   # idle gap after last read → flush
+    ANPR_BURST_MAX_SECONDS: float = 8.0      # hard cap on a buffer's lifetime
+    # Ramp line-crossing cameras whose crossing confirms "one car physically
+    # entered" — used as the entry confirmation + per-car burst boundary, and to
+    # detect silent entries (a crossing with no plate read). CAM-23 is the new
+    # ramp cam (line-crossing only, no ANPR); CAM-03 is the in-garage backstop.
+    ENTRY_CONFIRM_CAMERAS: str = "CAM-23,CAM-03"
+    # CAM-23 line id + direction meaning "into the garage" (set from real events,
+    # like OCCUPANCY_ENTRANCE_ZONES). Empty = accept any CAM-23 line-crossing.
+    CAM23_ENTRY_LINE: str = ""
+    CAM23_ENTRY_DIRECTION: str = ""
+    # Per-confirmation-camera PMS `direction` marker, so the PMS can tell the
+    # ramp-top (CAM-23) and in-garage (CAM-03) images apart. "source:direction"
+    # pairs; unlisted sources fall back to "B-entry".
+    ENTRY_CONFIRM_DIRECTIONS: str = "CAM-23:ramp-entry,CAM-03:B-entry"
+    # How long after an entry is written a late confirmation crossing (CAM-03,
+    # deep in the garage) may still attach its image to that entry.
+    ENTRY_CONFIRM_MATCH_SECONDS: float = 30.0
+
     # ── Anti-bounce on entry events (UC1) ────────────────────────────────
     # Suppress an entry-camera ANPR firing if the same plate had an exit
     # within this many seconds — handles the case where the entry camera
