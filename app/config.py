@@ -337,7 +337,11 @@ class Settings(BaseSettings):
     # write ONE entry labeled by the LAST read, committed after a short debounce
     # window (idle gap after the final read) — never the first/wrong read.
     ANPR_BURST_WINDOW_SECONDS: float = 2.5   # idle gap after last read → flush
-    ANPR_BURST_MAX_SECONDS: float = 8.0      # hard cap on a buffer's lifetime
+    # Hard cap on a buffer's lifetime = the max time from the FIRST plate read
+    # (CAM-ENTRY) within which the ramp crossing (CAM-23) must arrive to confirm
+    # the burst. Real-world read→crossing travel time is ~8s at this site, so 8s
+    # dropped valid entries by ~1s; 20s covers the travel gap plus a slow driver.
+    ANPR_BURST_MAX_SECONDS: float = 20.0     # hard cap on a buffer's lifetime
     # Ramp line-crossing cameras whose crossing confirms "one car physically
     # entered" — used as the entry confirmation + per-car burst boundary, and to
     # detect silent entries (a crossing with no plate read). CAM-23 is the new
