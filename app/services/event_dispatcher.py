@@ -124,6 +124,33 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
         elif is_gate:
              logger.debug(f"[UC3] Gate camera {event.camera_id} sent non-occupancy event: {event.event_type}")
 
+        # ── ENTRY RAMP CONFIRMATION ───────────────────────────────────────────
+        # A ramp line-crossing cam (default CAM-23 — line-crossing only, no ANPR)
+        # confirms one car physically entered → confirm the current ANPR burst
+        # (and flags a silent entry if no plate was read). The set is configurable
+        # via ENTRY_CONFIRM_CAMERAS; occupancy cameras in that set (e.g. CAM-03)
+        # are excluded here because they confirm via occupancy_service — routing
+        # them here too would double-confirm.
+        entry_confirm_cams = {c.strip() for c in settings.ENTRY_CONFIRM_CAMERAS.split(",") if c.strip()}
+        ramp_confirm_cams = entry_confirm_cams - {"CAM-03", "CAM-08", "CAM-09", "CAM-10"}
+        if event.camera_id in ramp_confirm_cams and event.event_type == "linedetection":
+            want_line = settings.CAM23_ENTRY_LINE.strip()
+            want_dir = settings.CAM23_ENTRY_DIRECTION.strip()
+            line_ok = (not want_line) or (str(event.region_id or "") == want_line)
+            dir_ok = (not want_dir) or (str(event.crossing_direction or "") == want_dir)
+            if line_ok and dir_ok:
+                from app.services.entry_exit_service import confirm_entry_crossing
+                await confirm_entry_crossing(
+                    db,
+                    snapshot=event.local_snapshot_path or event.snapshot_path,
+                    source_cam=event.camera_id,
+                )
+            else:
+                logger.debug(
+                    f"[UC1] {event.camera_id} linedetection ignored (line={event.region_id!r} "
+                    f"dir={event.crossing_direction!r}; want line={want_line!r} dir={want_dir!r})"
+                )
+
         # ── PHASE 2 ───────────────────────────────────────────────────────────
         # UC1 + UC2 + UC4: ANPR gate events (JSON=AccessControllerEvent, XML=ANPR).
         # `vehicleMatchResult` is suppressed at the top of this function — only

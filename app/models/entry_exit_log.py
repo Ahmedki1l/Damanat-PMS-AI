@@ -20,6 +20,7 @@ class EntryExitLog(Base):
     camera_id = Column(String(50), nullable=False)
     event_time = Column(DateTime, nullable=False, index=True)
     parking_duration = Column(Integer)        # seconds (set on exit)
+    plate_confidence = Column(Integer, nullable=True)  # winning ANPR read confidence (audit/tuning)
     snapshot_path = Column(Text, nullable=True)  # CDN URL (Spaces) or local path
     matched_entry_id = Column(Integer, ForeignKey("entry_exit_log.id", ondelete="NO ACTION"))
     is_test = Column(Boolean, default=False, nullable=False)  # True for simulated/test events

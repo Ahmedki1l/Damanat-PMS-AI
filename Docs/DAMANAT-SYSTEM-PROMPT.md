@@ -2358,7 +2358,7 @@ services:
       - ./.env:/app/.env
     environment:
       DATABASE_URL: postgresql://damanat:damanat@db:5432/damanat_db
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 2
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 1
 
 volumes:
   db_data:
@@ -2386,7 +2386,7 @@ RUN mkdir -p logs
 
 EXPOSE 8080
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "2"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
 ```
 
 ---

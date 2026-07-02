@@ -17,6 +17,9 @@ pydantic==2.12.5
 pydantic-settings==2.13.1
 python-dotenv==1.2.1
 
+# Credential decryption (shared Fernet key with the API Gateway)
+cryptography==44.0.0
+
 # XML / HTTP
 lxml==6.0.2
 requests==2.32.5

@@ -11,6 +11,28 @@ from pydantic_settings import BaseSettings
 from typing import Optional, Dict, List, Any
 
 
+# Canonical gate assignments (entry/exit) for the internal floor-to-floor and
+# main entrance/exit cameras. Single source of truth shared by the .env
+# validator (_build_camera_dicts) and the DB loader (camera_loader.py) so both
+# code paths derive gates identically.
+GATE_RULES: dict[str, str] = {
+    "CAM-03": "entry",   # Main entrance internal
+    "CAM-08": "exit",    # Main exit internal
+    "CAM-09": "entry",   # To B2
+    "CAM-10": "exit",    # From B2
+    "CAM-ENTRY": "entry",
+    "CAM-EXIT": "exit",
+}
+
+
+def apply_gate_rules(cameras: dict) -> dict:
+    """Stamp the canonical entry/exit gate onto each known camera in-place."""
+    for cam_id, gate in GATE_RULES.items():
+        if cam_id in cameras:
+            cameras[cam_id]["gate"] = gate
+    return cameras
+
+
 class Settings(BaseSettings):
     # ── Database ──────────────────────────────────────────────────────────
     DATABASE_URL: str = "mssql://damanat:damanat@pms-mssql:1433"
@@ -66,6 +88,13 @@ class Settings(BaseSettings):
 
     # ── PMS Tracking API Integration ─────────────────────────────────────
     PMS_API_URL: str = ""           # e.g. "http://localhost:8000"; empty = disabled
+
+    # ── Camera credential decryption ─────────────────────────────────────
+    # Shared urlsafe-base64 Fernet key with the API Gateway. Used to decrypt
+    # cameras.password_encrypted when the inventory is loaded from the DB at
+    # startup (see app/services/camera_loader.py). Empty = DB passwords can't
+    # be decrypted and the loader falls back to the .env CAM_XX_PASSWORD values.
+    CAMERAS_ENCRYPTION_KEY: str = ""
 
     # ── Zone UUID mappings (from Node.js backend database) ────────────────
     # Camera ID → Zone UUID (used for alert zone_id in violation/intrusion/ANPR)
@@ -265,14 +294,7 @@ class Settings(BaseSettings):
             ip_map[self.CAM_EXIT_IP] = "CAM-EXIT"
 
         # Internal Floor-to-Floor and Main Entrance/Exit Internal Gates
-        if "CAM-03" in cameras:
-            cameras["CAM-03"]["gate"] = "entry"
-        if "CAM-08" in cameras:
-            cameras["CAM-08"]["gate"] = "exit"
-        if "CAM-09" in cameras:
-            cameras["CAM-09"]["gate"] = "entry"  # To B2
-        if "CAM-10" in cameras:
-            cameras["CAM-10"]["gate"] = "exit"   # From B2
+        apply_gate_rules(cameras)
 
         self.CAMERAS = cameras
         self.CAMERA_IP_MAP = ip_map
@@ -307,6 +329,35 @@ class Settings(BaseSettings):
     USE_EXIT_DIRECTION_VALIDATION: bool = True
     USE_EXIT_CONFIRM_WINDOW: bool = True
     USE_CAM03_ENTRY_CONFIRMATION: bool = True
+
+    # ── ANPR entry burst aggregation (UC1) ───────────────────────────────
+    # The entry ANPR camera fires several reads for one car as it approaches
+    # (each <picNum> with its own <licensePlate>/<confidenceLevel>). The early
+    # read is often wrong; a later read is correct. We buffer the burst and
+    # write ONE entry labeled by the LAST read, committed after a short debounce
+    # window (idle gap after the final read) — never the first/wrong read.
+    ANPR_BURST_WINDOW_SECONDS: float = 2.5   # idle gap after last read → flush
+    # Hard cap on a buffer's lifetime = the max time from the FIRST plate read
+    # (CAM-ENTRY) within which the ramp crossing (CAM-23) must arrive to confirm
+    # the burst. Real-world read→crossing travel time is ~8s at this site, so 8s
+    # dropped valid entries by ~1s; 20s covers the travel gap plus a slow driver.
+    ANPR_BURST_MAX_SECONDS: float = 20.0     # hard cap on a buffer's lifetime
+    # Ramp line-crossing cameras whose crossing confirms "one car physically
+    # entered" — used as the entry confirmation + per-car burst boundary, and to
+    # detect silent entries (a crossing with no plate read). CAM-23 is the new
+    # ramp cam (line-crossing only, no ANPR); CAM-03 is the in-garage backstop.
+    ENTRY_CONFIRM_CAMERAS: str = "CAM-23,CAM-03"
+    # CAM-23 line id + direction meaning "into the garage" (set from real events,
+    # like OCCUPANCY_ENTRANCE_ZONES). Empty = accept any CAM-23 line-crossing.
+    CAM23_ENTRY_LINE: str = ""
+    CAM23_ENTRY_DIRECTION: str = ""
+    # Per-confirmation-camera PMS `direction` marker, so the PMS can tell the
+    # ramp-top (CAM-23) and in-garage (CAM-03) images apart. "source:direction"
+    # pairs; unlisted sources fall back to "B-entry".
+    ENTRY_CONFIRM_DIRECTIONS: str = "CAM-23:ramp-entry,CAM-03:B-entry"
+    # How long after an entry is written a late confirmation crossing (CAM-03,
+    # deep in the garage) may still attach its image to that entry.
+    ENTRY_CONFIRM_MATCH_SECONDS: float = 30.0
 
     # ── Anti-bounce on entry events (UC1) ────────────────────────────────
     # Suppress an entry-camera ANPR firing if the same plate had an exit
