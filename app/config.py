@@ -370,6 +370,17 @@ class Settings(BaseSettings):
     # entry_exit_service.py:73-103.
     ENTRY_ANTIBOUNCE_SECONDS: int = 30
 
+    # ── PMS/VA forward reliability (port 8000) ───────────────────────────
+    # notify_pms_anpr forwards ANPR identity images to the VA core backend. A
+    # single fire-and-forget POST silently loses the image whenever VA is
+    # momentarily unreachable, so on a transient failure the payload is spooled
+    # to disk and re-POSTed from a background task (every DRAIN_INTERVAL) until
+    # VA acks. The drain interval is the retry cadence — the live forward stays a
+    # single attempt so it never adds latency to the exit webhook / burst flusher.
+    PMS_FORWARD_SPOOL_DIR: str = "./pms_forward_spool"
+    PMS_FORWARD_DRAIN_INTERVAL_SECONDS: float = 15.0   # background re-POST cadence
+    PMS_FORWARD_SPOOL_MAX_AGE_SECONDS: float = 3600.0  # drop spooled payloads older than this
+
     # ── Snapshot fetch auth fallback ─────────────────────────────────────
     # Default empty = Digest only (Hikvision standard). Set to "basic" to
     # try Basic auth as a second pass when Digest gets 401/403. Used to

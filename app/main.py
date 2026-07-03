@@ -138,6 +138,26 @@ async def startup():
     app.state.entry_burst_flusher = asyncio.create_task(_entry_burst_flusher_loop())
     logger.info("🧹 Entry-burst flusher task started")
 
+    # Background drain for undelivered ANPR forwards to the VA backend. When VA
+    # is briefly unreachable, notify_pms_anpr spools the payload to disk instead
+    # of dropping it; this task re-POSTs the spool until VA acks.
+    app.state.pms_forward_drainer = asyncio.create_task(_pms_forward_drainer_loop())
+    logger.info("📤 PMS/VA forward-spool drainer task started")
+
+
+async def _pms_forward_drainer_loop():
+    """Periodically re-POST any spooled ANPR forwards to the VA backend so an
+    image is not lost when VA was down at forward time."""
+    from app.utils.core_backend_client import drain_pms_forward_spool
+    while True:
+        try:
+            await asyncio.sleep(float(settings.PMS_FORWARD_DRAIN_INTERVAL_SECONDS))
+            await drain_pms_forward_spool()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[PMS] Forward-spool drain tick failed: {e}", exc_info=True)
+
 
 async def _entry_burst_flusher_loop():
     """Every ~0.5s flush any confirmed entry burst that has settled (idle window)
@@ -160,10 +180,11 @@ async def _entry_burst_flusher_loop():
 @app.on_event("shutdown")
 async def shutdown():
     logger.info("🛑 Damanat Backend shutting down...")
-    task = getattr(app.state, "entry_burst_flusher", None)
-    if task is not None:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    for attr in ("entry_burst_flusher", "pms_forward_drainer"):
+        task = getattr(app.state, attr, None)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
