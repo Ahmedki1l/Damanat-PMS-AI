@@ -364,6 +364,13 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
         f"discarded={discarded}"
     )
 
+    # dedup / anti-bounce suppress only the PMS-side occupancy record (the
+    # EntryExitLog row, the open session, the alert). They must NOT suppress the
+    # forward of the identity image to VA (port 8000): VA has its own dedup and
+    # needs the image to (re)build the car's ReID identity + on-disk folder.
+    suppress_occupancy = False
+    suppress_reason = ""
+
     # Deduplication: same plate already logged as an entry in the last 30s.
     dedup_window = event_time - timedelta(seconds=30)
     recent = (
@@ -376,13 +383,17 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
         .first()
     )
     if recent:
-        logger.debug(f"[UC1] Duplicate entry suppressed for plate={plate}")
-        return
+        suppress_occupancy = True
+        suppress_reason = "duplicate"
+        logger.debug(
+            f"[UC1] Duplicate entry — occupancy suppressed for plate={plate} "
+            f"(VA still notified)"
+        )
 
     # Anti-bounce: an entry whose plate just exited within the window is the
     # entry camera catching a car driving away from the exit gate — suppress.
     antibounce_s = settings.ENTRY_ANTIBOUNCE_SECONDS
-    if antibounce_s > 0:
+    if not suppress_occupancy and antibounce_s > 0:
         recent_exit_window = event_time - timedelta(seconds=antibounce_s)
         recent_exit = (
             db.query(EntryExitLog)
@@ -396,19 +407,21 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
         )
         if recent_exit:
             gap_s = (event_time - recent_exit.event_time).total_seconds()
+            suppress_occupancy = True
+            suppress_reason = "anti-bounce"
             logger.info(
-                "[UC1] Anti-bounce: suppressed entry for plate=%s "
-                "(last exit %.1fs ago, window=%ds)",
+                "[UC1] Anti-bounce: occupancy suppressed for plate=%s "
+                "(last exit %.1fs ago, window=%ds) — VA still notified",
                 plate, gap_s, antibounce_s,
             )
-            return
 
     # Register this entry in the recent-entries cache BEFORE any network I/O, so a
     # CAM-03 crossing that fires during the forwards below (the normal ordering)
-    # can already attach its image. We're past dedup/anti-bounce here, so the entry
-    # is committed-to. sent_sources seeds with the snapshots collected so far, so a
-    # CAM-03 already in confirm_snapshots is not double-sent, while a CAM-03 that
-    # arrives mid-flush finds this entry instead of falling through to an older car.
+    # can already attach its image. Registered even when occupancy is suppressed,
+    # so a late CAM-03 B-entry still reaches VA (the primary ReID reference).
+    # sent_sources seeds with the snapshots collected so far, so a CAM-03 already
+    # in confirm_snapshots is not double-sent, while a CAM-03 that arrives
+    # mid-flush finds this entry instead of falling through to an older car.
     confirm_snapshots = buf.get("confirm_snapshots") or {}
     async with _bursts_lock:
         match_window = settings.ENTRY_CONFIRM_MATCH_SECONDS
@@ -432,35 +445,44 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
     except Exception as e:
         logger.warning(f"[UC1] PMS API forwarding failed for plate={plate}: {e}")
 
-    # UC4: resolve the vehicle for the WINNING plate only — so the only vehicles
-    # row this entry creates is for the final, correct plate.
-    vehicle = vehicle_service.ensure_unregistered_vehicle(db, plate)
-    vehicle_type = vehicle.vehicle_type if vehicle else "unknown"
+    # PMS occupancy record — the EntryExitLog row + open parking session. Skipped
+    # when dedup/anti-bounce suppressed this entry; VA was already notified above.
+    vehicle = None
+    if not suppress_occupancy:
+        # UC4: resolve the vehicle for the WINNING plate only — so the only
+        # vehicles row this entry creates is for the final, correct plate.
+        vehicle = vehicle_service.ensure_unregistered_vehicle(db, plate)
+        vehicle_type = vehicle.vehicle_type if vehicle else "unknown"
 
-    log_entry = EntryExitLog(
-        plate_number=plate,
-        vehicle_id=vehicle.id if vehicle else None,
-        vehicle_type=vehicle_type,
-        gate="entry",
-        camera_id=camera_id,
-        event_time=event_time,
-        snapshot_path=snapshot_path,
-        plate_confidence=confidence,
-        created_at=facility_now_naive(),
-    )
-    db.add(log_entry)
-    parking_session_service.open_session(
-        db,
-        plate_number=plate,
-        event_time=event_time,
-        camera_id=camera_id,
-        snapshot_path=snapshot_path,
-        vehicle=vehicle,
-    )
-    logger.info(
-        f"[UC1] Entry CONFIRMED (burst flush): plate={plate} "
-        f"source={buf.get('confirm_source') or 'idle/boundary'}"
-    )
+        log_entry = EntryExitLog(
+            plate_number=plate,
+            vehicle_id=vehicle.id if vehicle else None,
+            vehicle_type=vehicle_type,
+            gate="entry",
+            camera_id=camera_id,
+            event_time=event_time,
+            snapshot_path=snapshot_path,
+            plate_confidence=confidence,
+            created_at=facility_now_naive(),
+        )
+        db.add(log_entry)
+        parking_session_service.open_session(
+            db,
+            plate_number=plate,
+            event_time=event_time,
+            camera_id=camera_id,
+            snapshot_path=snapshot_path,
+            vehicle=vehicle,
+        )
+        logger.info(
+            f"[UC1] Entry CONFIRMED (burst flush): plate={plate} "
+            f"source={buf.get('confirm_source') or 'idle/boundary'}"
+        )
+    else:
+        logger.info(
+            f"[UC1] Entry occupancy suppressed ({suppress_reason}) for "
+            f"plate={plate}; VA identity image forwarded"
+        )
 
     # Forward every confirmation snapshot collected so far (CAM-23, and CAM-03 if
     # it already fired) — each under its own PMS direction marker, after the gate
@@ -470,8 +492,11 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
         if image:
             await _forward_confirm_snapshot(plate, src, image)
 
-    # UC4 alert/notification.
-    if vehicle and vehicle.is_registered:
+    # UC4 alert/notification — only when we actually recorded the entry above.
+    # A dedup/anti-bounce-suppressed entry must not raise a fresh gate alert.
+    if suppress_occupancy:
+        pass
+    elif vehicle and vehicle.is_registered:
         from app.services.alert_service import broadcast_event
         await broadcast_event(
             is_alert=False,
