@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "mssql://damanat:damanat@pms-mssql:1433"
     DB_NAME: str = "damanat_pms"
     DB_DRIVER: str = "ODBC Driver 18 for SQL Server"
+    # Max time a statement may wait on a lock before erroring out (SQL Server
+    # 1222). Bounded so a lock wait can never freeze the event loop; see the
+    # connect hook in database.py.
+    DB_LOCK_TIMEOUT_MS: int = 15000
 
     @property
     def db_url(self) -> str:

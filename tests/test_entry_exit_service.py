@@ -20,6 +20,7 @@ from app.services.entry_exit_service import (
     confirm_pending_entry,
     confirm_entry_crossing,
     flush_due_entry_bursts,
+    drain_background_forwards,
     _entry_bursts,
     _pending_crossings,
     _recent_entries,
@@ -372,6 +373,9 @@ class TestEntryExitService:
 
         mock_pms.reset_mock()
         await confirm_pending_entry(db, cam03_snapshot="garage.jpg")  # CAM-03 late
+        # The forward is detached from the caller's DB transaction (it runs as a
+        # background task), so wait for it before asserting.
+        await drain_background_forwards()
 
         mock_pms.assert_awaited_once()
         assert mock_pms.await_args.args == ("ABC-1234", "B-entry")
@@ -390,6 +394,44 @@ class TestEntryExitService:
         await confirm_pending_entry(db, cam03_snapshot="garage.jpg")
 
         mock_pms.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.open_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_entry_is_committed_before_any_network_forward(
+        self, mock_vs, mock_open, mock_alert, mock_settings, mock_pms
+    ):
+        """Regression (2026-07-12 freeze): the entry row + parking session must be
+        COMMITTED before the flush awaits any PMS forward.
+
+        Holding those write locks across a network await deadlocked the service:
+        the sync pyodbc driver runs on the event loop, so a concurrent handler
+        blocking on the uncommitted rows froze the loop that would have resumed
+        this coroutine to commit. Nothing could then read entry_exit_log."""
+        configure_settings(mock_settings, two_phase=True)
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+        db = make_db()
+
+        committed_before_forward = []
+
+        async def pms_side_effect(plate, direction, image_path=None):
+            committed_before_forward.append(db.commit.called)
+        mock_pms.side_effect = pms_side_effect
+
+        await handle_anpr_event(make_anpr_event(pic_num=1), db)
+        await confirm_entry_crossing(db, snapshot="ramp.jpg", source_cam="CAM-23")
+        _force_idle()
+        await flush_due_entry_bursts(db)
+        await drain_background_forwards()
+
+        assert committed_before_forward, "expected at least one PMS forward"
+        assert all(committed_before_forward), (
+            "a PMS forward was awaited while the entry write was still "
+            "uncommitted — this is the deadlock that froze the backend"
+        )
 
     @pytest.mark.asyncio
     @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
@@ -418,6 +460,7 @@ class TestEntryExitService:
         await confirm_entry_crossing(db, snapshot="ramp.jpg", source_cam="CAM-23")
         _force_idle()
         await flush_due_entry_bursts(db)
+        await drain_background_forwards()   # CAM-03's forward is detached from the txn
 
         by_direction = {c.args[1]: c.kwargs.get("image_path") for c in mock_pms.await_args_list}
         assert by_direction.get("B-entry") == "garage.jpg"   # CAM-03 attached mid-flush
