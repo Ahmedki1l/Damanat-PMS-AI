@@ -180,6 +180,8 @@ async def _entry_burst_flusher_loop():
 @app.on_event("shutdown")
 async def shutdown():
     logger.info("🛑 Damanat Backend shutting down...")
+    from app.services.entry_exit_service import drain_background_forwards
+    await drain_background_forwards()
     for attr in ("entry_burst_flusher", "pms_forward_drainer"):
         task = getattr(app.state, attr, None)
         if task is not None:

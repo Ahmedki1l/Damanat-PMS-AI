@@ -23,6 +23,23 @@ engine = create_engine(
     echo=False,                  # Set True to log all SQL queries (debug only)
 )
 
+if engine.dialect.name == "mssql":
+    from sqlalchemy import event as _event
+
+    @_event.listens_for(engine, "connect")
+    def _set_lock_timeout(dbapi_conn, _record):
+        """Never let a blocked query wait forever.
+
+        pyodbc is synchronous and runs on the asyncio event loop, so a query that
+        waits indefinitely on a lock does not just stall one request — it freezes
+        the entire service. Bounding the wait turns that permanent freeze into a
+        normal, logged error (SQL Server 1222) that the handler can roll back.
+        """
+        cur = dbapi_conn.cursor()
+        cur.execute(f"SET LOCK_TIMEOUT {settings.DB_LOCK_TIMEOUT_MS}")
+        cur.close()
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()

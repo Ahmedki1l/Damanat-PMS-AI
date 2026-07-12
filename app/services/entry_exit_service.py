@@ -70,6 +70,9 @@ CAM03_PMS_DIRECTION = "B-entry"
 # against ENTRY_CONFIRM_MATCH_SECONDS. Guarded by _bursts_lock.
 _recent_entries: list[dict] = []
 
+# Strong refs to in-flight detached PMS forwards (see _spawn_confirm_forward).
+_background_forwards: set[asyncio.Task] = set()
+
 
 def _confirm_direction(source_cam: str) -> str:
     """Map a confirmation camera id → its PMS `direction` marker, parsed from
@@ -248,7 +251,7 @@ async def confirm_entry_crossing(db: Session, snapshot: str | None = None,
                 )
 
     if to_forward is not None:
-        await _forward_confirm_snapshot(*to_forward)
+        _spawn_confirm_forward(*to_forward)
 
 
 def _claim_recent_entry_image(source_cam: str, snapshot: str | None, now) -> tuple | None:
@@ -436,17 +439,20 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
             "sent_sources": set(confirm_snapshots.keys()),
         })
 
-    # Forward the WINNING plate + its snapshot to the PMS tracking API (port
-    # 8000) — once, with the correct plate (never the wrong early read).
-    try:
-        await core_backend_client.notify_pms_anpr(
-            plate, "entry", image_path=local_snapshot or snapshot_path,
-        )
-    except Exception as e:
-        logger.warning(f"[UC1] PMS API forwarding failed for plate={plate}: {e}")
-
-    # PMS occupancy record — the EntryExitLog row + open parking session. Skipped
-    # when dedup/anti-bounce suppressed this entry; VA was already notified above.
+    # ── DB WRITES — must complete and COMMIT before any network await below.
+    #
+    # NEVER hold an uncommitted write across an `await` that does I/O. The DB
+    # driver (pyodbc) is SYNCHRONOUS and runs on the asyncio event loop, so:
+    # this coroutine writes entry_exit_log + parking_sessions (taking X locks),
+    # awaits a PMS forward, and yields the loop — then a concurrent camera-event
+    # handler runs occupancy_service's "count open parking sessions" query, which
+    # needs an S lock on the row we just wrote and BLOCKS THE EVENT LOOP ITSELF.
+    # The loop is what would have resumed us to commit, so the locks are never
+    # released and both sides wait forever. SQL Server cannot detect it (our
+    # session is idle, not waiting on SQL). This wedged the backend hard on
+    # 2026-07-12 (the PMS being down stretched the forward long enough to collide
+    # with the next event) and made entry_exit_log unreadable to every client.
+    # Keep every network await BELOW the commit.
     vehicle = None
     if not suppress_occupancy:
         # UC4: resolve the vehicle for the WINNING plate only — so the only
@@ -484,16 +490,11 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
             f"plate={plate}; VA identity image forwarded"
         )
 
-    # Forward every confirmation snapshot collected so far (CAM-23, and CAM-03 if
-    # it already fired) — each under its own PMS direction marker, after the gate
-    # image. (This entry was already recorded in _recent_entries above, before the
-    # network I/O, so a CAM-03 crossing arriving LATER can attach its image to it.)
-    for src, image in confirm_snapshots.items():
-        if image:
-            await _forward_confirm_snapshot(plate, src, image)
-
     # UC4 alert/notification — only when we actually recorded the entry above.
     # A dedup/anti-bounce-suppressed entry must not raise a fresh gate alert.
+    # Safe to run pre-commit: create_alert/broadcast_event only touch the DB and
+    # the in-process SSE bus (event_bus.publish → put_nowait) — no network I/O,
+    # so neither can suspend this coroutine while the write locks are held.
     if suppress_occupancy:
         pass
     elif vehicle and vehicle.is_registered:
@@ -522,6 +523,29 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
             snapshot_path=snapshot_path,
         )
 
+    # Release the write locks BEFORE any network I/O (see the note above). The
+    # caller commits again after all bursts; committing here too is harmless.
+    db.commit()
+
+    # ── NETWORK FORWARDS — no transaction is held from here on. ─────────────
+    # Gate image first (the WINNING plate — never the wrong early read), then
+    # every confirmation snapshot collected so far (CAM-23, and CAM-03 if it
+    # already fired), each under its own PMS direction marker. Forwarded even
+    # when occupancy was suppressed: VA has its own dedup and needs the image to
+    # (re)build the car's ReID identity. (This entry was already recorded in
+    # _recent_entries above, before the I/O, so a CAM-03 crossing arriving LATER
+    # can still attach its image to it.)
+    try:
+        await core_backend_client.notify_pms_anpr(
+            plate, "entry", image_path=local_snapshot or snapshot_path,
+        )
+    except Exception as e:
+        logger.warning(f"[UC1] PMS API forwarding failed for plate={plate}: {e}")
+
+    for src, image in confirm_snapshots.items():
+        if image:
+            await _forward_confirm_snapshot(plate, src, image)
+
 
 async def _raise_silent_entry_alert(db: Session, source_cam: str | None,
                                     snapshot: str | None) -> None:
@@ -539,6 +563,34 @@ async def _raise_silent_entry_alert(db: Session, source_cam: str | None,
         plate_number=None,
         snapshot_path=snapshot,
     )
+
+
+def _spawn_confirm_forward(plate: str, source_cam: str,
+                           snapshot: str | None) -> None:
+    """Detach a confirmation-image forward from the caller's DB transaction.
+
+    `confirm_entry_crossing` is called from the occupancy / line-crossing webhook
+    handlers, which are still inside the request's OPEN transaction (the router
+    commits after dispatch) and already hold write locks on zone_occupancy.
+    Awaiting the ~10s PMS forward there would hold those locks across an await
+    and can freeze the whole event loop — the same deadlock documented in
+    _flush_entry_burst. Run it as a background task instead so the caller commits
+    immediately. A strong reference is kept until it finishes, otherwise the task
+    can be garbage-collected mid-flight."""
+    task = asyncio.create_task(
+        _forward_confirm_snapshot(plate, source_cam, snapshot)
+    )
+    _background_forwards.add(task)
+    task.add_done_callback(_background_forwards.discard)
+
+
+async def drain_background_forwards() -> None:
+    """Wait for any detached confirmation forwards to finish.
+
+    Called on shutdown so a clean stop doesn't drop an in-flight image, and by
+    tests that need to observe the result of a detached forward."""
+    if _background_forwards:
+        await asyncio.gather(*list(_background_forwards), return_exceptions=True)
 
 
 async def _forward_confirm_snapshot(plate: str, source_cam: str,
