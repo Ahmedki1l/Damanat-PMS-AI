@@ -1,6 +1,8 @@
 # app/services/event_dispatcher.py
 """Routes events to correct use-case handlers — Phase 1 and Phase 2."""
 
+import time
+
 from app.services.event_parser import ParsedCameraEvent
 from app.services.occupancy_service import handle_occupancy_event
 from app.services.entry_exit_service import handle_anpr_event
@@ -12,6 +14,56 @@ from app.config import settings
 from sqlalchemy.orm import Session
 
 logger = get_logger(__name__)
+
+
+# ── ANPR gate-identity rescue ────────────────────────────────────────────────
+# The entry LPR fires a `vehicleMatchResult` (which resolves to the gate camera)
+# ~1-5s BEFORE the follow-on `ANPR`. On setups where every camera pushes through
+# a gateway/NAT, that follow-on ANPR can arrive with an unresolvable identity
+# (camera_id = "UNKNOWN-<gateway-ip>") because its body carries no mapped
+# ipAddress/deviceSerial — handle_anpr_event then drops it for "no gate", so no
+# entry is ever logged. We bridge the gap: remember the gate camera the paired
+# vehicleMatchResult resolved to, keyed by plate, and let the follow-on ANPR
+# inherit it. Bounded by ANPR_BURST_MAX_SECONDS so a stale hint can never
+# mislabel a later car. Per-process, like the entry burst buffer it feeds.
+_VMR_GATE_HINTS: dict[str, tuple[str, str, float]] = {}
+
+
+def _remember_vmr_gate(event: ParsedCameraEvent) -> None:
+    """Record plate → (camera_id, gate) when a vehicleMatchResult resolved to a
+    known gate camera, so a follow-on UNKNOWN ANPR can inherit the identity."""
+    gate = settings.CAMERAS.get(event.camera_id, {}).get("gate")
+    if gate not in ("entry", "exit") or not event.plate_number:
+        return
+    now = time.monotonic()
+    # Opportunistically prune expired hints so the dict stays bounded.
+    for plate in [p for p, (_, _, dl) in _VMR_GATE_HINTS.items() if dl <= now]:
+        _VMR_GATE_HINTS.pop(plate, None)
+    _VMR_GATE_HINTS[event.plate_number] = (
+        event.camera_id, gate, now + settings.ANPR_BURST_MAX_SECONDS,
+    )
+
+
+def _rescue_unknown_gate(event: ParsedCameraEvent) -> None:
+    """If an ANPR resolved to an UNKNOWN camera but a recent vehicleMatchResult
+    for the same plate resolved to a gate camera, adopt that identity so the
+    entry/exit isn't dropped. Only rescues UNKNOWN cameras — never overrides an
+    already-resolved one."""
+    if not event.plate_number or not str(event.camera_id).startswith("UNKNOWN"):
+        return
+    hint = _VMR_GATE_HINTS.get(event.plate_number)
+    if not hint:
+        return
+    camera_id, gate, deadline = hint
+    if time.monotonic() > deadline:
+        _VMR_GATE_HINTS.pop(event.plate_number, None)
+        return
+    logger.info(
+        "[dispatch] Rescued ANPR %s → %s (gate=%s) via recent vehicleMatchResult "
+        "for plate=%s", event.camera_id, camera_id, gate, event.plate_number,
+    )
+    event.camera_id = camera_id
+    event.gate = gate
 
 async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
     """
@@ -65,12 +117,21 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
         # don't process it here — see SNAPSHOT_EVENT_TYPES comment above. Just
         # log at DEBUG so we can confirm the camera fired it but we ignored it.
         if event.event_type == "vehicleMatchResult":
+            # Not processed here, but remember which gate camera it resolved to so
+            # the follow-on ANPR can inherit the identity if it arrives UNKNOWN.
+            _remember_vmr_gate(event)
             logger.debug(
                 "[dispatch] Skipping vehicleMatchResult from %s plate=%s — "
                 "follow-on ANPR event will carry the multipart image",
                 event.camera_id, event.plate_number,
             )
             return
+
+        # Rescue an ANPR whose identity didn't resolve (UNKNOWN-<gateway-ip>) by
+        # inheriting the gate from the paired vehicleMatchResult seen moments ago.
+        # Done before the gate/feed logic below so the whole flow sees the real id.
+        if event.event_type in ("ANPR", "AccessControllerEvent"):
+            _rescue_unknown_gate(event)
 
         is_gate = settings.CAMERAS.get(event.camera_id, {}).get("gate") in ("entry", "exit")
         is_occupancy_event = event.event_type == "linedetection"

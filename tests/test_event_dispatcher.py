@@ -9,8 +9,26 @@ import pytest
 from datetime import datetime, UTC
 from unittest.mock import MagicMock, AsyncMock, patch
 
+import app.services.event_dispatcher as dispatcher
 from app.services.event_dispatcher import dispatch_event
 from app.services.event_parser import ParsedCameraEvent
+
+
+def make_anpr_event(cam_id, plate, event_type="ANPR"):
+    return ParsedCameraEvent(
+        camera_id=cam_id,
+        device_serial="x",
+        channel_id=1,
+        event_type=event_type,
+        detection_target="vehicle",
+        region_id=None,
+        channel_name="lpr",
+        trigger_time=datetime.now(UTC),
+        raw_xml="{}",
+        snapshot_path="snap.jpg",          # set → skips the ISAPI snapshot fetch
+        local_snapshot_path="snap.jpg",
+        plate_number=plate,
+    )
 
 
 def make_line_event(cam_id, direction="forward", region_id="1"):
@@ -86,3 +104,69 @@ async def test_occupancy_confirm_cam_not_double_confirmed(mock_settings, mock_co
 
     mock_occ.assert_awaited_once()        # handled by the occupancy path
     mock_confirm.assert_not_awaited()     # not double-confirmed here
+
+
+def _configure_anpr(mock_settings, cameras):
+    mock_settings.CAMERAS = cameras
+    mock_settings.ANPR_BURST_MAX_SECONDS = 20.0
+    mock_settings.LOG_CAMERA_FILTER = ""
+    mock_settings.LOG_CAMERA_EXCLUDE = ""
+    mock_settings.ENTRY_CONFIRM_CAMERAS = ""
+
+
+@pytest.mark.asyncio
+@patch("app.services.event_dispatcher.handle_anpr_event", new_callable=AsyncMock)
+@patch("app.services.event_dispatcher.add_event_to_feed")
+@patch("app.services.event_dispatcher.settings")
+async def test_unknown_anpr_rescued_by_prior_vmr(mock_settings, mock_feed, mock_anpr):
+    """A vehicleMatchResult resolves the entry camera; the follow-on ANPR arrives
+    UNKNOWN (gateway NAT). The ANPR must inherit CAM-ENTRY so it isn't dropped."""
+    dispatcher._VMR_GATE_HINTS.clear()
+    _configure_anpr(mock_settings, {"CAM-ENTRY": {"gate": "entry"}})
+
+    # 1) entry LPR fires the imageless match result — resolves to CAM-ENTRY
+    await dispatch_event(make_anpr_event("CAM-ENTRY", "DJS-7842", "vehicleMatchResult"), MagicMock())
+    mock_anpr.assert_not_awaited()        # VMR itself is not processed
+
+    # 2) follow-on ANPR arrives with an unresolvable identity
+    await dispatch_event(make_anpr_event("UNKNOWN-10.1.20.60", "DJS-7842"), MagicMock())
+
+    mock_anpr.assert_awaited_once()
+    rescued = mock_anpr.await_args.args[0]
+    assert rescued.camera_id == "CAM-ENTRY"
+    assert rescued.gate == "entry"
+
+
+@pytest.mark.asyncio
+@patch("app.services.event_dispatcher.handle_anpr_event", new_callable=AsyncMock)
+@patch("app.services.event_dispatcher.add_event_to_feed")
+@patch("app.services.event_dispatcher.settings")
+async def test_unknown_anpr_without_vmr_not_rescued(mock_settings, mock_feed, mock_anpr):
+    """No prior vehicleMatchResult for the plate → the UNKNOWN ANPR is left as-is
+    (handle_anpr_event will drop it for 'no gate'), never misattributed."""
+    dispatcher._VMR_GATE_HINTS.clear()
+    _configure_anpr(mock_settings, {"CAM-ENTRY": {"gate": "entry"}})
+
+    await dispatch_event(make_anpr_event("UNKNOWN-10.1.20.60", "GHOST-0001"), MagicMock())
+
+    # still dispatched (handler decides), but identity untouched
+    rescued = mock_anpr.await_args.args[0]
+    assert rescued.camera_id == "UNKNOWN-10.1.20.60"
+    assert rescued.gate is None
+
+
+@pytest.mark.asyncio
+@patch("app.services.event_dispatcher.handle_anpr_event", new_callable=AsyncMock)
+@patch("app.services.event_dispatcher.add_event_to_feed")
+@patch("app.services.event_dispatcher.settings")
+async def test_resolved_anpr_not_overridden(mock_settings, mock_feed, mock_anpr):
+    """An ANPR that already resolved (CAM-EXIT) is never rewritten, even if a VMR
+    hint exists for the same plate."""
+    dispatcher._VMR_GATE_HINTS.clear()
+    _configure_anpr(mock_settings, {"CAM-ENTRY": {"gate": "entry"}, "CAM-EXIT": {"gate": "exit"}})
+
+    await dispatch_event(make_anpr_event("CAM-ENTRY", "SHR-5918", "vehicleMatchResult"), MagicMock())
+    await dispatch_event(make_anpr_event("CAM-EXIT", "SHR-5918"), MagicMock())
+
+    rescued = mock_anpr.await_args.args[0]
+    assert rescued.camera_id == "CAM-EXIT"    # untouched — was already resolved
