@@ -28,6 +28,36 @@ logger = get_logger(__name__)
 # mislabel a later car. Per-process, like the entry burst buffer it feeds.
 _VMR_GATE_HINTS: dict[str, tuple[str, str, float]] = {}
 
+# THE PLATE-KEYED HINT ABOVE CANNOT RESCUE A MISREAD — the one case that matters.
+# It is WRITTEN under the vehicleMatchResult's plate and READ under the follow-on
+# ANPR's plate, so it only ever hits when the two agree. When the raw OCR
+# misreads, the lookup misses and the event is dropped for "no gate".
+#
+# Measured on production logs 2026-07-12..20: 292 VMR->ANPR pairs; 290 agreed and
+# were rescued; the 2 that disagreed were both RGR-6466, and both were lost:
+#
+#   06:35:10  vehicleMatchResult  CAM-ENTRY           RGR-6466   <- opened the barrier
+#   06:35:12  ANPR                UNKNOWN-10.1.20.60  66466RA    <- raw OCR, wrong
+#   06:35:12  [Phase2] Dropped ANPR event - no gate assigned
+#
+# That car stopped being recorded on 2026-07-16 while it kept parking every day,
+# because the BARRIER acts on the match result and we acted on the raw OCR.
+#
+# So keep a second, plate-INDEPENDENT trail of recent match results. When the
+# plate lookup misses, pair FIFO — a single-lane gate is ordered and the ANPR
+# trails its own VMR by 1-5s — and adopt the match result's PLATE as well as its
+# gate: it is the identity the access controller accepted, and the better string
+# (95% well-formed vs the raw OCR on the same feed). Entries are consumed on use
+# so two ANPRs can never claim one crossing.
+_VMR_RECENT: list[tuple[str, str, str, float]] = []  # (plate, camera_id, gate, deadline)
+
+
+def _prune_vmr(now: float) -> None:
+    """Drop expired hints from both stores. Bounded by ANPR_BURST_MAX_SECONDS."""
+    for plate in [p for p, (_, _, dl) in _VMR_GATE_HINTS.items() if dl <= now]:
+        _VMR_GATE_HINTS.pop(plate, None)
+    _VMR_RECENT[:] = [h for h in _VMR_RECENT if h[3] > now]
+
 
 def _remember_vmr_gate(event: ParsedCameraEvent) -> None:
     """Record plate → (camera_id, gate) when a vehicleMatchResult resolved to a
@@ -36,34 +66,59 @@ def _remember_vmr_gate(event: ParsedCameraEvent) -> None:
     if gate not in ("entry", "exit") or not event.plate_number:
         return
     now = time.monotonic()
-    # Opportunistically prune expired hints so the dict stays bounded.
-    for plate in [p for p, (_, _, dl) in _VMR_GATE_HINTS.items() if dl <= now]:
-        _VMR_GATE_HINTS.pop(plate, None)
-    _VMR_GATE_HINTS[event.plate_number] = (
-        event.camera_id, gate, now + settings.ANPR_BURST_MAX_SECONDS,
-    )
+    # Opportunistically prune expired hints so the stores stay bounded.
+    _prune_vmr(now)
+    deadline = now + settings.ANPR_BURST_MAX_SECONDS
+    _VMR_GATE_HINTS[event.plate_number] = (event.camera_id, gate, deadline)
+    _VMR_RECENT.append((event.plate_number, event.camera_id, gate, deadline))
 
 
 def _rescue_unknown_gate(event: ParsedCameraEvent) -> None:
     """If an ANPR resolved to an UNKNOWN camera but a recent vehicleMatchResult
-    for the same plate resolved to a gate camera, adopt that identity so the
-    entry/exit isn't dropped. Only rescues UNKNOWN cameras — never overrides an
-    already-resolved one."""
-    if not event.plate_number or not str(event.camera_id).startswith("UNKNOWN"):
+    resolved to a gate camera, adopt that identity so the entry/exit isn't
+    dropped. Only rescues UNKNOWN cameras — never overrides an already-resolved
+    one.
+
+    Two paths, in order:
+
+      1. exact plate — the common case (290/292 in production), unchanged;
+      2. FIFO fallback on the plate-independent trail, reached only when path 1
+         missed. A miss means the OCR disagrees with the string the barrier
+         accepted, so this path also OVERRIDES the plate.
+    """
+    if not str(event.camera_id).startswith("UNKNOWN"):
         return
-    hint = _VMR_GATE_HINTS.get(event.plate_number)
-    if not hint:
+    now = time.monotonic()
+    _prune_vmr(now)
+
+    # ── 1. exact plate ───────────────────────────────────────────────────────
+    hint = _VMR_GATE_HINTS.get(event.plate_number) if event.plate_number else None
+    if hint:
+        camera_id, gate, _ = hint
+        logger.info(
+            "[dispatch] Rescued ANPR %s -> %s (gate=%s) via recent "
+            "vehicleMatchResult for plate=%s",
+            event.camera_id, camera_id, gate, event.plate_number,
+        )
+        event.camera_id = camera_id
+        event.gate = gate
+        _VMR_RECENT[:] = [h for h in _VMR_RECENT if h[0] != event.plate_number]
         return
-    camera_id, gate, deadline = hint
-    if time.monotonic() > deadline:
-        _VMR_GATE_HINTS.pop(event.plate_number, None)
+
+    # ── 2. FIFO fallback — the misread case ──────────────────────────────────
+    if not _VMR_RECENT:
         return
-    logger.info(
-        "[dispatch] Rescued ANPR %s → %s (gate=%s) via recent vehicleMatchResult "
-        "for plate=%s", event.camera_id, camera_id, gate, event.plate_number,
+    vmr_plate, camera_id, gate, _ = _VMR_RECENT.pop(0)
+    logger.warning(
+        "[dispatch] Rescued ANPR %s -> %s (gate=%s) by FIFO vehicleMatchResult "
+        "pairing; the ANPR read %r disagrees with the match result %r — adopting "
+        "the match result (it is what opened the barrier)",
+        event.camera_id, camera_id, gate, event.plate_number, vmr_plate,
     )
     event.camera_id = camera_id
     event.gate = gate
+    event.plate_number = vmr_plate
+    _VMR_GATE_HINTS.pop(vmr_plate, None)
 
 async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
     """
