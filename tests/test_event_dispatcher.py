@@ -170,3 +170,121 @@ async def test_resolved_anpr_not_overridden(mock_settings, mock_feed, mock_anpr)
 
     rescued = mock_anpr.await_args.args[0]
     assert rescued.camera_id == "CAM-EXIT"    # untouched — was already resolved
+
+
+# ── Misread rescue (the RGR-6466 outage, 2026-07-16..20) ────────────────────
+# Production logs showed 292 vehicleMatchResult->ANPR pairs. 290 agreed and were
+# rescued by the plate-keyed hint. The 2 that DISAGREED were both this car, and
+# both were dropped — because the hint is written under the match result's plate
+# and read under the ANPR's misread one, so it can never hit when it matters:
+#
+#   06:35:10  vehicleMatchResult  CAM-ENTRY           RGR-6466
+#   06:35:12  ANPR                UNKNOWN-10.1.20.60  66466RA
+#   06:35:12  [Phase2] Dropped ANPR event - no gate assigned
+#
+# The car kept parking daily with no entry recorded, which left VA with no open
+# session, which left slot B12 permanently unidentified.
+
+
+@pytest.mark.asyncio
+@patch("app.services.event_dispatcher.handle_anpr_event", new_callable=AsyncMock)
+@patch("app.services.event_dispatcher.add_event_to_feed")
+@patch("app.services.event_dispatcher.settings")
+async def test_misread_anpr_rescued_and_plate_corrected(mock_settings, mock_feed, mock_anpr):
+    """The exact 2026-07-20 06:35 sequence: the ANPR misreads, so the plate-keyed
+    hint misses. The event must still be rescued, and must carry the match
+    result's plate — that is the string the barrier accepted."""
+    dispatcher._VMR_GATE_HINTS.clear()
+    dispatcher._VMR_RECENT.clear()
+    _configure_anpr(mock_settings, {"CAM-ENTRY": {"gate": "entry"}})
+
+    await dispatch_event(make_anpr_event("CAM-ENTRY", "RGR-6466", "vehicleMatchResult"), MagicMock())
+    await dispatch_event(make_anpr_event("UNKNOWN-10.1.20.60", "66466RA"), MagicMock())
+
+    mock_anpr.assert_awaited_once()
+    rescued = mock_anpr.await_args.args[0]
+    assert rescued.camera_id == "CAM-ENTRY"      # no longer dropped for "no gate"
+    assert rescued.gate == "entry"
+    assert rescued.plate_number == "RGR-6466"    # the barrier's plate wins, not '66466RA'
+
+
+@pytest.mark.asyncio
+@patch("app.services.event_dispatcher.handle_anpr_event", new_callable=AsyncMock)
+@patch("app.services.event_dispatcher.add_event_to_feed")
+@patch("app.services.event_dispatcher.settings")
+async def test_misread_with_no_plate_at_all_is_rescued(mock_settings, mock_feed, mock_anpr):
+    """The 2026-07-16 06:31 variant of the same failure: the follow-on ANPR
+    carried plate=None. Previously it returned before even looking at the hint."""
+    dispatcher._VMR_GATE_HINTS.clear()
+    dispatcher._VMR_RECENT.clear()
+    _configure_anpr(mock_settings, {"CAM-ENTRY": {"gate": "entry"}})
+
+    await dispatch_event(make_anpr_event("CAM-ENTRY", "RGR-6466", "vehicleMatchResult"), MagicMock())
+    await dispatch_event(make_anpr_event("UNKNOWN-10.1.20.60", None), MagicMock())
+
+    rescued = mock_anpr.await_args.args[0]
+    assert rescued.camera_id == "CAM-ENTRY"
+    assert rescued.plate_number == "RGR-6466"
+
+
+@pytest.mark.asyncio
+@patch("app.services.event_dispatcher.handle_anpr_event", new_callable=AsyncMock)
+@patch("app.services.event_dispatcher.add_event_to_feed")
+@patch("app.services.event_dispatcher.settings")
+async def test_exact_plate_match_does_not_consume_another_cars_hint(mock_settings, mock_feed, mock_anpr):
+    """Two cars in the queue. The second's ANPR agrees with its own match result,
+    so it must take the exact-plate path and leave car A's hint intact for A."""
+    dispatcher._VMR_GATE_HINTS.clear()
+    dispatcher._VMR_RECENT.clear()
+    _configure_anpr(mock_settings, {"CAM-ENTRY": {"gate": "entry"}})
+
+    await dispatch_event(make_anpr_event("CAM-ENTRY", "RGR-6466", "vehicleMatchResult"), MagicMock())
+    await dispatch_event(make_anpr_event("CAM-ENTRY", "DJS-7842", "vehicleMatchResult"), MagicMock())
+    # car B's ANPR reads correctly -> exact match, must NOT eat car A's hint
+    await dispatch_event(make_anpr_event("UNKNOWN-10.1.20.60", "DJS-7842"), MagicMock())
+    assert mock_anpr.await_args.args[0].plate_number == "DJS-7842"
+
+    # car A's ANPR misreads -> falls back, and A's hint is still there
+    await dispatch_event(make_anpr_event("UNKNOWN-10.1.20.60", "66466RA"), MagicMock())
+    assert mock_anpr.await_args.args[0].plate_number == "RGR-6466"
+
+
+@pytest.mark.asyncio
+@patch("app.services.event_dispatcher.handle_anpr_event", new_callable=AsyncMock)
+@patch("app.services.event_dispatcher.add_event_to_feed")
+@patch("app.services.event_dispatcher.settings")
+async def test_fifo_hint_is_consumed_once(mock_settings, mock_feed, mock_anpr):
+    """One crossing must not be claimed by two ANPRs — the second misread finds
+    no hint left and is passed through untouched rather than misattributed."""
+    dispatcher._VMR_GATE_HINTS.clear()
+    dispatcher._VMR_RECENT.clear()
+    _configure_anpr(mock_settings, {"CAM-ENTRY": {"gate": "entry"}})
+
+    await dispatch_event(make_anpr_event("CAM-ENTRY", "RGR-6466", "vehicleMatchResult"), MagicMock())
+    await dispatch_event(make_anpr_event("UNKNOWN-10.1.20.60", "66466RA"), MagicMock())
+    assert mock_anpr.await_args.args[0].plate_number == "RGR-6466"
+
+    await dispatch_event(make_anpr_event("UNKNOWN-10.1.20.60", "66466XA"), MagicMock())
+    stray = mock_anpr.await_args.args[0]
+    assert stray.camera_id == "UNKNOWN-10.1.20.60"   # not rescued
+    assert stray.plate_number == "66466XA"           # not rewritten
+
+
+@pytest.mark.asyncio
+@patch("app.services.event_dispatcher.handle_anpr_event", new_callable=AsyncMock)
+@patch("app.services.event_dispatcher.add_event_to_feed")
+@patch("app.services.event_dispatcher.settings")
+async def test_expired_hint_never_rescues(mock_settings, mock_feed, mock_anpr):
+    """A stale match result must not label a later car. Bounded by
+    ANPR_BURST_MAX_SECONDS in BOTH stores."""
+    dispatcher._VMR_GATE_HINTS.clear()
+    dispatcher._VMR_RECENT.clear()
+    _configure_anpr(mock_settings, {"CAM-ENTRY": {"gate": "entry"}})
+    mock_settings.ANPR_BURST_MAX_SECONDS = 0.0     # every hint is born expired
+
+    await dispatch_event(make_anpr_event("CAM-ENTRY", "RGR-6466", "vehicleMatchResult"), MagicMock())
+    await dispatch_event(make_anpr_event("UNKNOWN-10.1.20.60", "66466RA"), MagicMock())
+
+    stray = mock_anpr.await_args.args[0]
+    assert stray.camera_id == "UNKNOWN-10.1.20.60"
+    assert stray.plate_number == "66466RA"
