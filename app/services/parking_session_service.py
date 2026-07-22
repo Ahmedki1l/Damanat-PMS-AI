@@ -14,6 +14,10 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Existing column marker: this is an inferred upper-bound closure caused by a
+# strictly validated re-entry, not a physical exit-camera observation.
+REENTRY_RECONCILIATION_CAMERA_ID = "SYSTEM-REENTRY-RECONCILE"
+
 
 def _naive(dt: Optional[datetime]) -> datetime:
     """Normalize a (possibly tz-aware) datetime to NAIVE FACILITY-LOCAL for DB
@@ -53,6 +57,89 @@ def get_latest_open_session(db: Session, plate_number: str) -> Optional[ParkingS
         )
         .order_by(ParkingSession.entry_time.desc(), ParkingSession.id.desc())
         .first()
+    )
+
+
+def get_open_sessions(db: Session, plate_number: str) -> list[ParkingSession]:
+    """Return every open stay for repair under the caller's plate lock."""
+    return (
+        db.query(ParkingSession)
+        .filter(
+            ParkingSession.plate_number == plate_number,
+            ParkingSession.status == "open",
+        )
+        .order_by(ParkingSession.entry_time.desc(), ParkingSession.id.desc())
+        .all()
+    )
+
+
+def _close_session_record(
+    db: Session,
+    session: ParkingSession,
+    *,
+    exit_time: datetime,
+    camera_id: str,
+    snapshot_path: Optional[str],
+    clear_vehicle_location: bool,
+) -> ParkingSession:
+    previous_exit_time = session.exit_time
+    previous_exit_camera = session.exit_camera_id
+    session.exit_time = exit_time
+    session.exit_camera_id = camera_id
+    session.exit_snapshot_path = snapshot_path
+    session.duration_seconds = max(
+        0,
+        int((exit_time - session.entry_time).total_seconds()),
+    )
+    session.status = "closed"
+    session.updated_at = facility_now_naive()
+
+    # When a delayed real exit corrects an inferred re-entry boundary, replace
+    # the inferred slot-left timestamp too. Otherwise preserve an independently
+    # observed unbind time.
+    inferred_slot_exit = (
+        previous_exit_camera == REENTRY_RECONCILIATION_CAMERA_ID
+        and session.slot_left_at == previous_exit_time
+    )
+    if session.slot_id is not None and (
+        session.slot_left_at is None or inferred_slot_exit
+    ):
+        session.slot_left_at = exit_time
+
+    if clear_vehicle_location:
+        vehicle = _resolve_vehicle(db, session)
+        if vehicle is not None:
+            vehicle.current_slot_id = None
+            vehicle.floor = None
+            vehicle.floor_id = None
+
+    return session
+
+
+def reconcile_open_session_for_reentry(
+    db: Session,
+    session: ParkingSession,
+    reentry_time: datetime,
+) -> ParkingSession:
+    """Close one older open stay at a validated re-entry upper bound."""
+    boundary = _naive(reentry_time)
+    if session.status != "open" or session.entry_time >= boundary:
+        raise ValueError("only an older open session can be reconciled")
+
+    logger.warning(
+        "[ParkingSession] Reconciling stale open stay id=%s plate=%s at "
+        "validated re-entry %s",
+        session.id,
+        session.plate_number,
+        boundary,
+    )
+    return _close_session_record(
+        db,
+        session,
+        exit_time=boundary,
+        camera_id=REENTRY_RECONCILIATION_CAMERA_ID,
+        snapshot_path=None,
+        clear_vehicle_location=True,
     )
 
 
@@ -96,35 +183,63 @@ def close_session(
     camera_id: str,
     snapshot_path: Optional[str],
 ) -> Optional[ParkingSession]:
-    session = get_latest_open_session(db, plate_number)
-    if not session:
-        logger.warning("[ParkingSession] No open session found for plate=%s", plate_number)
-        return None
-
     exit_time = _naive(event_time)
-    session.exit_time = exit_time
-    session.exit_camera_id = camera_id
-    session.exit_snapshot_path = snapshot_path
-    session.duration_seconds = max(0, int((exit_time - session.entry_time).total_seconds()))
-    session.status = "closed"
-    session.updated_at = facility_now_naive()
-    # If the car exited while still bound to a slot (no VA unbind before the
-    # ANPR exit event), close_session is the last writer that knows when the
-    # slot was vacated. Backfill slot_left_at so historical queries can rely
-    # on `slot_left_at IS NOT NULL` for closed sessions.
-    if session.slot_id is not None and session.slot_left_at is None:
-        session.slot_left_at = exit_time
+    session = (
+        db.query(ParkingSession)
+        .filter(
+            ParkingSession.plate_number == plate_number,
+            ParkingSession.status == "open",
+            ParkingSession.entry_time <= exit_time,
+        )
+        .order_by(ParkingSession.entry_time.desc(), ParkingSession.id.desc())
+        .first()
+    )
+    if session is not None:
+        return _close_session_record(
+            db,
+            session,
+            exit_time=exit_time,
+            camera_id=camera_id,
+            snapshot_path=snapshot_path,
+            clear_vehicle_location=True,
+        )
 
-    # The car has left the garage entirely — clear all "where is it now"
-    # mirrors on the vehicle row. Without this, the vehicles row keeps
-    # pointing at the last slot/floor indefinitely.
-    vehicle = _resolve_vehicle(db, session)
-    if vehicle is not None:
-        vehicle.current_slot_id = None
-        vehicle.floor = None
-        vehicle.floor_id = None
+    # A real exit can arrive late after a validated re-entry already closed the
+    # previous stay at an inferred upper bound. Correct that exact audit marker,
+    # but never touch a newer open stay or clear its current vehicle location.
+    reconciled = (
+        db.query(ParkingSession)
+        .filter(
+            ParkingSession.plate_number == plate_number,
+            ParkingSession.status == "closed",
+            ParkingSession.exit_camera_id == REENTRY_RECONCILIATION_CAMERA_ID,
+            ParkingSession.entry_time <= exit_time,
+            ParkingSession.exit_time >= exit_time,
+        )
+        .order_by(ParkingSession.entry_time.desc(), ParkingSession.id.desc())
+        .first()
+    )
+    if reconciled is not None:
+        logger.info(
+            "[ParkingSession] Applying delayed real exit to reconciled stay "
+            "id=%s plate=%s",
+            reconciled.id,
+            plate_number,
+        )
+        return _close_session_record(
+            db,
+            reconciled,
+            exit_time=exit_time,
+            camera_id=camera_id,
+            snapshot_path=snapshot_path,
+            clear_vehicle_location=False,
+        )
 
-    return session
+    logger.warning(
+        "[ParkingSession] No temporally eligible session found for plate=%s",
+        plate_number,
+    )
+    return None
 
 
 def bind_slot(
@@ -211,4 +326,3 @@ def unbind_slot(
 
     db.flush()
     return session
-

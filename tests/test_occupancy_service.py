@@ -18,9 +18,9 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
 from app.models.zone_occupancy import ZoneOccupancy
+from app.models.parking_session import ParkingSession
 from app.services.occupancy_service import (
     handle_occupancy_event,
-    record_event_in_cache,
     _processed_events_cache,
 )
 from app.services.event_parser import ParsedCameraEvent
@@ -72,6 +72,23 @@ def seed_zones(db, total=0, b1=0, b2=0, capacity=10):
     db.commit()
 
 
+def seed_open_sessions(db, floors):
+    now = datetime.now(UTC).replace(tzinfo=None)
+    for index, floor in enumerate(floors, start=1):
+        db.add(
+            ParkingSession(
+                plate_number=f"TEST-{index}",
+                entry_time=now,
+                entry_camera_id="CAM-ENTRY",
+                floor=floor,
+                status="open",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    db.commit()
+
+
 def get_count(db, zone_id):
     zone = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id == zone_id).first()
     if zone:
@@ -104,9 +121,9 @@ class TestOccupancyService:
     @pytest.mark.asyncio
     async def test_new_zone_auto_created_on_first_event(self, db):
         """UC3: Zone rows are auto-created if they don't exist in the DB."""
-        # Start with empty DB (no zones seeded)
+        seed_open_sessions(db, ["B1"])
         with patch("app.services.occupancy_service.create_alert", new_callable=AsyncMock):
-            cache_key = await handle_occupancy_event(make_event("1"), db)
+            await handle_occupancy_event(make_event("1"), db)
         db.commit()
 
         total = db.query(ZoneOccupancy).filter(
@@ -118,21 +135,24 @@ class TestOccupancyService:
         assert total.floor == settings.get_zone_metadata(settings.GARAGE_TOTAL_ZONE)["floor"]
 
     @pytest.mark.asyncio
-    async def test_entrance_increments_count(self, db):
-        """Line 1 crossing (entrance via CAM-03) increments TOTAL and B1."""
-        seed_zones(db, total=3, b1=3, b2=0)
+    async def test_entrance_reconciles_drift_from_open_sessions(self, db):
+        """A line event replaces drifted aggregates; it never adds a delta."""
+        seed_zones(db, total=99, b1=99, b2=99)
+        seed_open_sessions(db, ["B1", "B1"])
 
         with patch("app.services.occupancy_service.create_alert", new_callable=AsyncMock):
             await handle_occupancy_event(make_event("1", "CAM-03"), db)
         db.commit()
 
-        assert get_count(db, settings.GARAGE_TOTAL_ZONE) == 4
-        assert get_count(db, settings.B1_PARKING_ZONE) == 4
+        assert get_count(db, settings.GARAGE_TOTAL_ZONE) == 2
+        assert get_count(db, settings.B1_PARKING_ZONE) == 2
+        assert get_count(db, settings.B2_PARKING_ZONE) == 0
 
     @pytest.mark.asyncio
-    async def test_exit_decrements_count(self, db):
-        """Line 1 crossing on exit camera (CAM-08) decrements TOTAL and B1."""
+    async def test_exit_line_does_not_decrement_without_a_closed_session(self, db):
+        """Direction cannot change counts while four sessions remain open."""
         seed_zones(db, total=5, b1=5, b2=0)
+        seed_open_sessions(db, ["B1", "B1", "B1", "B1"])
 
         with patch("app.services.occupancy_service.create_alert", new_callable=AsyncMock):
             await handle_occupancy_event(make_event("1", "CAM-08"), db)

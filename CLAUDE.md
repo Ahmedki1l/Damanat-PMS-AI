@@ -28,9 +28,9 @@ python scripts/setup/init_db.py
 alembic upgrade head
 alembic revision --autogenerate -m "description"
 
-# Docker (starts MySQL + backend)
+# Docker (starts SQL Server + backend)
 docker-compose up -d
-docker-compose up -d db
+docker-compose up -d pms-mssql
 
 # Simulate camera events for testing
 python scripts/test/simulate_event.py --event regionEntrance --zone parking-row-A --ip 192.168.1.103
@@ -41,15 +41,22 @@ python scripts/test/simulate_event.py --event anpr --plate ABC-1234 --ip 192.168
 
 ### Event-Driven Pipeline
 
-All camera events flow through a single path:
+All cameras send events only to PMS-AI. Entry V2 evidence is then forwarded to
+Video Analytics (VA); VA returns metadata-only decisions to PMS-AI:
 
 ```
 Camera HTTP Push → POST /api/v1/events/camera
   → event_parser.py (auto-detect XML vs JSON, normalize to ParsedCameraEvent dataclass)
+  → trusted camera identity resolution
+  → entry_v2_forwarder.py (ANPR/CAM-23/CAM-03 in-memory vehicle evidence → VA)
+  → VA POST /api/v1/internal/entry-confirmations (metadata-only decision)
+  → entry_confirmation_service.py (transactional entry/session mutation)
+
+Other events and off/shadow legacy behavior:
   → event_dispatcher.py (route by event_type to correct service handler)
   → service handler (occupancy / entry_exit)
   → alert_service.py (shared alert creation)
-  → MySQL persistence + optional Node.js backend notification
+  → SQL Server persistence + optional Node.js backend notification
 ```
 
 There is also a camera polling mode (`camera_poller.py`) that connects TO cameras via their ISAPI `alertStream` endpoint — currently not wired up in `main.py` startup.
@@ -59,19 +66,23 @@ There is also a camera polling mode (`camera_poller.py`) that connects TO camera
 - **Routers** (`app/routers/`): HTTP endpoints, request/response handling. Each file maps to a use case.
 - **Services** (`app/services/`): All business logic. `event_parser.py` normalizes raw payloads into `ParsedCameraEvent`. `event_dispatcher.py` routes events to the correct handler. `occupancy_service.py` and `entry_exit_service.py` are the primary handlers. `snapshot_service.py` fetches/uploads camera snapshots.
 - **Repositories** (`app/repositories/`): Data-access helpers that wrap ORM queries (e.g. `vehicle_repository.py`). Use these rather than writing raw ORM queries in services.
-- **Models** (`app/models/`): SQLAlchemy ORM definitions. 6 tables: `camera_events`, `zone_occupancy`, `alerts`, `vehicles`, `entry_exit_log`, `system_config`.
+- **Models** (`app/models/`): SQLAlchemy ORM definitions for `alerts`, `camera_feeds`, `entry_exit_log`, `parking_sessions`, `vehicles`, and `zone_occupancy`.
 - **Schemas** (`app/schemas/`): Pydantic request/response models.
 - **Config** (`app/config.py`): Pydantic BaseSettings. Contains camera inventory (`CAMERAS` dict), IP-to-camera-ID mapping (`CAMERA_IP_MAP`), zone UUIDs, and thresholds.
 
 ### External Integrations
 
 - **Node.js core backend** (`app/utils/core_backend_client.py`): Fire-and-forget HTTP push to the Node.js backend for occupancy, ANPR, and alert events. Configured via `NODEBACK_URL`, `NODEBACK_SITE_ID`, `NODEBACK_SERVICE_KEY`. If `NODEBACK_URL` is empty, all calls silently skip.
-- **PMS Tracking API** (`PMS_API_URL`): Secondary HTTP push to the PMS tracking service. Empty = disabled.
+- **Video Analytics** (`PMS_API_URL`): PMS-AI → VA evidence/exit boundary. Active Entry V2 also requires `ENTRY_V2_SERVICE_KEY`; authoritative entry evidence is memory-only, while failed exits use the durable local retry spool.
 - **DigitalOcean Spaces** (`app/utils/spaces_client.py`): Snapshot image upload. Enabled when `STORAGE_MODE=spaces`. Falls back gracefully when unreachable.
 
 ### Security
 
-Optional API key auth via `APIKeyMiddleware` in `main.py`. Camera webhook (`/events/camera`), health, alerts, and docs endpoints are always open (no auth). Set `API_KEY` in `.env` to enable; leave empty to disable.
+Optional API key auth via `APIKeyMiddleware` in `main.py`. The camera webhook is
+excluded from that API key but is constrained by
+`CAMERA_EVENT_ALLOWED_SOURCE_CIDRS` (mandatory in authoritative Entry V2).
+The VA callback uses the separate `ENTRY_V2_SERVICE_KEY` boundary. Set `API_KEY`
+to protect the remaining API endpoints according to the middleware policy.
 
 ### Phase 1 vs Phase 2
 
@@ -85,7 +96,7 @@ Occupancy cameras (hardcoded in `event_dispatcher.py`): CAM-03, CAM-08, CAM-09, 
 
 ## Key Conventions
 
-- **Webhook endpoint must always return HTTP 200** — never let exceptions bubble up to cameras. The `/api/v1/events/camera` endpoint catches all errors and returns 200 regardless.
+- **Camera acknowledgement**: legacy/shadow processing returns HTTP 200. Authoritative Entry V2 returns HTTP 503 for retryable VA, lock, timestamp, or processing failures so Hikvision remains the retry boundary; deterministic malformed evidence is acknowledged and not retried forever.
 - **Logging**: Use `from app.utils.logger import get_logger; logger = get_logger(__name__)` — never use `print()`. Logs go to both console and rotating files in `logs/`. Use structured format: `logger.info(f"[UC3] zone={zone_id} count={count}")`.
 - **Configuration**: Never hardcode IPs or credentials. Use `settings` from `app/config.py` which reads from `.env`.
 - **Database sessions**: Use FastAPI dependency injection (`db: Session = Depends(get_db)`). Explicit `db.commit()` after modifications.
@@ -97,11 +108,11 @@ Occupancy cameras (hardcoded in `event_dispatcher.py`): CAM-03, CAM-08, CAM-09, 
 
 ## Testing
 
-Tests use pytest + pytest-asyncio. Database sessions are mocked with `MagicMock`/`AsyncMock` — no real database needed for unit tests. Service dependencies like `create_alert` are patched.
+Tests use pytest + pytest-asyncio. Most persistence tests use isolated SQLite sessions and boundary tests use `MagicMock`/`AsyncMock`. SQL Server application-lock concurrency and DATETIME behavior still require the live/container MSSQL integration gate before authoritative rollout.
 
 ## Stack
 
-FastAPI 0.133, SQLAlchemy 2.0, MySQL (pymysql driver), Alembic 1.18, Pydantic 2.12, lxml (XML parsing), httpx (async HTTP), Python 3.11+
+FastAPI 0.133, SQLAlchemy 2.0, SQL Server (pyodbc / ODBC Driver 18), Alembic 1.18, Pydantic 2.12, lxml (XML parsing), Pillow (bounded in-memory crops), httpx (async HTTP), Python 3.11+
 
 ---
 

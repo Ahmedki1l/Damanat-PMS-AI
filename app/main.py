@@ -5,6 +5,9 @@ Includes security middleware, global error handlers, and all routers.
 """
 # (no-op edit: 2026-05-05 to trigger uvicorn --reload — rev 3 for close_session vehicle clear)
 
+import asyncio
+import time
+
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,12 +15,21 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.routers import (
     events, occupancy,
     health, alerts, vehicles, entry_exit, parking_stats, parking_sessions_internal,
+    entry_confirmations,
     snapshots,
 )
-from app.database import create_tables
+from app.database import SessionLocal, create_tables, engine
 from app.config import settings
+from app.services.entry_state_lock import assert_authoritative_lock_backend
+from app.services.entry_v2_forwarder import (
+    close_entry_v2_http_client,
+    start_entry_v2_http_client,
+)
+from app.utils.core_backend_client import (
+    close_core_backend_http_client,
+    start_core_backend_http_client,
+)
 from app.utils.logger import get_logger
-import time
 
 logger = get_logger(__name__)
 
@@ -42,7 +54,8 @@ app.add_middleware(
 class APIKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         open_paths = {
-            "/api/v1/events/camera", "/api/v1/health", "/docs", 
+            "/api/v1/events/camera", "/api/v1/health", "/docs",
+            "/api/v1/internal/entry-confirmations",
             "/redoc", "/openapi.json", "/api/v1/alerts"
         }
         
@@ -96,17 +109,19 @@ app.include_router(parking_stats.router, prefix="/api/v1", tags=["📊 Stats —
 app.include_router(vehicles.router,      prefix="/api/v1", tags=["🔍 Vehicles — UC4"])
 
 app.include_router(parking_sessions_internal.router, prefix="/api/v1", tags=["Internal Sessions"])
+app.include_router(entry_confirmations.router, prefix="/api/v1", tags=["Entry V2"])
 
 app.include_router(snapshots.router, tags=["📸 Snapshots"])
-
-import asyncio
-from app.database import SessionLocal
-
 
 # ── Startup ───────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     logger.info("🚀 Damanat Backend starting up...")
+    # Authoritative entry/session writes require SQL Server's transaction-owned
+    # application lock. This assertion is intentionally outside the best-effort
+    # schema initialization block: continuing on another dialect would permit
+    # concurrent duplicate/open-session races.
+    assert_authoritative_lock_backend(engine.dialect.name)
     try:
         create_tables()
         logger.info("✅ Database ready")
@@ -128,6 +143,9 @@ async def startup():
     )
     logger.info(f"🌐 Listening on http://{settings.BACKEND_IP}:{settings.BACKEND_PORT}")
 
+    await start_entry_v2_http_client()
+    await start_core_backend_http_client()
+
     # Background flusher for the ANPR entry-burst buffer. The CAM-23 ramp-top
     # crossing CONFIRMS each car, but the correct plate read lands 1-3s after the
     # crossing (recognition lag), so this task is what actually writes the entry:
@@ -135,12 +153,16 @@ async def startup():
     # confirmed, it commits one entry on the winning plate and forwards it to the
     # PMS. It also drops never-confirmed ghosts at the hard cap and reaps silent
     # ramp crossings.
-    app.state.entry_burst_flusher = asyncio.create_task(_entry_burst_flusher_loop())
-    logger.info("🧹 Entry-burst flusher task started")
+    if settings.ENTRY_V2_MODE != "authoritative":
+        app.state.entry_burst_flusher = asyncio.create_task(_entry_burst_flusher_loop())
+        logger.info("🧹 Entry-burst flusher task started")
+    else:
+        app.state.entry_burst_flusher = None
+        logger.info("🧠 Entry V2 authoritative — legacy burst/FIFO flusher disabled")
 
-    # Background drain for undelivered ANPR forwards to the VA backend. When VA
-    # is briefly unreachable, notify_pms_anpr spools the payload to disk instead
-    # of dropping it; this task re-POSTs the spool until VA acks.
+    # Background drain for undelivered legacy ANPR forwards to the VA backend.
+    # Authoritative Entry V2 quarantines old entry files; legacy exit payloads
+    # remain eligible for delivery.
     app.state.pms_forward_drainer = asyncio.create_task(_pms_forward_drainer_loop())
     logger.info("📤 PMS/VA forward-spool drainer task started")
 
@@ -190,3 +212,5 @@ async def shutdown():
                 await task
             except asyncio.CancelledError:
                 pass
+    await close_entry_v2_http_client()
+    await close_core_backend_http_client()

@@ -28,8 +28,13 @@ ANPR missed the plate entirely) → an alert is raised.
 """
 
 import asyncio
-from datetime import timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Optional
+
 from sqlalchemy.orm import Session
+
+from app.services.entry_state_lock import acquire_plate_transaction_lock
 from app.models.entry_exit_log import EntryExitLog
 from app.services import parking_session_service
 from app.services import vehicle_service
@@ -40,6 +45,10 @@ from app.utils.logger import get_logger
 from app.utils import core_backend_client
 
 logger = get_logger(__name__)
+
+
+class SourceTimestampUnavailable(RuntimeError):
+    """A destructive exit cannot be ordered from a PMS receive-time fallback."""
 
 # ── ANPR entry-burst buffer ──────────────────────────────────────────────
 # Keyed by an incrementing burst id (NOT plate, NOT camera) so a tailgater's
@@ -72,6 +81,36 @@ _recent_entries: list[dict] = []
 
 # Strong refs to in-flight detached PMS forwards (see _spawn_confirm_forward).
 _background_forwards: set[asyncio.Task] = set()
+
+
+@dataclass(frozen=True)
+class AnprPostCommitForward:
+    """Legacy VA notification that must run only after the DB lock is released."""
+
+    plate: str
+    direction: str
+    image_path: Optional[str]
+    captured_at: datetime
+
+    async def deliver(self) -> None:
+        try:
+            await core_backend_client.notify_pms_anpr(
+                self.plate,
+                self.direction,
+                image_path=self.image_path,
+                captured_at=self.captured_at,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[UC1] PMS API forwarding failed for plate=%s: %s",
+                self.plate,
+                exc,
+            )
+            if (
+                settings.ENTRY_V2_MODE == "authoritative"
+                and self.direction.strip().lower() == "exit"
+            ):
+                raise
 
 
 def _confirm_direction(source_cam: str) -> str:
@@ -612,7 +651,10 @@ async def _forward_confirm_snapshot(plate: str, source_cam: str,
         )
 
 
-async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
+async def handle_anpr_event(
+    event: ParsedCameraEvent,
+    db: Session,
+) -> Optional[AnprPostCommitForward]:
     """
     Process ANPR events to log vehicle movement, identify owners,
     and calculate parking duration for exits.
@@ -634,13 +676,31 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         logger.debug(f"[Phase2] ANPR event with no plate from {event.camera_id} - skipped")
         return
 
+    if (
+        gate == "exit"
+        and settings.ENTRY_V2_MODE == "authoritative"
+        and event.trigger_time_source.startswith("pms_receive_")
+    ):
+        raise SourceTimestampUnavailable(
+            "exit ANPR requires a valid camera source timestamp"
+        )
+
     # Camera sends tz-aware timestamps like `2026-05-07T12:14:51+03:00`. The
     # DB convention (since 2026-05-07) is NAIVE FACILITY-LOCAL — the wall
     # clock the operator sees, NOT UTC. Convert to facility tz first, then
     # strip tzinfo, so 12:14:51+03:00 stays 12:14:51 in the column.
-    event_time = event.trigger_time or facility_now_naive()
-    if event_time.tzinfo is not None:
-        event_time = event_time.astimezone(facility_tz()).replace(tzinfo=None)
+    source_captured_at = event.trigger_time
+    if source_captured_at is None:
+        source_captured_at = facility_now_naive().replace(tzinfo=facility_tz())
+    elif (
+        source_captured_at.tzinfo is None
+        or source_captured_at.utcoffset() is None
+    ):
+        # Hikvision timestamps are normally offset-aware.  A legacy/parser test
+        # may still supply facility wall-clock time without tzinfo; its only
+        # unambiguous interpretation in PMS is the configured facility zone.
+        source_captured_at = source_captured_at.replace(tzinfo=facility_tz())
+    event_time = source_captured_at.astimezone(facility_tz()).replace(tzinfo=None)
 
     # ── ENTRY: buffer the multi-read burst — the LAST read wins. The DB write,
     # PMS forward (port 8000) and vehicle resolution all happen once, at flush
@@ -649,29 +709,48 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         await _buffer_entry_read(event, plate, event_time)
         return
 
+    # Build the VA notification before deduplication. If PMS committed the first
+    # delivery and then crashed before the post-commit forward could run or spool,
+    # the camera's duplicate webhook is the only recovery signal. Returning this
+    # same idempotent forward for a duplicate heals that commit-to-forward window
+    # without repeating any PMS row/session/alert mutation.
+    exit_forward = AnprPostCommitForward(
+        plate=plate,
+        direction=gate,
+        image_path=event.local_snapshot_path or event.snapshot_path,
+        captured_at=source_captured_at,
+    )
+
     # ── EXIT: a single read is reliable — log immediately. ──────────────────
+    # Only authoritative V2 has a second writer (the confirmation callback).
+    # The transaction-owned lock remains held through the router's commit, and
+    # the callback acquires the exact same normalized-plate resource. Whichever
+    # transaction wins is therefore fully visible before the other decides
+    # whether an open stay may exist. Off/shadow keep their legacy exit path and
+    # cannot acquire/fail a lock that they do not need.
+    if settings.ENTRY_V2_MODE == "authoritative":
+        acquire_plate_transaction_lock(db, plate)
     logger.debug(f"[UC1] Checking dedup for plate {plate}...")
     dedup_window = event_time - timedelta(seconds=30)
+    dedup_ceiling = event_time + timedelta(seconds=30)
     recent = (
         db.query(EntryExitLog)
         .filter(
             EntryExitLog.plate_number == plate,
             EntryExitLog.gate == gate,
             EntryExitLog.event_time >= dedup_window,
+            EntryExitLog.event_time <= dedup_ceiling,
         )
         .first()
     )
     if recent:
-        logger.debug(f"[UC1] Duplicate suppressed for plate={plate} gate={gate}")
-        return
-
-    # Forward plate + snapshot to PMS tracking API (fire-and-forget)
-    try:
-        await core_backend_client.notify_pms_anpr(
-            plate, gate, image_path=event.local_snapshot_path or event.snapshot_path,
+        logger.debug(
+            "[UC1] Duplicate PMS exit mutation suppressed for plate=%s gate=%s; "
+            "VA exit notification will be replayed",
+            plate,
+            gate,
         )
-    except Exception as e:
-        logger.warning(f"[UC1] PMS API forwarding failed for plate={plate}: {e}")
+        return exit_forward
 
     # UC4: Resolve vehicle identity via vehicle_service
     logger.debug(f"[UC4] Looking up vehicle for plate {plate}...")
@@ -697,7 +776,8 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         .filter(
             EntryExitLog.plate_number == plate,
             EntryExitLog.gate == "entry",
-            EntryExitLog.matched_entry_id.is_(None)
+            EntryExitLog.matched_entry_id.is_(None),
+            EntryExitLog.event_time <= event_time,
         )
         .order_by(EntryExitLog.event_time.desc())
         .first()
@@ -729,6 +809,14 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         camera_id=event.camera_id,
         snapshot_path=event.snapshot_path,
     )
+    from app.services.occupancy_service import (
+        reconcile_zone_counts_from_open_sessions,
+    )
+
+    reconcile_zone_counts_from_open_sessions(
+        db,
+        camera_id=event.camera_id,
+    )
 
     # UC4
     if vehicle and vehicle.is_registered:
@@ -759,3 +847,8 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
 
     if log_entry not in db.new:
         db.add(log_entry)
+
+    # Network delivery is intentionally deferred until the router commits.
+    # SQL Server transaction-owned application locks are released by that
+    # commit, so a slow VA call cannot block a confirmation for this plate.
+    return exit_forward

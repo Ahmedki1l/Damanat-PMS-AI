@@ -29,3 +29,16 @@ def isolate_external_side_effects(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(settings, "PMS_API_URL", "", raising=False)
     monkeypatch.setattr(settings, "NODEBACK_URL", "", raising=False)
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "off", raising=False)
+    monkeypatch.setattr(
+        settings,
+        "CAMERA_EVENT_ALLOWED_SOURCE_CIDRS",
+        "10.0.0.0/8",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        settings,
+        "CAMERA_EVENT_MAX_BODY_BYTES",
+        16 * 1024 * 1024,
+        raising=False,
+    )

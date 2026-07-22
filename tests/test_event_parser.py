@@ -12,7 +12,7 @@ from app.services.event_parser import parse_camera_event
 class TestXMLEventParsing:
     """Phase 1: XML event parsing tests."""
 
-    def test_fielddetection_event(self):
+    def test_fielddetection_event(self, monkeypatch):
         xml = b"""<?xml version="1.0" encoding="utf-8"?>
         <EventNotificationAlert version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
           <deviceSerial>DS-2CD3681G2-001</deviceSerial>
@@ -27,7 +27,12 @@ class TestXMLEventParsing:
         </EventNotificationAlert>"""
 
         from app.config import settings
-        event = parse_camera_event(xml, settings.CAM_02_IP, "application/xml")
+        monkeypatch.setattr(
+            settings,
+            "CAMERA_SERIAL_MAP",
+            {"DS-2CD3681G2-001": "CAM-02"},
+        )
+        event = parse_camera_event(xml, "192.0.2.2", "application/xml")
         assert event.event_type == "fielddetection"
         assert event.detection_target == "vehicle"
         assert event.region_id == "restricted-vip"
@@ -96,7 +101,6 @@ class TestXMLEventParsing:
         event = parse_camera_event(xml, "10.0.0.99", "application/xml")
         assert event.camera_id == "UNKNOWN-10.0.0.99"
 
-
 class TestJSONEventParsing:
     """Phase 2: JSON/ANPR event parsing tests."""
 
@@ -124,7 +128,7 @@ class TestJSONEventParsing:
         assert event.person_name == "Ahmed"
         assert event.detection_target == "vehicle"
 
-    def test_anpr_exit_event(self):
+    def test_anpr_exit_event(self, monkeypatch):
         json_body = b"""{
             "eventType": "AccessControllerEvent",
             "dateTime": "2026-02-20T14:30:00Z",
@@ -136,7 +140,17 @@ class TestJSONEventParsing:
         }"""
 
         from app.config import settings
-        event = parse_camera_event(json_body, settings.CAM_EXIT_IP, "application/json")
+        monkeypatch.setattr(
+            settings,
+            "CAMERA_SERIAL_MAP",
+            {"ANPR-EXIT-001": "CAM-EXIT"},
+        )
+        monkeypatch.setattr(
+            settings,
+            "CAMERAS",
+            {"CAM-EXIT": {"gate": "exit"}},
+        )
+        event = parse_camera_event(json_body, "192.0.2.8", "application/json")
         assert event.event_type == "AccessControllerEvent"
         assert event.plate_number == "XYZ-5678"
         assert event.gate == "exit"
@@ -149,7 +163,6 @@ class TestJSONEventParsing:
         event = parse_camera_event(json_body, "192.168.1.104", "")
         assert event.event_type == "AccessControllerEvent"
         assert event.plate_number == "TEST-001"
-
 
 class TestPlateNormalization:
     """`_normalize_plate` stores plates exactly as before (the frontend handles

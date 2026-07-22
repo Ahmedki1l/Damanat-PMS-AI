@@ -78,6 +78,7 @@ COPY . .
 ENV PATH=/root/.local/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    GUNICORN_TIMEOUT_SECONDS=90 \
     PORT=8080
 
 # Logs
@@ -87,7 +88,7 @@ EXPOSE 8080
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=10s \
-  CMD curl -f http://localhost:${PORT}/health || exit 1
+  CMD curl -f http://localhost:${PORT}/api/v1/health || exit 1
 
 # =========================
 # Entrypoint
@@ -113,7 +114,7 @@ echo "[$(date)] 🚀 Starting Gunicorn server..."
 exec gunicorn app.main:app \
   -k uvicorn.workers.UvicornWorker \
   -w 1 \
-  --timeout 30 \
+  --timeout "${GUNICORN_TIMEOUT_SECONDS}" \
   --bind 0.0.0.0:${PORT} \
   --access-logfile - \
   --error-logfile - \

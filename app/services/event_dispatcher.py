@@ -5,12 +5,16 @@ import time
 
 from app.services.event_parser import ParsedCameraEvent
 from app.services.occupancy_service import handle_occupancy_event
-from app.services.entry_exit_service import handle_anpr_event
+from app.services.entry_exit_service import AnprPostCommitForward, handle_anpr_event
 from app.services.camera_feed_service import add_event_to_feed
 from app.services.snapshot_service import fetch_snapshot
-from app.utils.event_bus import event_bus
 from app.utils.logger import get_logger
 from app.config import settings
+from app.services.entry_v2_forwarder import (
+    is_authoritative as entry_v2_is_authoritative,
+    is_entry_crossing as is_entry_v2_crossing,
+    is_non_exit_attempt as is_entry_v2_non_exit_attempt,
+)
 from sqlalchemy.orm import Session
 
 logger = get_logger(__name__)
@@ -70,10 +74,15 @@ def _remember_vmr_gate(event: ParsedCameraEvent) -> None:
     _prune_vmr(now)
     deadline = now + settings.ANPR_BURST_MAX_SECONDS
     _VMR_GATE_HINTS[event.plate_number] = (event.camera_id, gate, deadline)
-    _VMR_RECENT.append((event.plate_number, event.camera_id, gate, deadline))
+    if not entry_v2_is_authoritative():
+        _VMR_RECENT.append((event.plate_number, event.camera_id, gate, deadline))
 
 
-def _rescue_unknown_gate(event: ParsedCameraEvent) -> None:
+def _rescue_unknown_gate(
+    event: ParsedCameraEvent,
+    *,
+    allow_fifo: bool = True,
+) -> None:
     """If an ANPR resolved to an UNKNOWN camera but a recent vehicleMatchResult
     resolved to a gate camera, adopt that identity so the entry/exit isn't
     dropped. Only rescues UNKNOWN cameras — never overrides an already-resolved
@@ -105,7 +114,13 @@ def _rescue_unknown_gate(event: ParsedCameraEvent) -> None:
         _VMR_RECENT[:] = [h for h in _VMR_RECENT if h[0] != event.plate_number]
         return
 
-    # ── 2. FIFO fallback — the misread case ──────────────────────────────────
+    # Entry V2 leaves disagreement resolution to VA's evidence/ReID pipeline.
+    # Exact hints remain safe, but plate-independent FIFO pairing is explicitly
+    # disabled in authoritative mode because it can assign one car to another.
+    if not allow_fifo:
+        return
+
+    # ── 2. FIFO fallback — the legacy misread case ───────────────────────────
     if not _VMR_RECENT:
         return
     vmr_plate, camera_id, gate, _ = _VMR_RECENT.pop(0)
@@ -120,6 +135,17 @@ def _rescue_unknown_gate(event: ParsedCameraEvent) -> None:
     event.plate_number = vmr_plate
     _VMR_GATE_HINTS.pop(vmr_plate, None)
 
+
+def resolve_exact_vmr_identity(event: ParsedCameraEvent) -> None:
+    """Apply only a same-plate VMR camera hint before V2 evidence delivery.
+
+    The authoritative path must never use the plate-independent FIFO fallback,
+    but an exact same-plate hint is safe and prevents a gateway/NAT source from
+    reaching VA as ``UNKNOWN-<gateway-ip>`` when PMS-AI already resolved it.
+    """
+    _rescue_unknown_gate(event, allow_fifo=False)
+
+
 async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
     """
     Route event to handlers and commit as a single transaction.
@@ -130,6 +156,7 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
     """
     # Collects cache keys that should only be recorded after successful commit
     _post_commit_cache_keys = []
+    _post_commit_anpr_forwards: list[AnprPostCommitForward] = []
     # Snapshot strategy:
     # 1. Use multipart image if the camera attached one to the event (already saved locally)
     # 2. If no image → try fetching a fresh snapshot from the camera (saves locally)
@@ -148,7 +175,10 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
         "fielddetection", "linedetection", "regionEntrance",
         "AccessControllerEvent", "ANPR",
     )
-    if event.event_type in SNAPSHOT_EVENT_TYPES:
+    authoritative_v2_evidence = entry_v2_is_authoritative() and (
+        is_entry_v2_non_exit_attempt(event) or is_entry_v2_crossing(event)
+    )
+    if event.event_type in SNAPSHOT_EVENT_TYPES and not authoritative_v2_evidence:
         # event_parser.parse_camera_event already sets snapshot_path (URL) and
         # local_snapshot_path on multipart events. If neither is set, fall
         # back to fetching a fresh JPEG from the camera here.
@@ -186,7 +216,10 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
         # inheriting the gate from the paired vehicleMatchResult seen moments ago.
         # Done before the gate/feed logic below so the whole flow sees the real id.
         if event.event_type in ("ANPR", "AccessControllerEvent"):
-            _rescue_unknown_gate(event)
+            _rescue_unknown_gate(
+                event,
+                allow_fifo=not entry_v2_is_authoritative(),
+            )
 
         is_gate = settings.CAMERAS.get(event.camera_id, {}).get("gate") in ("entry", "exit")
         is_occupancy_event = event.event_type == "linedetection"
@@ -249,7 +282,11 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
         # them here too would double-confirm.
         entry_confirm_cams = {c.strip() for c in settings.ENTRY_CONFIRM_CAMERAS.split(",") if c.strip()}
         ramp_confirm_cams = entry_confirm_cams - {"CAM-03", "CAM-08", "CAM-09", "CAM-10"}
-        if event.camera_id in ramp_confirm_cams and event.event_type == "linedetection":
+        if (
+            not entry_v2_is_authoritative()
+            and event.camera_id in ramp_confirm_cams
+            and event.event_type == "linedetection"
+        ):
             want_line = settings.CAM23_ENTRY_LINE.strip()
             want_dir = settings.CAM23_ENTRY_DIRECTION.strip()
             line_ok = (not want_line) or (str(event.region_id or "") == want_line)
@@ -273,14 +310,26 @@ async def dispatch_event(event: ParsedCameraEvent, db: Session) -> dict:
         # ANPR (with multipart JPEG) drives entry_exit_log creation. This makes
         # the entry-camera flow identical to the exit-camera flow: both rely on
         # the inline multipart image, neither needs the ISAPI snapshot fetch.
-        if event.event_type in ("ANPR", "AccessControllerEvent") and event.plate_number:
-            await handle_anpr_event(event, db)
+        if (
+            event.event_type in ("ANPR", "AccessControllerEvent")
+            and event.plate_number
+            and not (
+                entry_v2_is_authoritative()
+                and is_entry_v2_non_exit_attempt(event)
+            )
+        ):
+            post_commit_forward = await handle_anpr_event(event, db)
+            if isinstance(post_commit_forward, AnprPostCommitForward):
+                _post_commit_anpr_forwards.append(post_commit_forward)
 
         # ── MAINTENANCE ───────────────────────────────────────────────────────
         # Pending logic removed per user request
 
         # FIX #2: Return pending cache keys for the router to record after commit
-        return {"occupancy_cache_keys": _post_commit_cache_keys}
+        return {
+            "occupancy_cache_keys": _post_commit_cache_keys,
+            "anpr_forwards": _post_commit_anpr_forwards,
+        }
 
     except Exception as e:
         db.rollback()

@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
-from datetime import datetime, UTC, timedelta
+from datetime import datetime, UTC, timedelta, timezone
 from app.models.vehicle import Vehicle
 from app.services.entry_exit_service import (
     handle_anpr_event,
@@ -25,6 +25,7 @@ from app.services.entry_exit_service import (
     _pending_crossings,
     _recent_entries,
     CAM03_PMS_DIRECTION,
+    SourceTimestampUnavailable,
 )
 from app.services.event_parser import ParsedCameraEvent
 from app.config import facility_now_naive
@@ -51,6 +52,36 @@ def make_anpr_event(plate="ABC-1234", gate="entry", trigger_time=None,
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "should_reject"),
+    [("off", False), ("shadow", False), ("authoritative", True)],
+)
+async def test_exit_receive_time_fallback_is_mode_scoped(
+    monkeypatch,
+    mode,
+    should_reject,
+):
+    monkeypatch.setattr(
+        "app.services.entry_exit_service.settings.ENTRY_V2_MODE",
+        mode,
+    )
+    event = make_anpr_event(gate="exit")
+    event.trigger_time_source = "pms_receive_missing"
+    db = MagicMock()
+
+    if should_reject:
+        with pytest.raises(SourceTimestampUnavailable):
+            await handle_anpr_event(event, db)
+        db.add.assert_not_called()
+    else:
+        result = await handle_anpr_event(event, db)
+        assert result is not None
+
+    if should_reject:
+        db.add.assert_not_called()
+
+
 def make_vehicle(registered=False, plate="ABC-1234"):
     v = MagicMock(spec=Vehicle)
     v.id = 42
@@ -69,7 +100,8 @@ def make_db(first_side_effect=None):
     q.filter.return_value = q
     q.order_by.return_value = q
     if first_side_effect:
-        q.first.side_effect = first_side_effect
+        results = iter(first_side_effect)
+        q.first.side_effect = lambda: next(results, None)
     else:
         q.first.return_value = None
     return db
@@ -569,6 +601,142 @@ class TestEntryExitService:
 
         mock_alert.assert_called_once()
         mock_broadcast.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.close_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_exit_forward_carries_original_aware_camera_timestamp(
+        self,
+        mock_vs,
+        mock_close,
+        mock_alert,
+        mock_settings,
+        mock_pms,
+    ):
+        configure_settings(mock_settings, two_phase=False)
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+        captured_at = datetime(2026, 7, 21, 9, 0, tzinfo=timezone(timedelta(hours=3)))
+
+        forward = await handle_anpr_event(
+            make_anpr_event(gate="exit", trigger_time=captured_at),
+            make_db(first_side_effect=[None, None]),
+        )
+
+        assert forward is not None
+        assert forward.captured_at == captured_at
+        await forward.deliver()
+        mock_pms.assert_awaited_once_with(
+            "ABC-1234",
+            "exit",
+            image_path=None,
+            captured_at=captured_at,
+        )
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.close_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_duplicate_exit_replays_va_forward_without_repeating_pms_mutation(
+        self,
+        mock_vs,
+        mock_close,
+        mock_alert,
+        mock_settings,
+        mock_pms,
+    ):
+        """A camera retry heals a crash after exit commit but before VA delivery."""
+        configure_settings(mock_settings, two_phase=False)
+        captured_at = datetime(
+            2026,
+            7,
+            21,
+            9,
+            0,
+            tzinfo=timezone(timedelta(hours=3)),
+        )
+        event = make_anpr_event(gate="exit", trigger_time=captured_at)
+        event.local_snapshot_path = "/tmp/retried-exit.jpg"
+        db = make_db(first_side_effect=[MagicMock()])
+
+        forward = await handle_anpr_event(event, db)
+
+        assert forward is not None
+        assert forward.plate == "ABC-1234"
+        assert forward.direction == "exit"
+        assert forward.image_path == "/tmp/retried-exit.jpg"
+        assert forward.captured_at == captured_at
+        db.add.assert_not_called()
+        mock_vs.ensure_unregistered_vehicle.assert_not_called()
+        mock_close.assert_not_called()
+        mock_alert.assert_not_awaited()
+
+        await forward.deliver()
+        mock_pms.assert_awaited_once_with(
+            "ABC-1234",
+            "exit",
+            image_path="/tmp/retried-exit.jpg",
+            captured_at=captured_at,
+        )
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.acquire_plate_transaction_lock")
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.close_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_exit_locks_plate_before_state_queries(
+        self,
+        mock_vs,
+        mock_close,
+        mock_alert,
+        mock_settings,
+        mock_lock,
+    ):
+        configure_settings(mock_settings, two_phase=False)
+        mock_settings.ENTRY_V2_MODE = "authoritative"
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+        db = make_db(first_side_effect=[None, None])
+        query = db.query
+        calls = []
+        mock_lock.side_effect = lambda *_: calls.append("lock")
+        db.query.side_effect = lambda *_: (calls.append("query"), query.return_value)[1]
+
+        await handle_anpr_event(make_anpr_event(gate="exit"), db)
+
+        mock_lock.assert_called_once_with(db, "ABC-1234")
+        assert calls[:2] == ["lock", "query"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["off", "shadow"])
+    @patch("app.services.entry_exit_service.acquire_plate_transaction_lock")
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.close_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_non_authoritative_exit_does_not_take_v2_plate_lock(
+        self,
+        mock_vs,
+        mock_close,
+        mock_alert,
+        mock_settings,
+        mock_lock,
+        mode,
+    ):
+        configure_settings(mock_settings, two_phase=False)
+        mock_settings.ENTRY_V2_MODE = mode
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+
+        await handle_anpr_event(
+            make_anpr_event(gate="exit"),
+            make_db(first_side_effect=[None, None]),
+        )
+
+        mock_lock.assert_not_called()
 
     # ── UC2: Parking duration (exit path — unchanged) ─────────────────────
 

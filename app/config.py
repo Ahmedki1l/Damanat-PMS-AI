@@ -4,11 +4,12 @@ Application configuration using Pydantic-Settings.
 All settings can be overridden via environment variables or .env file.
 """
 
+from ipaddress import ip_network
+from typing import Any, Literal, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from pydantic import model_validator, ConfigDict
+from pydantic import ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings
-from typing import Optional, Dict, List, Any
 
 
 # Canonical gate assignments (entry/exit) for the internal floor-to-floor and
@@ -23,6 +24,15 @@ GATE_RULES: dict[str, str] = {
     "CAM-ENTRY": "entry",
     "CAM-EXIT": "exit",
 }
+
+
+def parse_camera_source_networks(value: str) -> tuple[Any, ...]:
+    """Parse exact peer IPs or CIDRs; invalid entries fail configuration."""
+    return tuple(
+        ip_network(item.strip(), strict=False)
+        for item in value.split(",")
+        if item.strip()
+    )
 
 
 def apply_gate_rules(cameras: dict) -> dict:
@@ -84,6 +94,11 @@ class Settings(BaseSettings):
 
     # ── Security ──────────────────────────────────────────────────────────
     API_KEY: Optional[str] = None   # Set in .env to enable auth on API endpoints
+    CAMERA_EVENT_MAX_BODY_BYTES: int = Field(
+        default=16 * 1024 * 1024,
+        gt=0,
+    )
+    CAMERA_EVENT_ALLOWED_SOURCE_CIDRS: str = ""
 
     # ── Node.js Core Backend Integration ─────────────────────────────────
     NODEBACK_URL: str = ""          # e.g. "http://localhost:3000"; empty = disabled
@@ -92,6 +107,59 @@ class Settings(BaseSettings):
 
     # ── PMS Tracking API Integration ─────────────────────────────────────
     PMS_API_URL: str = ""           # e.g. "http://localhost:8000"; empty = disabled
+
+    # ── Entry validation V2 (PMS-AI ↔ Video Analytics) ─────────────────
+    # off:           existing burst/FIFO entry flow only (safe default)
+    # shadow:        existing flow remains authoritative; evidence is mirrored
+    # authoritative: VA confirmations are the only writer of entry log/session
+    ENTRY_V2_MODE: Literal["off", "shadow", "authoritative"] = "off"
+    ENTRY_V2_SERVICE_KEY: str = ""
+    ENTRY_V2_CAMERA_ALIASES: str = ""
+    ENTRY_V2_CONNECT_TIMEOUT_SECONDS: float = Field(
+        default=2.0, gt=0, allow_inf_nan=False
+    )
+    ENTRY_V2_READ_TIMEOUT_SECONDS: float = Field(
+        default=30.0, gt=0, allow_inf_nan=False
+    )
+    ENTRY_V2_WRITE_TIMEOUT_SECONDS: float = Field(
+        default=10.0, gt=0, allow_inf_nan=False
+    )
+    ENTRY_V2_POOL_TIMEOUT_SECONDS: float = Field(
+        default=2.0, gt=0, allow_inf_nan=False
+    )
+    ENTRY_V2_APPLOCK_TIMEOUT_MS: int = Field(default=1000, ge=0, le=4000)
+    ENTRY_V2_MAX_IMAGE_BYTES: int = Field(
+        default=4 * 1024 * 1024,
+        gt=0,
+        le=4 * 1024 * 1024,
+    )
+    ENTRY_V2_MAX_SOURCE_IMAGE_BYTES: int = Field(
+        default=16 * 1024 * 1024,
+        gt=0,
+        le=16 * 1024 * 1024,
+    )
+    ENTRY_V2_MAX_IMAGES: int = Field(default=4, gt=0, le=4)
+    # The first two bounds are the exact VA decoded-image intake envelope.
+    # Source images may be larger because PMS crops them before forwarding, but
+    # their decode is independently bounded to prevent compressed image bombs.
+    ENTRY_V2_MAX_DECODED_PIXELS: int = Field(
+        default=12_000_000,
+        gt=0,
+        le=12_000_000,
+    )
+    ENTRY_V2_MAX_IMAGE_DIMENSION: int = Field(default=8192, gt=0, le=8192)
+    ENTRY_V2_MAX_SOURCE_DECODED_PIXELS: int = Field(
+        default=30_000_000,
+        gt=0,
+        le=30_000_000,
+    )
+    ENTRY_V2_CROP_PADDING_RATIO: float = Field(
+        default=0.12,
+        ge=0,
+        le=0.5,
+        allow_inf_nan=False,
+    )
+    ENTRY_V2_ONE_WAY_LINES: str = ""
 
     # ── Camera credential decryption ─────────────────────────────────────
     # Shared urlsafe-base64 Fernet key with the API Gateway. Used to decrypt
@@ -251,6 +319,80 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _build_camera_dicts(self) -> "Settings":
         """Build CAMERAS and CAMERA_IP_MAP from individual env vars."""
+        try:
+            source_networks = parse_camera_source_networks(
+                self.CAMERA_EVENT_ALLOWED_SOURCE_CIDRS
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "CAMERA_EVENT_ALLOWED_SOURCE_CIDRS contains an invalid IP/CIDR"
+            ) from exc
+        if self.ENTRY_V2_MODE == "authoritative" and not source_networks:
+            raise ValueError(
+                "CAMERA_EVENT_ALLOWED_SOURCE_CIDRS is required when "
+                "ENTRY_V2_MODE=authoritative"
+            )
+        if self.ENTRY_V2_MODE != "off":
+            base_url = self.PMS_API_URL.strip()
+            try:
+                parsed_url = urlsplit(base_url)
+                _ = parsed_url.port
+            except ValueError as exc:
+                raise ValueError(
+                    "PMS_API_URL must be a valid absolute HTTP(S) URL when "
+                    "ENTRY_V2_MODE is active"
+                ) from exc
+            if (
+                parsed_url.scheme not in {"http", "https"}
+                or not parsed_url.hostname
+                or parsed_url.username
+                or parsed_url.password
+                or parsed_url.query
+                or parsed_url.fragment
+            ):
+                raise ValueError(
+                    "PMS_API_URL must be a credential-free absolute HTTP(S) "
+                    "base URL without a query or fragment when ENTRY_V2_MODE "
+                    "is active"
+                )
+            if not self.ENTRY_V2_SERVICE_KEY.strip():
+                raise ValueError(
+                    "ENTRY_V2_SERVICE_KEY is required when ENTRY_V2_MODE is active"
+                )
+            self.PMS_API_URL = base_url.rstrip("/")
+
+        confirmation_cameras = {
+            camera.strip()
+            for camera in self.ENTRY_CONFIRM_CAMERAS.split(",")
+            if camera.strip()
+        }
+        if (
+            self.ENTRY_V2_MODE == "authoritative"
+            and "CAM-23" in confirmation_cameras
+            and not (
+                self.CAM23_ENTRY_LINE.strip()
+                or self.CAM23_ENTRY_DIRECTION.strip()
+            )
+        ):
+            raise ValueError(
+                "CAM23_ENTRY_LINE or CAM23_ENTRY_DIRECTION is required when "
+                "CAM-23 is enabled in authoritative Entry V2"
+            )
+
+        if (
+            self.ENTRY_V2_MAX_SOURCE_DECODED_PIXELS
+            < self.ENTRY_V2_MAX_DECODED_PIXELS
+        ):
+            raise ValueError(
+                "ENTRY_V2_MAX_SOURCE_DECODED_PIXELS must be greater than or "
+                "equal to ENTRY_V2_MAX_DECODED_PIXELS"
+            )
+        if self.ENTRY_V2_MAX_SOURCE_IMAGE_BYTES > self.CAMERA_EVENT_MAX_BODY_BYTES:
+            raise ValueError(
+                "ENTRY_V2_MAX_SOURCE_IMAGE_BYTES must be less than or equal to "
+                "CAMERA_EVENT_MAX_BODY_BYTES"
+            )
+
         cameras = {}
         ip_map = {}
 
@@ -352,7 +494,9 @@ class Settings(BaseSettings):
     # ramp cam (line-crossing only, no ANPR); CAM-03 is the in-garage backstop.
     ENTRY_CONFIRM_CAMERAS: str = "CAM-23,CAM-03"
     # CAM-23 line id + direction meaning "into the garage" (set from real events,
-    # like OCCUPANCY_ENTRANCE_ZONES). Empty = accept any CAM-23 line-crossing.
+    # like OCCUPANCY_ENTRANCE_ZONES). At least one is required when CAM-23 is an
+    # authoritative V2 confirmation camera; both may stay empty during shadow
+    # calibration, where legacy processing remains authoritative.
     CAM23_ENTRY_LINE: str = ""
     CAM23_ENTRY_DIRECTION: str = ""
     # Per-confirmation-camera PMS `direction` marker, so the PMS can tell the
