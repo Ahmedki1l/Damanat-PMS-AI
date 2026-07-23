@@ -30,6 +30,7 @@ ANPR missed the plate entirely) → an alert is raised.
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from time import monotonic
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -158,14 +159,17 @@ def _open_buffer_for(cam: str) -> dict | None:
 def _attach_pending_crossing(buf: dict) -> None:
     """If a ramp crossing arrived just before this burst started, consume the
     oldest still-valid one and mark the burst confirmed."""
-    now = facility_now_naive()
-    window = settings.ANPR_BURST_WINDOW_SECONDS
-    _pending_crossings[:] = [
-        c for c in _pending_crossings
-        if (now - c["ts"]).total_seconds() <= window
-    ]
-    if _pending_crossings:
-        c = _pending_crossings.pop(0)
+    now = monotonic()
+    valid_index = next(
+        (
+            index
+            for index, crossing in enumerate(_pending_crossings)
+            if now <= crossing["expires_at_monotonic"]
+        ),
+        None,
+    )
+    if valid_index is not None:
+        c = _pending_crossings.pop(valid_index)
         buf["confirmed"] = True
         src = c.get("source") or "CAM-23"
         if c.get("snapshot"):
@@ -272,6 +276,9 @@ async def confirm_entry_crossing(db: Session, snapshot: str | None = None,
         elif allow_silent_entry:
             _pending_crossings.append({
                 "ts": facility_now_naive(),
+                "expires_at_monotonic": (
+                    monotonic() + settings.ENTRY_PENDING_CROSSING_SECONDS
+                ),
                 "snapshot": snapshot,
                 "source": source_cam,
             })
@@ -333,6 +340,7 @@ async def flush_due_entry_bursts(db: Session) -> None:
     raises silent-entry alerts for ramp crossings that never matched a burst.
     Commits once if anything changed."""
     now = facility_now_naive()
+    now_monotonic = monotonic()
     require_confirm = settings.USE_CAM03_ENTRY_CONFIRMATION
     window = settings.ANPR_BURST_WINDOW_SECONDS
     max_age = settings.ANPR_BURST_MAX_SECONDS
@@ -357,7 +365,7 @@ async def flush_due_entry_bursts(db: Session) -> None:
 
         keep = []
         for c in _pending_crossings:
-            if (now - c["ts"]).total_seconds() > window:
+            if now_monotonic > c["expires_at_monotonic"]:
                 silent.append(c)
             else:
                 keep.append(c)

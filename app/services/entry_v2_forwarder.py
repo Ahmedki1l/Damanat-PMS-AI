@@ -2,15 +2,19 @@
 
 The camera still talks only to PMS-AI. This module forwards derived in-memory
 vehicle crops without base64 encoding, filesystem persistence, or an internal
-retry queue. In authoritative mode a retryable VA result is surfaced to the
-camera as HTTP 503 so the source request remains the retry boundary.
+retry queue. Shadow delivery uses one bounded, best-effort FIFO worker so VA
+latency cannot delay the legacy camera response. In authoritative mode a
+retryable VA result is surfaced to the camera as HTTP 503 so the source request
+remains the retry boundary.
 """
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 import hashlib
 import json
+from time import monotonic
 from typing import Optional
 from uuid import UUID, uuid5
 
@@ -33,6 +37,16 @@ _CROSSING_ROLES = {"CAM-23": "primary", "CAM-03": "fallback"}
 _ALIAS_TARGETS = {"CAM-ENTRY", "CAM-EXIT"}
 _MODE_HEADER = "X-Entry-V2-Mode"
 _http_client: Optional[httpx.AsyncClient] = None
+_shadow_queue: Optional[asyncio.Queue[ParsedCameraEvent]] = None
+_shadow_worker_task: Optional[asyncio.Task[None]] = None
+_shadow_accepting = False
+_shadow_enqueued_count = 0
+_shadow_completed_count = 0
+_shadow_failed_count = 0
+_shadow_dropped_count = 0
+_shadow_inflight_count = 0
+_shadow_last_drop_log_at = 0.0
+_shadow_last_failure_log_at = 0.0
 
 
 def _vehicle_images(event: ParsedCameraEvent) -> tuple[TransientImage, ...]:
@@ -185,6 +199,76 @@ def is_entry_crossing(event: ParsedCameraEvent) -> bool:
 
 def is_entry_v2_evidence(event: ParsedCameraEvent) -> bool:
     return is_entry_attempt(event) or is_entry_crossing(event)
+
+
+def entry_v2_shadow_status() -> dict[str, str | int | bool]:
+    """Return process-local queue health for logs, diagnostics, and tests."""
+    queue = _shadow_queue
+    worker = _shadow_worker_task
+    return {
+        "mode": settings.ENTRY_V2_MODE,
+        "accepting": _shadow_accepting,
+        "worker_alive": worker is not None and not worker.done(),
+        "queue_depth": queue.qsize() if queue is not None else 0,
+        "queue_capacity": queue.maxsize if queue is not None else 0,
+        "inflight": _shadow_inflight_count,
+        "enqueued": _shadow_enqueued_count,
+        "completed": _shadow_completed_count,
+        "failed": _shadow_failed_count,
+        "dropped": _shadow_dropped_count,
+    }
+
+
+def enqueue_entry_v2_shadow(event: ParsedCameraEvent) -> bool:
+    """Queue one immutable shadow event without waiting on VA network I/O.
+
+    Returns ``True`` only when relevant evidence was accepted by the worker.
+    A missing/full queue drops the shadow observation but never changes legacy
+    entry/session handling or the camera response.
+    """
+    global _shadow_dropped_count, _shadow_enqueued_count
+    global _shadow_last_drop_log_at
+
+    if settings.ENTRY_V2_MODE != "shadow":
+        return False
+    if not (is_entry_v2_evidence(event) or is_unresolved_attempt(event)):
+        return False
+
+    queue = _shadow_queue
+    if not _shadow_accepting or queue is None:
+        _shadow_dropped_count += 1
+        now = monotonic()
+        if now - _shadow_last_drop_log_at >= 10.0:
+            _shadow_last_drop_log_at = now
+            logger.error(
+                "[EntryV2][shadow] Worker unavailable; dropped camera=%s "
+                "event=%s dropped_total=%d",
+                event.camera_id,
+                event.event_type,
+                _shadow_dropped_count,
+            )
+        return False
+
+    try:
+        queue.put_nowait(event)
+    except asyncio.QueueFull:
+        _shadow_dropped_count += 1
+        now = monotonic()
+        if now - _shadow_last_drop_log_at >= 10.0:
+            _shadow_last_drop_log_at = now
+            logger.warning(
+                "[EntryV2][shadow] Queue full; dropped newest camera=%s "
+                "event=%s depth=%d capacity=%d dropped_total=%d",
+                event.camera_id,
+                event.event_type,
+                queue.qsize(),
+                queue.maxsize,
+                _shadow_dropped_count,
+            )
+        return False
+
+    _shadow_enqueued_count += 1
+    return True
 
 
 def _configured_crossing_direction(camera_id: str) -> str:
@@ -354,6 +438,142 @@ def _http_timeout() -> httpx.Timeout:
     )
 
 
+def _log_retryable_delivery_warning(message: str, *args) -> None:
+    """Rate-limit repeated shadow outage logs while preserving all counters."""
+    global _shadow_last_failure_log_at
+
+    if settings.ENTRY_V2_MODE != "shadow":
+        logger.warning(message, *args)
+        return
+    now = monotonic()
+    if now - _shadow_last_failure_log_at >= 10.0:
+        _shadow_last_failure_log_at = now
+        logger.warning(message, *args)
+
+
+async def _entry_v2_shadow_worker() -> None:
+    """Deliver shadow evidence serially in FIFO enqueue order."""
+    global _shadow_completed_count, _shadow_dropped_count
+    global _shadow_failed_count, _shadow_inflight_count
+
+    queue = _shadow_queue
+    if queue is None:
+        return
+
+    while True:
+        event = await queue.get()
+        _shadow_inflight_count += 1
+        try:
+            try:
+                result = await forward_entry_v2_event(event)
+            except asyncio.CancelledError:
+                _shadow_dropped_count += 1
+                raise
+            except Exception:
+                _shadow_failed_count += 1
+                logger.error(
+                    "[EntryV2][shadow] Unexpected forwarding failure "
+                    "camera=%s event=%s",
+                    event.camera_id,
+                    event.event_type,
+                    exc_info=True,
+                )
+            else:
+                if result is not None and result.retryable:
+                    _shadow_failed_count += 1
+                else:
+                    _shadow_completed_count += 1
+        finally:
+            _shadow_inflight_count -= 1
+            queue.task_done()
+
+
+async def start_entry_v2_shadow_worker() -> None:
+    """Start the process-local bounded shadow FIFO when shadow mode is active."""
+    global _shadow_accepting, _shadow_queue, _shadow_worker_task
+
+    if settings.ENTRY_V2_MODE != "shadow":
+        return
+    if _shadow_worker_task is not None and not _shadow_worker_task.done():
+        return
+
+    _shadow_queue = asyncio.Queue(
+        maxsize=settings.ENTRY_V2_SHADOW_QUEUE_CAPACITY
+    )
+    _shadow_accepting = True
+    _shadow_worker_task = asyncio.create_task(
+        _entry_v2_shadow_worker(),
+        name="entry-v2-shadow-forwarder",
+    )
+    logger.info(
+        "[EntryV2][shadow] Forward worker started capacity=%d",
+        _shadow_queue.maxsize,
+    )
+
+
+async def stop_entry_v2_shadow_worker() -> None:
+    """Drain shadow work for a bounded interval, then release all image bytes."""
+    global _shadow_accepting, _shadow_dropped_count
+    global _shadow_queue, _shadow_worker_task
+
+    _shadow_accepting = False
+    queue = _shadow_queue
+    worker = _shadow_worker_task
+    if queue is None and worker is None:
+        return
+
+    if queue is not None:
+        try:
+            await asyncio.wait_for(
+                queue.join(),
+                timeout=settings.ENTRY_V2_SHADOW_SHUTDOWN_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "[EntryV2][shadow] Shutdown drain timed out queued=%d "
+                "inflight=%d",
+                queue.qsize(),
+                _shadow_inflight_count,
+            )
+
+    if worker is not None:
+        worker.cancel()
+        done, pending = await asyncio.wait(
+            {worker},
+            timeout=min(
+                1.0,
+                settings.ENTRY_V2_SHADOW_SHUTDOWN_TIMEOUT_SECONDS,
+            ),
+        )
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+        if pending:
+            logger.error(
+                "[EntryV2][shadow] Worker did not stop after cancellation; "
+                "process shutdown will release the in-flight event"
+            )
+
+    discarded = 0
+    if queue is not None:
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                queue.task_done()
+                discarded += 1
+    if discarded:
+        _shadow_dropped_count += discarded
+        logger.warning(
+            "[EntryV2][shadow] Released %d queued events during shutdown",
+            discarded,
+        )
+
+    _shadow_worker_task = None
+    _shadow_queue = None
+
+
 async def start_entry_v2_http_client() -> None:
     """Create the app-lifetime VA client once when Entry V2 is active."""
     global _http_client
@@ -472,7 +692,7 @@ async def forward_entry_v2_event(
             },
         )
     except (httpx.TimeoutException, httpx.NetworkError) as exc:
-        logger.warning(
+        _log_retryable_delivery_warning(
             "[EntryV2] VA unavailable for evidence=%s: %s",
             evidence_id,
             exc,
@@ -483,7 +703,7 @@ async def forward_entry_v2_event(
             detail=type(exc).__name__,
         )
     except httpx.HTTPError as exc:
-        logger.warning(
+        _log_retryable_delivery_warning(
             "[EntryV2] HTTP failure for evidence=%s: %s",
             evidence_id,
             exc,
@@ -526,7 +746,7 @@ async def forward_entry_v2_event(
         or response.status_code in retryable_statuses
         or response.status_code >= 500
     ):
-        logger.warning(
+        _log_retryable_delivery_warning(
             "[EntryV2] VA backpressure evidence=%s status=%s: %s",
             evidence_id,
             response.status_code,

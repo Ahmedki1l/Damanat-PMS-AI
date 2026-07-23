@@ -1,7 +1,6 @@
 # app/schemas/responses.py
 """Shared response schemas for endpoints that return simple status dicts."""
-from pydantic import BaseModel, ConfigDict
-from datetime import datetime
+from pydantic import BaseModel
 from typing import Optional
 
 
@@ -61,10 +60,24 @@ class DailyStatsResponse(BaseModel):
     avg_parking_minutes: float
 
 
+class EntryV2ShadowHealthResponse(BaseModel):
+    mode: str
+    accepting: bool
+    worker_alive: bool
+    queue_depth: int
+    queue_capacity: int
+    inflight: int
+    enqueued: int
+    completed: int
+    failed: int
+    dropped: int
+
+
 class HealthResponse(BaseModel):
     status: str
     timestamp: str
     backend: str
     database: str
     cameras: list[str]
+    entry_v2_shadow: EntryV2ShadowHealthResponse
 

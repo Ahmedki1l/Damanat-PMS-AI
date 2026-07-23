@@ -168,6 +168,11 @@ def test_active_entry_v2_rejects_unsafe_or_malformed_peer_url(url):
         ("ENTRY_V2_READ_TIMEOUT_SECONDS", -1),
         ("ENTRY_V2_WRITE_TIMEOUT_SECONDS", float("nan")),
         ("ENTRY_V2_POOL_TIMEOUT_SECONDS", float("inf")),
+        ("ENTRY_V2_SHADOW_QUEUE_CAPACITY", 0),
+        ("ENTRY_V2_SHADOW_QUEUE_CAPACITY", 17),
+        ("ENTRY_V2_SHADOW_SHUTDOWN_TIMEOUT_SECONDS", 0),
+        ("ENTRY_V2_SHADOW_SHUTDOWN_TIMEOUT_SECONDS", 31),
+        ("ENTRY_V2_SHADOW_SHUTDOWN_TIMEOUT_SECONDS", float("nan")),
         ("ENTRY_V2_MAX_IMAGE_BYTES", 0),
         ("ENTRY_V2_MAX_IMAGE_BYTES", 4 * 1024 * 1024 + 1),
         ("ENTRY_V2_MAX_SOURCE_IMAGE_BYTES", 0),
@@ -216,8 +221,22 @@ def test_entry_v2_source_image_limit_cannot_exceed_camera_body_limit():
 def test_entry_v2_image_defaults_match_va_intake_contract():
     configured = Settings(_env_file=None)
 
+    assert configured.ENTRY_V2_SHADOW_QUEUE_CAPACITY == 8
+    assert configured.ENTRY_V2_SHADOW_SHUTDOWN_TIMEOUT_SECONDS == 5.0
     assert configured.ENTRY_V2_MAX_DECODED_PIXELS == 12_000_000
     assert configured.ENTRY_V2_MAX_IMAGE_DIMENSION == 8192
     assert configured.ENTRY_V2_MAX_IMAGE_BYTES == 4 * 1024 * 1024
     assert configured.ENTRY_V2_MAX_SOURCE_IMAGE_BYTES == 16 * 1024 * 1024
     assert configured.ENTRY_V2_MAX_SOURCE_DECODED_PIXELS == 30_000_000
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0, 61, float("inf"), float("nan")],
+)
+def test_pending_crossing_window_fails_fast_outside_safe_bounds(value):
+    with pytest.raises(ValidationError, match="ENTRY_PENDING_CROSSING_SECONDS"):
+        Settings(
+            _env_file=None,
+            ENTRY_PENDING_CROSSING_SECONDS=value,
+        )

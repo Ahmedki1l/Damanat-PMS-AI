@@ -1,5 +1,6 @@
 """Camera-boundary tests for Entry V2 transient and retry behavior."""
 
+import asyncio
 from datetime import datetime, timezone
 from io import BytesIO
 import json
@@ -18,7 +19,11 @@ from app.services.entry_v2_forwarder import (
     ForwardOutcome,
     ForwardResult,
     _request_parts,
+    entry_v2_shadow_status,
+    enqueue_entry_v2_shadow,
     is_entry_crossing,
+    start_entry_v2_shadow_worker,
+    stop_entry_v2_shadow_worker,
 )
 from app.services.entry_state_lock import EntryStateLockUnavailable
 from app.services.entry_exit_service import (
@@ -440,32 +445,146 @@ async def test_authoritative_invalid_evidence_is_terminally_acked(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_shadow_backpressure_preserves_legacy_response(monkeypatch):
-    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+@pytest.mark.parametrize(
+    ("mode", "expected_order"),
+    [
+        ("off", ["dispatch", "commit"]),
+        ("shadow", ["dispatch", "commit", "enqueue"]),
+        ("authoritative", ["v2", "dispatch", "commit"]),
+    ],
+)
+async def test_entry_v2_mode_preserves_legacy_ordering_contract(
+    monkeypatch,
+    mode,
+    expected_order,
+):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", mode)
+    order = []
     db = MagicMock()
-    result = ForwardResult(
-        outcome=ForwardOutcome.UNAVAILABLE,
-        evidence_id="attempt-1",
-        status_code=503,
-    )
+    db.commit.side_effect = lambda: order.append("commit")
+
+    async def forward_v2(_event):
+        order.append("v2")
+        return None
+
+    async def dispatch_legacy(_event, _db):
+        order.append("dispatch")
+        return {}
+
+    def enqueue_shadow(_event):
+        order.append("enqueue")
+        return True
+
     with (
         patch("app.routers.events.parse_camera_event", return_value=_event()),
         patch(
             "app.routers.events.forward_entry_v2_event",
             new_callable=AsyncMock,
-            return_value=result,
+            side_effect=forward_v2,
+        ) as v2,
+        patch(
+            "app.routers.events.dispatch_event",
+            new_callable=AsyncMock,
+            side_effect=dispatch_legacy,
         ),
+        patch(
+            "app.routers.events.enqueue_entry_v2_shadow",
+            side_effect=enqueue_shadow,
+        ) as enqueue,
+    ):
+        response = await receive_camera_event(_Request(), db)
+
+    assert response == {"status": "ok", "event_type": "ANPR"}
+    assert order == expected_order
+    if mode == "authoritative":
+        v2.assert_awaited_once()
+        enqueue.assert_not_called()
+    elif mode == "shadow":
+        v2.assert_not_awaited()
+        enqueue.assert_called_once()
+    else:
+        v2.assert_not_awaited()
+        enqueue.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_shadow_uses_prelegacy_evidence_after_all_legacy_work(monkeypatch):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    parsed_event = _event()
+    order = []
+    forwarded_events = []
+    db = MagicMock()
+    db.commit.side_effect = lambda: order.append("commit")
+    post_commit_forward = SimpleNamespace(
+        deliver=AsyncMock(side_effect=lambda: order.append("deliver"))
+    )
+
+    async def dispatch_legacy(event, _db):
+        order.append("dispatch")
+        # Legacy FIFO rescue is allowed to mutate its own event. Shadow must
+        # still receive the pre-legacy camera/plate evidence.
+        event.camera_id = "CAM-LEGACY-RESCUED"
+        event.plate_number = "LEGACY-9999"
+        return {
+            "occupancy_cache_keys": [("CAM-ENTRY", "ANPR", "entry")],
+            "anpr_forwards": [post_commit_forward],
+        }
+
+    def enqueue_shadow(event):
+        order.append("enqueue")
+        forwarded_events.append(event)
+        return True
+
+    with (
+        patch("app.routers.events.parse_camera_event", return_value=parsed_event),
+        patch(
+            "app.routers.events.dispatch_event",
+            new_callable=AsyncMock,
+            side_effect=dispatch_legacy,
+        ),
+        patch(
+            "app.routers.events.record_event_in_cache",
+            side_effect=lambda _key: order.append("cache"),
+        ),
+        patch(
+            "app.routers.events.enqueue_entry_v2_shadow",
+            side_effect=enqueue_shadow,
+        ),
+    ):
+        response = await receive_camera_event(_Request(), db)
+
+    assert response == {"status": "ok", "event_type": "ANPR"}
+    assert order == ["dispatch", "commit", "cache", "deliver", "enqueue"]
+    assert len(forwarded_events) == 1
+    assert forwarded_events[0] is not parsed_event
+    assert forwarded_events[0].camera_id == "CAM-ENTRY"
+    assert forwarded_events[0].plate_number == "ABC-1234"
+    assert parsed_event.camera_id == "CAM-LEGACY-RESCUED"
+    assert parsed_event.plate_number == "LEGACY-9999"
+
+
+@pytest.mark.asyncio
+async def test_shadow_backpressure_preserves_legacy_response(monkeypatch):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    db = MagicMock()
+    with (
+        patch("app.routers.events.parse_camera_event", return_value=_event()),
         patch(
             "app.routers.events.dispatch_event",
             new_callable=AsyncMock,
             return_value={},
         ) as dispatch,
+        patch(
+            "app.routers.events.enqueue_entry_v2_shadow",
+            return_value=False,
+        ) as enqueue,
     ):
         response = await receive_camera_event(_Request(), db)
 
     assert response == {"status": "ok", "event_type": "ANPR"}
     dispatch.assert_awaited_once()
     db.commit.assert_called_once_with()
+    enqueue.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -480,20 +599,19 @@ async def test_exit_forward_runs_only_after_camera_transaction_commit(monkeypatc
     with (
         patch("app.routers.events.parse_camera_event", return_value=_event()),
         patch(
-            "app.routers.events.forward_entry_v2_event",
-            new_callable=AsyncMock,
-            return_value=None,
-        ),
-        patch(
             "app.routers.events.dispatch_event",
             new_callable=AsyncMock,
             return_value={"anpr_forwards": [forward]},
+        ),
+        patch(
+            "app.routers.events.enqueue_entry_v2_shadow",
+            side_effect=lambda _event: order.append("enqueue"),
         ),
     ):
         response = await receive_camera_event(_Request(), db)
 
     assert response == {"status": "ok", "event_type": "ANPR"}
-    assert order == ["commit", "deliver"]
+    assert order == ["commit", "deliver", "enqueue"]
 
 
 @pytest.mark.asyncio
@@ -583,10 +701,8 @@ async def test_shadow_unexpected_dispatch_failure_preserves_legacy_ack(monkeypat
     with (
         patch("app.routers.events.parse_camera_event", return_value=_event()),
         patch(
-            "app.routers.events.forward_entry_v2_event",
-            new_callable=AsyncMock,
-            return_value=None,
-        ),
+            "app.routers.events.enqueue_entry_v2_shadow",
+        ) as enqueue,
         patch(
             "app.routers.events.dispatch_event",
             new_callable=AsyncMock,
@@ -597,6 +713,250 @@ async def test_shadow_unexpected_dispatch_failure_preserves_legacy_ack(monkeypat
 
     assert response == {"status": "error", "detail": "legacy failure"}
     db.rollback.assert_called_once()
+    enqueue.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_shadow_commit_failure_does_not_forward_uncommitted_evidence(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    db = MagicMock()
+    db.commit.side_effect = RuntimeError("commit failed")
+    with (
+        patch("app.routers.events.parse_camera_event", return_value=_event()),
+        patch(
+            "app.routers.events.enqueue_entry_v2_shadow",
+        ) as enqueue,
+        patch(
+            "app.routers.events.dispatch_event",
+            new_callable=AsyncMock,
+            return_value={},
+        ),
+    ):
+        response = await receive_camera_event(_Request(), db)
+
+    assert response == {"status": "error", "detail": "commit failed"}
+    db.rollback.assert_called_once()
+    enqueue.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_shadow_queue_drop_cannot_change_committed_legacy_success(monkeypatch):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    db = MagicMock()
+    with (
+        patch("app.routers.events.parse_camera_event", return_value=_event()),
+        patch(
+            "app.routers.events.enqueue_entry_v2_shadow",
+            return_value=False,
+        ) as enqueue,
+        patch(
+            "app.routers.events.dispatch_event",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as dispatch,
+    ):
+        response = await receive_camera_event(_Request(), db)
+
+    assert response == {"status": "ok", "event_type": "ANPR"}
+    dispatch.assert_awaited_once()
+    db.commit.assert_called_once()
+    enqueue.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_shadow_webhook_ack_does_not_wait_for_va(monkeypatch):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    monkeypatch.setattr(settings, "ENTRY_V2_SHADOW_QUEUE_CAPACITY", 2)
+    monkeypatch.setattr(
+        settings,
+        "ENTRY_V2_SHADOW_SHUTDOWN_TIMEOUT_SECONDS",
+        1.0,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_forward(_event):
+        started.set()
+        await release.wait()
+        return ForwardResult(
+            outcome=ForwardOutcome.UNAVAILABLE,
+            evidence_id="attempt-delayed",
+            status_code=503,
+        )
+
+    await stop_entry_v2_shadow_worker()
+    baseline = entry_v2_shadow_status()
+    await start_entry_v2_shadow_worker()
+    try:
+        with (
+            patch(
+                "app.services.entry_v2_forwarder.forward_entry_v2_event",
+                new_callable=AsyncMock,
+                side_effect=blocked_forward,
+            ),
+            patch("app.routers.events.parse_camera_event", return_value=_event()),
+            patch(
+                "app.routers.events.dispatch_event",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+        ):
+            response = await asyncio.wait_for(
+                receive_camera_event(_Request(), MagicMock()),
+                timeout=1.0,
+            )
+            assert response == {"status": "ok", "event_type": "ANPR"}
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            assert not release.is_set()
+    finally:
+        release.set()
+        await stop_entry_v2_shadow_worker()
+
+    status = entry_v2_shadow_status()
+    assert status["enqueued"] == baseline["enqueued"] + 1
+    assert status["failed"] == baseline["failed"] + 1
+
+
+@pytest.mark.asyncio
+async def test_shadow_fifo_is_bounded_and_drops_only_shadow(monkeypatch):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    monkeypatch.setattr(settings, "ENTRY_V2_SHADOW_QUEUE_CAPACITY", 1)
+    monkeypatch.setattr(
+        settings,
+        "ENTRY_V2_SHADOW_SHUTDOWN_TIMEOUT_SECONDS",
+        1.0,
+    )
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    delivered = []
+    active = 0
+    max_active = 0
+
+    first = _event()
+    first.plate_number = "FIRST"
+    second = _event()
+    second.plate_number = "SECOND"
+    overflow = _event()
+    overflow.plate_number = "OVERFLOW"
+
+    async def ordered_forward(event):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            delivered.append(event.plate_number)
+            if event.plate_number == "FIRST":
+                first_started.set()
+                await release_first.wait()
+            return None
+        finally:
+            active -= 1
+
+    await stop_entry_v2_shadow_worker()
+    baseline = entry_v2_shadow_status()
+    await start_entry_v2_shadow_worker()
+    try:
+        with patch(
+            "app.services.entry_v2_forwarder.forward_entry_v2_event",
+            new_callable=AsyncMock,
+            side_effect=ordered_forward,
+        ):
+            assert enqueue_entry_v2_shadow(first) is True
+            await asyncio.wait_for(first_started.wait(), timeout=1.0)
+            assert enqueue_entry_v2_shadow(second) is True
+            assert enqueue_entry_v2_shadow(overflow) is False
+            release_first.set()
+            await stop_entry_v2_shadow_worker()
+    finally:
+        release_first.set()
+        await stop_entry_v2_shadow_worker()
+
+    status = entry_v2_shadow_status()
+    assert delivered == ["FIRST", "SECOND"]
+    assert max_active == 1
+    assert status["enqueued"] == baseline["enqueued"] + 2
+    assert status["dropped"] == baseline["dropped"] + 1
+
+
+@pytest.mark.asyncio
+async def test_shadow_worker_survives_one_forwarding_exception(monkeypatch):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    monkeypatch.setattr(settings, "ENTRY_V2_SHADOW_QUEUE_CAPACITY", 2)
+    monkeypatch.setattr(
+        settings,
+        "ENTRY_V2_SHADOW_SHUTDOWN_TIMEOUT_SECONDS",
+        1.0,
+    )
+    attempts = []
+    first = _event()
+    first.plate_number = "FAIL"
+    second = _event()
+    second.plate_number = "PASS"
+
+    async def fail_once(event):
+        attempts.append(event.plate_number)
+        if event.plate_number == "FAIL":
+            raise RuntimeError("VA client regression")
+        return None
+
+    await stop_entry_v2_shadow_worker()
+    baseline = entry_v2_shadow_status()
+    await start_entry_v2_shadow_worker()
+    try:
+        with patch(
+            "app.services.entry_v2_forwarder.forward_entry_v2_event",
+            new_callable=AsyncMock,
+            side_effect=fail_once,
+        ):
+            assert enqueue_entry_v2_shadow(first) is True
+            assert enqueue_entry_v2_shadow(second) is True
+            await stop_entry_v2_shadow_worker()
+    finally:
+        await stop_entry_v2_shadow_worker()
+
+    status = entry_v2_shadow_status()
+    assert attempts == ["FAIL", "PASS"]
+    assert status["failed"] == baseline["failed"] + 1
+    assert status["completed"] == baseline["completed"] + 1
+
+
+@pytest.mark.asyncio
+async def test_shadow_shutdown_timeout_releases_queued_events(monkeypatch):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    monkeypatch.setattr(settings, "ENTRY_V2_SHADOW_QUEUE_CAPACITY", 1)
+    monkeypatch.setattr(
+        settings,
+        "ENTRY_V2_SHADOW_SHUTDOWN_TIMEOUT_SECONDS",
+        0.01,
+    )
+    started = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def blocked_forward(_event):
+        started.set()
+        await never_release.wait()
+        return None
+
+    await stop_entry_v2_shadow_worker()
+    baseline = entry_v2_shadow_status()
+    await start_entry_v2_shadow_worker()
+    with patch(
+        "app.services.entry_v2_forwarder.forward_entry_v2_event",
+        new_callable=AsyncMock,
+        side_effect=blocked_forward,
+    ):
+        assert enqueue_entry_v2_shadow(_event()) is True
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        assert enqueue_entry_v2_shadow(_event()) is True
+        await stop_entry_v2_shadow_worker()
+
+    status = entry_v2_shadow_status()
+    assert status["worker_alive"] is False
+    assert status["queue_depth"] == 0
+    # One in-flight event is cancelled and one queued event is discarded.
+    assert status["dropped"] == baseline["dropped"] + 2
 
 
 @pytest.mark.asyncio

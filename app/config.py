@@ -127,6 +127,15 @@ class Settings(BaseSettings):
     ENTRY_V2_POOL_TIMEOUT_SECONDS: float = Field(
         default=2.0, gt=0, allow_inf_nan=False
     )
+    # Shadow delivery is detached from the camera request. Bound the number of
+    # image-bearing events retained in memory while VA is slow or unavailable.
+    ENTRY_V2_SHADOW_QUEUE_CAPACITY: int = Field(default=8, gt=0, le=16)
+    ENTRY_V2_SHADOW_SHUTDOWN_TIMEOUT_SECONDS: float = Field(
+        default=5.0,
+        gt=0,
+        le=30.0,
+        allow_inf_nan=False,
+    )
     ENTRY_V2_APPLOCK_TIMEOUT_MS: int = Field(default=1000, ge=0, le=4000)
     ENTRY_V2_MAX_IMAGE_BYTES: int = Field(
         default=4 * 1024 * 1024,
@@ -483,6 +492,15 @@ class Settings(BaseSettings):
     # write ONE entry labeled by the LAST read, committed after a short debounce
     # window (idle gap after the final read) — never the first/wrong read.
     ANPR_BURST_WINDOW_SECONDS: float = 2.5   # idle gap after last read → flush
+    # A CAM-23 crossing can reach PMS-AI before Hikvision emits the associated
+    # ANPR webhook. This is a separate correlation window, not the read-idle
+    # debounce above. Keep it tight because the crossing itself has no plate.
+    ENTRY_PENDING_CROSSING_SECONDS: float = Field(
+        default=10.0,
+        gt=0,
+        le=60.0,
+        allow_inf_nan=False,
+    )
     # Hard cap on a buffer's lifetime = the max time from the FIRST plate read
     # (CAM-ENTRY) within which the ramp crossing (CAM-23) must arrive to confirm
     # the burst. Real-world read→crossing travel time is ~8s at this site, so 8s

@@ -5,6 +5,7 @@ POST /events/camera — receives events from all cameras (XML or JSON).
 GET  /events       — lists raw event log with optional filters.
 """
 
+from dataclasses import replace
 from ipaddress import ip_address
 
 from fastapi import APIRouter, Request, Depends
@@ -20,6 +21,7 @@ from app.services.event_parser import (
 )
 from app.services.event_dispatcher import dispatch_event, resolve_exact_vmr_identity
 from app.services.entry_v2_forwarder import (
+    enqueue_entry_v2_shadow,
     forward_entry_v2_event,
     is_authoritative as entry_v2_is_authoritative,
     resolve_entry_v2_camera_alias,
@@ -142,25 +144,31 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
         resolve_exact_vmr_identity(event)
         await run_in_threadpool(finalize_camera_event_images, event)
 
-        # Entry V2 forwards derived in-memory vehicle crops before dispatch can
-        # start a DB transaction. Authoritative mode deliberately makes the
-        # camera request the retry boundary: VA capacity/network failures become
-        # HTTP 503, while deterministic 4xx validation failures are acknowledged
-        # so malformed evidence cannot create an infinite camera retry loop.
-        try:
-            v2_result = await forward_entry_v2_event(event)
-        except Exception:
-            logger.error("[EntryV2] Unexpected forwarding failure", exc_info=True)
-            if entry_v2_is_authoritative():
+        # Capture the mode once so one camera request cannot cross execution
+        # policies if deployment configuration changes during a rollout.
+        entry_v2_mode = settings.ENTRY_V2_MODE
+        # Legacy dispatch may apply its plate-independent FIFO rescue in
+        # off/shadow and mutate camera_id/gate/plate_number. Shadow must observe
+        # the same pre-legacy evidence authoritative mode would receive, while
+        # retaining the derived in-memory crops without duplicating their bytes.
+        shadow_v2_event = replace(event) if entry_v2_mode == "shadow" else None
+
+        # Authoritative V2 must remain the camera-facing retry boundary and run
+        # before any legacy transaction. Shadow is intentionally deferred until
+        # after legacy commit below so VA latency can never consume the legacy
+        # ANPR/crossing correlation window.
+        if entry_v2_mode == "authoritative":
+            try:
+                v2_result = await forward_entry_v2_event(event)
+            except Exception:
+                logger.error("[EntryV2] Unexpected forwarding failure", exc_info=True)
                 return JSONResponse(
                     status_code=503,
                     content={"status": "retry", "detail": "entry validation unavailable"},
                     headers={"Retry-After": "1"},
                 )
-            v2_result = None
 
-        if v2_result is not None and v2_result.retryable:
-            if entry_v2_is_authoritative():
+            if v2_result is not None and v2_result.retryable:
                 logger.warning(
                     "[EntryV2] Returning camera-facing 503 for evidence=%s",
                     v2_result.evidence_id,
@@ -174,11 +182,6 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
                     },
                     headers={"Retry-After": v2_result.retry_after or "1"},
                 )
-            logger.warning(
-                "[EntryV2][shadow] Would return 503 for evidence=%s; "
-                "legacy processing remains authoritative",
-                v2_result.evidence_id,
-            )
 
         # CAM-04 diagnostic: log every field so we can see exit events and ignored types
         if event.camera_id == "CAM-04":
@@ -209,6 +212,13 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
         # the normalized-plate SQL Server application lock.
         for forward in dispatch_result.get("anpr_forwards", []):
             await forward.deliver()
+
+        # Shadow is observation-only: legacy state and all transaction-owned
+        # post-commit work are complete before the bounded FIFO takes ownership
+        # of the immutable image bytes. This call never waits on VA network I/O,
+        # so VA latency cannot extend the legacy camera acknowledgement path.
+        if shadow_v2_event is not None:
+            enqueue_entry_v2_shadow(shadow_v2_event)
 
         return {"status": "ok", "event_type": event.event_type}
 

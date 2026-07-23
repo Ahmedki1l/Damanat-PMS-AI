@@ -24,6 +24,8 @@ from app.services.entry_state_lock import assert_authoritative_lock_backend
 from app.services.entry_v2_forwarder import (
     close_entry_v2_http_client,
     start_entry_v2_http_client,
+    start_entry_v2_shadow_worker,
+    stop_entry_v2_shadow_worker,
 )
 from app.utils.core_backend_client import (
     close_core_backend_http_client,
@@ -144,6 +146,7 @@ async def startup():
     logger.info(f"🌐 Listening on http://{settings.BACKEND_IP}:{settings.BACKEND_PORT}")
 
     await start_entry_v2_http_client()
+    await start_entry_v2_shadow_worker()
     await start_core_backend_http_client()
 
     # Background flusher for the ANPR entry-burst buffer. The CAM-23 ramp-top
@@ -202,6 +205,9 @@ async def _entry_burst_flusher_loop():
 @app.on_event("shutdown")
 async def shutdown():
     logger.info("🛑 Damanat Backend shutting down...")
+    # Stop accepting shadow observations, drain for a bounded interval, and
+    # release queued image bytes before closing the shared VA HTTP client.
+    await stop_entry_v2_shadow_worker()
     from app.services.entry_exit_service import drain_background_forwards
     await drain_background_forwards()
     for attr in ("entry_burst_flusher", "pms_forward_drainer"):

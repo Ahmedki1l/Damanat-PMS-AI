@@ -12,8 +12,8 @@ from sqlalchemy import text
 from app.database import get_db
 from app.config import settings, facility_now_naive
 from app.schemas.responses import HealthResponse
+from app.services.entry_v2_forwarder import entry_v2_shadow_status
 from app.utils.logger import get_logger
-from datetime import datetime, UTC
 
 router = APIRouter()
 logger = get_logger(__name__)
@@ -34,6 +34,7 @@ def health_check(db: Session = Depends(get_db)):
         "backend": "ok",
         "database": "unknown",
         "cameras": list(settings.CAMERAS.keys()),
+        "entry_v2_shadow": entry_v2_shadow_status(),
     }
 
     # Check database
@@ -45,8 +46,6 @@ def health_check(db: Session = Depends(get_db)):
         result["status"] = "degraded"
 
     # Ping cameras in parallel to avoid linear timeouts (G-24)
-    from concurrent.futures import ThreadPoolExecutor
-    
     def check_cam(cam_id_info):
         cam_id, cam = cam_id_info
         try:

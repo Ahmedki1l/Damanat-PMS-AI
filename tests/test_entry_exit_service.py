@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from datetime import datetime, UTC, timedelta, timezone
+from time import monotonic
 from app.models.vehicle import Vehicle
 from app.services.entry_exit_service import (
     handle_anpr_event,
@@ -116,6 +117,7 @@ def configure_settings(mock_settings, *, two_phase: bool):
     }
     mock_settings.ENTRY_ANTIBOUNCE_SECONDS = 0  # disabled — keeps DB queries simple
     mock_settings.ANPR_BURST_WINDOW_SECONDS = 2.5
+    mock_settings.ENTRY_PENDING_CROSSING_SECONDS = 10.0
     mock_settings.ANPR_BURST_MAX_SECONDS = 8.0
     mock_settings.ENTRY_CONFIRM_DIRECTIONS = "CAM-23:ramp-entry,CAM-03:B-entry"
     mock_settings.ENTRY_CONFIRM_MATCH_SECONDS = 30.0
@@ -130,9 +132,8 @@ def _force_idle():
 
 def _age_pending_crossings():
     """Push every pending ramp crossing past its window so the flusher reaps it."""
-    old = facility_now_naive() - timedelta(seconds=999)
     for c in _pending_crossings:
-        c["ts"] = old
+        c["expires_at_monotonic"] = monotonic() - 1.0
 
 
 # ── Test class ────────────────────────────────────────────────────────────────
@@ -519,6 +520,117 @@ class TestEntryExitService:
         assert CAM03_PMS_DIRECTION not in markers
 
     # ── UC1: silent entry (ramp crossing, no plate read) ───────────────────
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_crossing_to_anpr_uses_dedicated_window(
+        self,
+        mock_vs,
+        mock_alert,
+        mock_settings,
+    ):
+        """A crossing remains correlatable after the 2.5s read-idle debounce."""
+        configure_settings(mock_settings, two_phase=True)
+        db = make_db()
+
+        await confirm_entry_crossing(
+            db,
+            snapshot="ramp.jpg",
+            source_cam="CAM-23",
+        )
+        # The old implementation incorrectly expired this from the wall-clock
+        # age using ANPR_BURST_WINDOW_SECONDS. The dedicated monotonic deadline
+        # remains valid independently of that debounce.
+        _pending_crossings[0]["ts"] = (
+            facility_now_naive() - timedelta(seconds=5)
+        )
+        _pending_crossings[0]["expires_at_monotonic"] = monotonic() + 5.0
+
+        await handle_anpr_event(make_anpr_event(pic_num=1), db)
+
+        assert len(_pending_crossings) == 0
+        assert len(_entry_bursts) == 1
+        burst = next(iter(_entry_bursts.values()))
+        assert burst["confirmed"] is True
+        assert burst["confirm_source"] == "CAM-23"
+        mock_alert.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.monotonic", side_effect=[100.0, 110.0])
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_pending_crossing_is_valid_at_exact_deadline(
+        self,
+        mock_vs,
+        mock_alert,
+        mock_settings,
+        mock_monotonic,
+    ):
+        configure_settings(mock_settings, two_phase=True)
+        mock_settings.ENTRY_PENDING_CROSSING_SECONDS = 10.0
+        db = make_db()
+
+        await confirm_entry_crossing(db, source_cam="CAM-23")
+        await handle_anpr_event(make_anpr_event(pic_num=1), db)
+
+        assert mock_monotonic.call_count == 2
+        assert not _pending_crossings
+        assert next(iter(_entry_bursts.values()))["confirmed"] is True
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_expired_crossing_does_not_confirm_late_anpr(
+        self,
+        mock_vs,
+        mock_alert,
+        mock_settings,
+    ):
+        configure_settings(mock_settings, two_phase=True)
+        db = make_db()
+
+        await confirm_entry_crossing(
+            db,
+            snapshot="expired.jpg",
+            source_cam="CAM-23",
+        )
+        _pending_crossings[0]["expires_at_monotonic"] = monotonic() - 1.0
+        await handle_anpr_event(make_anpr_event(pic_num=1), db)
+
+        assert next(iter(_entry_bursts.values()))["confirmed"] is False
+        # The expired physical crossing is retained until the flusher records
+        # its silent-entry alert; a late ANPR webhook cannot consume it.
+        assert len(_pending_crossings) == 1
+        await flush_due_entry_bursts(db)
+        assert not _pending_crossings
+        mock_alert.assert_awaited_once()
+        assert mock_alert.call_args.kwargs["alert_type"] == "silent_entry"
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_pending_crossing_can_confirm_only_one_burst(
+        self,
+        mock_vs,
+        mock_alert,
+        mock_settings,
+    ):
+        configure_settings(mock_settings, two_phase=True)
+        db = make_db()
+
+        await confirm_entry_crossing(db, source_cam="CAM-23")
+        await handle_anpr_event(make_anpr_event(plate="CAR-A", pic_num=1), db)
+        await handle_anpr_event(make_anpr_event(plate="CAR-B", pic_num=1), db)
+
+        assert not _pending_crossings
+        bursts = list(_entry_bursts.values())
+        assert len(bursts) == 2
+        assert [burst["confirmed"] for burst in bursts] == [True, False]
 
     @pytest.mark.asyncio
     @patch("app.services.entry_exit_service.settings")
