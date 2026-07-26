@@ -33,6 +33,7 @@ from app.services.entry_exit_service import (
 from app.services.event_parser import (
     ParsedCameraEvent,
     TransientImage,
+    _prepare_v2_vehicle_images,
     parse_camera_event,
 )
 
@@ -2016,3 +2017,62 @@ async def test_authoritative_dispatch_does_not_fifo_correct_misread(monkeypatch)
     legacy_entry.assert_not_awaited()
     assert misread.camera_id == "UNKNOWN-10.1.20.60"
     assert misread.plate_number == "66466RA"
+
+
+def _v2_entry_event():
+    """An ANPR entry event that satisfies the Entry V2 evidence predicate."""
+    event = _event()
+    event.gate = "entry"
+    return event
+
+
+@pytest.mark.parametrize(
+    "filename, expected_route",
+    [
+        # A camera-side crop is forwarded verbatim, so whatever the camera framed
+        # becomes the evidence — this is the route that can hand OCR a plate
+        # already cut off at the crop boundary.
+        ("vehiclePicture.jpg", "camera_side_crop"),
+        ("licensePlatePicture.jpg", "skipped_plate_part"),
+        ("someOtherPart.jpg", "skipped_unmatched_id"),
+    ],
+)
+def test_v2_part_selection_logs_route_and_sizes(
+    monkeypatch, caplog, filename, expected_route
+):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    images = (
+        TransientImage(
+            data=_jpeg(701, 407),
+            content_type="image/jpeg",
+            filename=filename,
+            source_name=filename,
+        ),
+        # A second part keeps `generic_single` false so the unmatched-id branch
+        # is actually reachable.
+        TransientImage(
+            data=_jpeg(64, 64),
+            content_type="image/jpeg",
+            filename="filler.jpg",
+            source_name="filler.jpg",
+        ),
+    )
+
+    with caplog.at_level("INFO", logger="app.services.event_parser"):
+        _prepare_v2_vehicle_images(_v2_entry_event(), images)
+
+    line = next(
+        m for m in caplog.messages
+        if m.startswith("[EntryV2][part]") and filename.lower() in m.lower()
+    )
+    assert f"route={expected_route}" in line
+    assert "camera=CAM-ENTRY" in line
+    assert "source=701x407" in line
+    if expected_route.startswith("skipped"):
+        assert "forwarded=dropped" in line
+        assert "bbox=none" in line
+    else:
+        # Forwarded verbatim: the whole-image bbox is the tell that no vehicle
+        # rectangle was applied.
+        assert "bbox=0,0,1,1n" in line
+        assert "forwarded=701x407" in line

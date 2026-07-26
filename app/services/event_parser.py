@@ -317,6 +317,53 @@ def _image_identifier(image: TransientImage) -> str:
     )
 
 
+def _image_pixel_size(image: TransientImage) -> str:
+    """``WxH`` from the encoded header alone, or ``?x?`` when unreadable.
+
+    Header-only read (PIL does not decode until ``load()``), so this stays cheap
+    enough for the per-part diagnostic below and can never raise into the
+    webhook path.
+    """
+    try:
+        with Image.open(BytesIO(image.data)) as decoded:
+            return f"{decoded.size[0]}x{decoded.size[1]}"
+    except Exception:
+        return "?x?"
+
+
+def _log_v2_part_selection(
+    event: ParsedCameraEvent,
+    image: TransientImage,
+    route: str,
+    forwarded: Optional[TransientImage] = None,
+    bbox: Optional[VehicleBoundingBox] = None,
+) -> None:
+    """Record which multipart part became Entry V2 evidence, and at what size.
+
+    VA's plate OCR can only be as good as the pixels it is handed, but the crop
+    it receives is memory-only — when a plate arrives already truncated there is
+    no artefact left showing WHICH camera part it came from or how it was cut.
+    Logging the identifier beside the source and forwarded dimensions makes a
+    camera-side crop that is framed on the plate rather than the vehicle
+    distinguishable from a bad rectangle, without persisting evidence images.
+    """
+    logger.info(
+        "[EntryV2][part] camera=%s type=%s route=%s id=%r source=%s bytes=%d "
+        "bbox=%s forwarded=%s",
+        event.camera_id,
+        event.event_type,
+        route,
+        _image_identifier(image) or image.filename,
+        _image_pixel_size(image),
+        len(image.data),
+        "none" if bbox is None else (
+            f"{bbox.x:.4g},{bbox.y:.4g},{bbox.width:.4g},{bbox.height:.4g}"
+            f"{'n' if bbox.normalized else 'px'}"
+        ),
+        "dropped" if forwarded is None else _image_pixel_size(forwarded),
+    )
+
+
 def _identifier_keys(*values: Optional[str]) -> set[str]:
     """Normalize MIME/XML image identifiers without fuzzy substring matching."""
     keys: set[str] = set()
@@ -621,15 +668,16 @@ def _prepare_v2_vehicle_images(
             break
         identifier = _image_identifier(image)
         if "plate" in identifier:
+            _log_v2_part_selection(event, image, "skipped_plate_part")
             continue
         if "vehiclepicture" in identifier or "vehiclecrop" in identifier:
             # Explicit vehicle-picture parts are camera-side crops, but still
             # decode/re-encode them to enforce byte/pixel bomb limits.
-            crop = _crop_vehicle_image(
-                image,
-                VehicleBoundingBox(0, 0, 1, 1, normalized=True),
-                len(prepared) + 1,
-            )
+            whole = VehicleBoundingBox(0, 0, 1, 1, normalized=True)
+            crop = _crop_vehicle_image(image, whole, len(prepared) + 1)
+            # Forwarded as-is: whatever the camera framed IS the evidence, so a
+            # part cropped tight on the plate reaches OCR already truncated.
+            _log_v2_part_selection(event, image, "camera_side_crop", crop, whole)
             if crop is not None:
                 prepared.append(crop)
             continue
@@ -640,6 +688,7 @@ def _prepare_v2_vehicle_images(
         # when the matching camera rectangle is present, and it is still cropped.
         generic_single = len(images) == 1
         if not (is_anpr_overview or is_line_overview or generic_single):
+            _log_v2_part_selection(event, image, "skipped_unmatched_id")
             continue
         vehicle_bbox = _vehicle_bbox_for_image(event, image, len(images))
         if vehicle_bbox is None:
@@ -653,11 +702,15 @@ def _prepare_v2_vehicle_images(
                     event.crossing_direction,
                     image.filename,
                 )
+                whole = VehicleBoundingBox(0, 0, 1, 1, normalized=True)
                 crop = _crop_vehicle_image(
                     image,
-                    VehicleBoundingBox(0, 0, 1, 1, normalized=True),
+                    whole,
                     len(prepared) + 1,
                     full_frame_fallback=True,
+                )
+                _log_v2_part_selection(
+                    event, image, "full_frame_fallback", crop, whole
                 )
                 if crop is not None:
                     prepared.append(crop)
@@ -666,8 +719,10 @@ def _prepare_v2_vehicle_images(
                 "[EntryV2] No vehicle rectangle for %s; full frame not forwarded",
                 image.filename,
             )
+            _log_v2_part_selection(event, image, "skipped_no_rectangle")
             continue
         crop = _crop_vehicle_image(image, vehicle_bbox, len(prepared) + 1)
+        _log_v2_part_selection(event, image, "vehicle_rect_crop", crop, vehicle_bbox)
         if crop is not None:
             prepared.append(crop)
     return tuple(prepared)
