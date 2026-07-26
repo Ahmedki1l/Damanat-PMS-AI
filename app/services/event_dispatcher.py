@@ -28,8 +28,11 @@ logger = get_logger(__name__)
 # ipAddress/deviceSerial — handle_anpr_event then drops it for "no gate", so no
 # entry is ever logged. We bridge the gap: remember the gate camera the paired
 # vehicleMatchResult resolved to, keyed by plate, and let the follow-on ANPR
-# inherit it. Bounded by ANPR_BURST_MAX_SECONDS so a stale hint can never
-# mislabel a later car. Per-process, like the entry burst buffer it feeds.
+# inherit it. Bounded by VMR_GATE_HINT_TTL_SECONDS so a stale hint can never
+# mislabel a later car. That bound is intentionally NOT the burst lifetime: the
+# burst cap is how long we wait for a slow driver, this is how long one car's
+# identity may be borrowed by another event. Per-process, like the entry burst
+# buffer it feeds.
 _VMR_GATE_HINTS: dict[str, tuple[str, str, float]] = {}
 
 # THE PLATE-KEYED HINT ABOVE CANNOT RESCUE A MISREAD — the one case that matters.
@@ -57,7 +60,7 @@ _VMR_RECENT: list[tuple[str, str, str, float]] = []  # (plate, camera_id, gate, 
 
 
 def _prune_vmr(now: float) -> None:
-    """Drop expired hints from both stores. Bounded by ANPR_BURST_MAX_SECONDS."""
+    """Drop expired hints from both stores. Bounded by VMR_GATE_HINT_TTL_SECONDS."""
     for plate in [p for p, (_, _, dl) in _VMR_GATE_HINTS.items() if dl <= now]:
         _VMR_GATE_HINTS.pop(plate, None)
     _VMR_RECENT[:] = [h for h in _VMR_RECENT if h[3] > now]
@@ -72,7 +75,7 @@ def _remember_vmr_gate(event: ParsedCameraEvent) -> None:
     now = time.monotonic()
     # Opportunistically prune expired hints so the stores stay bounded.
     _prune_vmr(now)
-    deadline = now + settings.ANPR_BURST_MAX_SECONDS
+    deadline = now + settings.VMR_GATE_HINT_TTL_SECONDS
     _VMR_GATE_HINTS[event.plate_number] = (event.camera_id, gate, deadline)
     if not entry_v2_is_authoritative():
         _VMR_RECENT.append((event.plate_number, event.camera_id, gate, deadline))

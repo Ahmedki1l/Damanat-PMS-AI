@@ -33,6 +33,8 @@ from app.services.entry_exit_service import (
 from app.services.event_parser import (
     ParsedCameraEvent,
     TransientImage,
+    VehicleBoundingBox,
+    VehicleImageRegion,
     _prepare_v2_vehicle_images,
     parse_camera_event,
 )
@@ -1274,7 +1276,12 @@ def test_authoritative_entry_multipart_stays_in_memory(
     assert event.transient_images[0].source_name == "detectionpicture.jpg"
     assert event.transient_images[0].data != image
     with Image.open(BytesIO(event.transient_images[0].data)) as crop:
-        assert crop.size == (50, 38)
+        # The ANPR overview is forwarded as a bounded FULL FRAME, not a crop to
+        # `vehicelRect`: that rectangle describes Hikvision's own composited
+        # plate/OSD overlay, so cropping to it fed OCR a re-read of the camera's
+        # output instead of the car. Source is 100x80, so the full frame is 100x80.
+        # Still in memory, still role=vehicle, still nothing on disk.
+        assert crop.size == (100, 80)
     assert list(tmp_path.iterdir()) == []
 
 
@@ -1367,7 +1374,12 @@ def test_anpr_picture_info_rectangles_match_exact_multipart_images(
     for transient in event.transient_images:
         with Image.open(BytesIO(transient.data)) as crop:
             crop_sizes.append(crop.size)
-    assert crop_sizes == [(14, 38), (26, 14)]
+    # Per-part rectangle matching is still exercised — an image whose filename
+    # matches no pictureInfo rectangle is dropped, which is why only A and B are
+    # forwarded and detectionPictureUnknown.jpg is not. The rectangle's presence
+    # is the gate; its coordinates are deliberately no longer used for ANPR, so
+    # both parts arrive as the bounded full frame rather than distinct crops.
+    assert crop_sizes == [(100, 100), (100, 100)]
     assert list(tmp_path.iterdir()) == []
 
 
@@ -2076,3 +2088,80 @@ def test_v2_part_selection_logs_route_and_sizes(
         # rectangle was applied.
         assert "bbox=0,0,1,1n" in line
         assert "forwarded=701x407" in line
+
+
+def test_anpr_overview_forwards_full_frame_not_the_overlay_rect(monkeypatch):
+    """`vehicelRect` on an ANPR overview points at Hikvision's composited
+    plate/OSD overlay, so its coordinates must not select the evidence."""
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    monkeypatch.setattr(settings, "ENTRY_V2_ANPR_FULL_FRAME", True)
+    event = _v2_entry_event()
+    # A rect anchored top-left, exactly the shape production reports (the overlay).
+    event.vehicle_image_regions = [
+        VehicleImageRegion(
+            identifiers=("detectionpicture.jpg",),
+            bbox=VehicleBoundingBox(54, 21, 565, 755, normalized=False),
+        )
+    ]
+    images = (
+        TransientImage(
+            data=_jpeg(2688, 1552),
+            content_type="image/jpeg",
+            filename="detectionPicture.jpg",
+            source_name="detectionPicture.jpg",
+        ),
+    )
+
+    prepared = _prepare_v2_vehicle_images(event, images)
+
+    assert len(prepared) == 1
+    with Image.open(BytesIO(prepared[0].data)) as out:
+        # Full frame, NOT the 687x867 the overlay rect would have produced.
+        assert out.size == (2688, 1552)
+    assert prepared[0].role == "vehicle"
+
+
+def test_anpr_overview_without_any_rect_still_forwards_nothing(monkeypatch):
+    """The rectangle's PRESENCE remains the vehicle-detected gate — a frame of
+    the open road must never ship as vehicle evidence just because OCR wants it."""
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    monkeypatch.setattr(settings, "ENTRY_V2_ANPR_FULL_FRAME", True)
+    event = _v2_entry_event()
+    event.vehicle_image_regions = []
+    event.vehicle_bbox = None
+    images = (
+        TransientImage(
+            data=_jpeg(2688, 1552),
+            content_type="image/jpeg",
+            filename="detectionPicture.jpg",
+            source_name="detectionPicture.jpg",
+        ),
+    )
+
+    assert _prepare_v2_vehicle_images(event, images) == ()
+
+
+def test_anpr_full_frame_can_be_disabled_without_a_redeploy(monkeypatch):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    monkeypatch.setattr(settings, "ENTRY_V2_ANPR_FULL_FRAME", False)
+    event = _v2_entry_event()
+    event.vehicle_image_regions = [
+        VehicleImageRegion(
+            identifiers=("detectionpicture.jpg",),
+            bbox=VehicleBoundingBox(54, 21, 565, 755, normalized=False),
+        )
+    ]
+    images = (
+        TransientImage(
+            data=_jpeg(2688, 1552),
+            content_type="image/jpeg",
+            filename="detectionPicture.jpg",
+            source_name="detectionPicture.jpg",
+        ),
+    )
+
+    prepared = _prepare_v2_vehicle_images(event, images)
+
+    assert len(prepared) == 1
+    with Image.open(BytesIO(prepared[0].data)) as out:
+        assert out.size == (687, 867)   # the old overlay-rect crop

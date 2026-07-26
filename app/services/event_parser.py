@@ -317,6 +317,33 @@ def _image_identifier(image: TransientImage) -> str:
     )
 
 
+def _bbox_presence_is_plausible(bbox: VehicleBoundingBox) -> bool:
+    """Whether a rectangle is sane enough to mean "a vehicle was detected here".
+
+    The ANPR full-frame path uses only the rectangle's PRESENCE, never its
+    coordinates — but a rectangle carrying non-finite or overflowing values is
+    corrupt payload, not a detection. Without this check such a body would stop
+    being rejected (its coordinates are no longer read), get forwarded, and turn
+    a deterministically-malformed event into a retryable failure the camera
+    repeats forever. Mirrors the padding-overflow guard in _crop_vehicle_image.
+    """
+    padding = settings.ENTRY_V2_CROP_PADDING_RATIO
+    if not all(
+        math.isfinite(value)
+        for value in (bbox.x, bbox.y, bbox.width, bbox.height)
+    ):
+        return False
+    return all(
+        math.isfinite(edge)
+        for edge in (
+            bbox.x - bbox.width * padding,
+            bbox.y - bbox.height * padding,
+            bbox.x + bbox.width * (1 + padding),
+            bbox.y + bbox.height * (1 + padding),
+        )
+    )
+
+
 def _image_pixel_size(image: TransientImage) -> str:
     """``WxH`` from the encoded header alone, or ``?x?`` when unreadable.
 
@@ -690,7 +717,38 @@ def _prepare_v2_vehicle_images(
         if not (is_anpr_overview or is_line_overview or generic_single):
             _log_v2_part_selection(event, image, "skipped_unmatched_id")
             continue
+
         vehicle_bbox = _vehicle_bbox_for_image(event, image, len(images))
+
+        # `vehicelRect` on an ANPR overview points at Hikvision's own composited
+        # plate/OSD overlay in the top-left, not at the car — so cropping to it
+        # could only ever re-read the camera's own output. Discard its
+        # COORDINATES and forward the bounded full frame so VA localizes the real
+        # plate itself (see the setting's comment for measured numbers).
+        #
+        # The rectangle's PRESENCE is still required. It is Hikvision's "a vehicle
+        # was detected here" signal, and it is the only thing separating a real
+        # car from a spurious ANPR trigger. Keeping that gate preserves the
+        # invariant that an ANPR event with no rectangle forwards nothing at all,
+        # so a frame of the open road is never shipped as vehicle evidence.
+        #
+        # Line overviews are NOT affected: their rectangles are normalized 0..1
+        # and correctly describe the vehicle, so they keep the exact crop.
+        if (
+            is_anpr_overview
+            and settings.ENTRY_V2_ANPR_FULL_FRAME
+            and vehicle_bbox is not None
+            and _bbox_presence_is_plausible(vehicle_bbox)
+        ):
+            whole = VehicleBoundingBox(0, 0, 1, 1, normalized=True)
+            crop = _crop_vehicle_image(
+                image, whole, len(prepared) + 1, full_frame_fallback=True
+            )
+            _log_v2_part_selection(event, image, "anpr_full_frame", crop, whole)
+            if crop is not None:
+                prepared.append(crop)
+            continue
+
         if vehicle_bbox is None:
             if crossing_matches_configured_entry_filter(event):
                 logger.warning(

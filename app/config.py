@@ -168,6 +168,23 @@ class Settings(BaseSettings):
         le=0.5,
         allow_inf_nan=False,
     )
+    # The ANPR detection picture is a COMPOSITE frame: Hikvision paints its own
+    # plate crop and an OSD annotation band into the top-left corner, and the
+    # `vehicelRect` inside pictureInfo describes THAT overlay box - not the car in
+    # the scene. Cropping to the rectangle therefore handed VA a re-read of
+    # Hikvision's own plate output (or, when the crop clipped the band, the
+    # timestamp text) and never the vehicle itself.
+    #
+    # With this on, the ANPR overview is forwarded as a bounded full frame so VA
+    # localizes the plate with its own detector - independent evidence rather than
+    # a re-read, and immune to the camera's overlay setting being toggled off.
+    # Measured over 87 production frames: VA's LPD finds the real plate at
+    # 138-293px (median 171, ~222px after crop padding) and detection improves from
+    # 27% to 42% once the overlay stops competing for the top box. 2688x1552 is
+    # 4.2Mpx against ENTRY_V2_MAX_DECODED_PIXELS=12Mpx, so nothing is downscaled.
+    #
+    # Set False to restore the rectangle crop if field results regress.
+    ENTRY_V2_ANPR_FULL_FRAME: bool = True
     ENTRY_V2_ONE_WAY_LINES: str = ""
 
     # ── Camera credential decryption ─────────────────────────────────────
@@ -505,7 +522,26 @@ class Settings(BaseSettings):
     # (CAM-ENTRY) within which the ramp crossing (CAM-23) must arrive to confirm
     # the burst. Real-world read→crossing travel time is ~8s at this site, so 8s
     # dropped valid entries by ~1s; 20s covers the travel gap plus a slow driver.
-    ANPR_BURST_MAX_SECONDS: float = 20.0     # hard cap on a buffer's lifetime
+    #
+    # 20s covered TRAVEL but not WAITING. The plate is read at the barrier, so the
+    # clock starts there - a driver held at a closed barrier, queued behind another
+    # car, or paused for a pedestrian blows the cap and the entry is discarded with
+    # a perfectly good plate. Measured read->CAM-03 is already 7-20s on a car that
+    # never stops. The pre-burst path allowed 60s (PENDING_ENTRY_TTL_SECONDS) and
+    # did not have this failure, so 60s restores the tolerance the site was built
+    # around. Superseded by the no-timeout Entry V2 design once it is authoritative.
+    ANPR_BURST_MAX_SECONDS: float = 60.0     # hard cap on a buffer's lifetime
+    # The VMR->ANPR camera-identity hint is bounded SEPARATELY and deliberately
+    # stays tight. It used to borrow ANPR_BURST_MAX_SECONDS, so raising the burst
+    # cap would have silently tripled the window in which a stale hint - or the
+    # plate-independent FIFO pairing - can attach one car's gate identity AND its
+    # plate to a different car. A correctness guard, not a patience setting.
+    VMR_GATE_HINT_TTL_SECONDS: float = Field(
+        default=20.0,
+        gt=0,
+        le=60.0,
+        allow_inf_nan=False,
+    )
     # Ramp line-crossing cameras whose crossing confirms "one car physically
     # entered" — used as the entry confirmation + per-car burst boundary, and to
     # detect silent entries (a crossing with no plate read). CAM-23 is the new
