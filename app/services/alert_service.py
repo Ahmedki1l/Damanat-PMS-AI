@@ -78,6 +78,18 @@ async def broadcast_event(
         }
     }
 
+    # Notification suppression. The caller has already persisted and logged the
+    # alert by the time it reaches here, so dropping the publish silences the
+    # dashboard pop-up WITHOUT losing the record — the row is still returned by
+    # GET /alerts. Keyed on the resolved alert_type so a suppressed type stays
+    # suppressed no matter which service published it.
+    if payload["alert_type"] in settings.suppressed_alert_notification_types():
+        logger.debug(
+            f"[Broadcast] SUPPRESSED {payload['alert_type']} | {description} "
+            "(alert still recorded; see SUPPRESSED_ALERT_NOTIFICATION_TYPES)"
+        )
+        return
+
     event_bus.publish(json.dumps(payload))
     logger.debug(f"[Broadcast] {event_type} | {'ALERT' if is_alert else 'INFO'} | {description}")
 

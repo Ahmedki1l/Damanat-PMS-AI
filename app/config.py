@@ -618,6 +618,14 @@ class Settings(BaseSettings):
     # ── Alert Cooldowns ───────────────────────────────────────────────────
     CAPACITY_ALERT_COOLDOWN_SECONDS: int = 5    # Min seconds between capacity_exceeded alerts per zone
 
+    # ── Alert Notification Suppression ────────────────────────────────────
+    # Comma-separated alert_type values that must NOT be pushed to the
+    # real-time SSE stream (/api/v1/alerts/stream). Suppression is
+    # notification-only: the row is still written to `alerts`, still logged,
+    # and still served by GET /api/v1/alerts — the dashboard just stops
+    # popping a live notification for it. Set to "" to notify on everything.
+    SUPPRESSED_ALERT_NOTIFICATION_TYPES: str = "silent_entry"
+
     # ── Logging ───────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 
@@ -625,6 +633,14 @@ class Settings(BaseSettings):
 
     LOG_CAMERA_FILTER: str = ""
     LOG_CAMERA_EXCLUDE: str = ""
+
+    def suppressed_alert_notification_types(self) -> set[str]:
+        """alert_type values excluded from the real-time SSE stream."""
+        return {
+            t.strip()
+            for t in self.SUPPRESSED_ALERT_NOTIFICATION_TYPES.split(",")
+            if t.strip()
+        }
 
     def get_zone_metadata(self, zone_id: Optional[str]) -> dict[str, Any]:
         """Return canonical metadata for a logical zone or gate."""
