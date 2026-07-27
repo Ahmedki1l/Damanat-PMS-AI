@@ -41,6 +41,8 @@ from app.services import parking_session_service
 from app.services import vehicle_service
 from app.services.event_parser import ParsedCameraEvent
 from app.services.alert_service import create_alert
+from app.services import hikcentral
+from app.services.hikcentral import HikImages
 from app.config import settings, facility_now_naive, facility_tz
 from app.utils.logger import get_logger
 from app.utils import core_backend_client
@@ -381,10 +383,79 @@ async def flush_due_entry_bursts(db: Session) -> None:
             f"cam={buf['camera_id']} reads={len(buf['reads'])}"
         )
     for c in silent:
+        # A crossing with no plate is only "silent" once HikCentral has also
+        # failed to name the car. Recovery is attempted first, never after.
+        if await _recover_silent_entry(db, c):
+            changed = True
+            continue
         await _raise_silent_entry_alert(db, c.get("source"), c.get("snapshot"))
         changed = True
     if changed:
         db.commit()
+
+
+def _recovered_burst(outcome, crossing: dict) -> dict:
+    """Shape a HikCentral recovery like an ordinary ANPR burst.
+
+    Reusing the normal flush path is the point: dedup, anti-bounce, vehicle
+    resolution, session creation, alerting and the VA forward all behave
+    identically, so a recovered entry is indistinguishable downstream from one
+    the camera labelled itself. `hik_outcome` rides along so the flush reuses the
+    record already fetched instead of looking the same car up twice.
+    """
+    event_time = outcome.pass_time_local or crossing.get("ts")
+    crossing_snapshot = crossing.get("snapshot")
+    source_cam = crossing.get("source") or "CAM-23"
+    return {
+        "id": 0,
+        # HikCentral saw this car at the entry LPR resource, so the gate camera
+        # is the honest attribution — the ramp cam only proved it moved.
+        "camera_id": "CAM-ENTRY",
+        "reads": [{
+            "plate": outcome.plate,
+            "confidence": None,
+            "pic_num": None,
+            "event_time": event_time,
+            "snapshot_path": None,
+            "local_snapshot_path": None,
+        }],
+        "first_event_time": event_time,
+        "last_read_at": facility_now_naive(),
+        "confirmed": True,
+        "confirm_snapshots": (
+            {source_cam: crossing_snapshot} if crossing_snapshot else {}
+        ),
+        "confirm_source": source_cam,
+        "force_flush": True,
+        "hik_outcome": outcome,
+    }
+
+
+async def _recover_silent_entry(db: Session, crossing: dict) -> bool:
+    """Try to rescue a plateless ramp crossing using HikCentral (Case B).
+
+    Returns True when the crossing became a real entry. False restores the
+    previous behaviour exactly: the caller raises the silent-entry alert.
+
+    Recovery needs exactly one HikCentral candidate in the window — with two
+    cars in flight nothing says which one crossed, and guessing would staple a
+    stranger's plate onto the session.
+    """
+    outcome = await hikcentral.recover_entry_plate(
+        crossing.get("ts"),
+        crossing.get("source") or "CAM-23",
+        db,
+    )
+    if outcome is None or not outcome.plate:
+        return False
+
+    logger.warning(
+        "[UC1] Silent entry RECOVERED from HikCentral: plate=%s guid=%s "
+        "source=%s",
+        outcome.plate, outcome.guid, crossing.get("source"),
+    )
+    await _flush_entry_burst(db, _recovered_burst(outcome, crossing))
+    return True
 
 
 async def _flush_entry_burst(db: Session, buf: dict) -> None:
@@ -413,6 +484,25 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
         f"pic={winner['pic_num']} conf={confidence} reads={len(reads)} "
         f"discarded={discarded}"
     )
+
+    # ── HikCentral validation (Case A) ───────────────────────────────────
+    # CAM-23 has already confirmed the crossing by the time a burst flushes, so
+    # this is the one place a car is validated — exactly one lookup per
+    # candidate. Deliberately ABOVE every DB access: it is network I/O, and the
+    # deadlock documented further down is what happens when an await separates a
+    # write from its commit.
+    #
+    # A burst recovered from HikCentral (Case B) arrives with its record already
+    # resolved; reusing it keeps the one-lookup rule.
+    hik_outcome = buf.get("hik_outcome")
+    if hik_outcome is None:
+        hik_outcome = await hikcentral.validate_entry_plate(plate, event_time, db)
+    if hik_outcome.plate and hik_outcome.plate != plate:
+        logger.warning(
+            "[UC1] plate replaced by HikCentral: %s -> %s (guid=%s)",
+            plate, hik_outcome.plate, hik_outcome.guid,
+        )
+        plate = hik_outcome.plate
 
     # dedup / anti-bounce suppress only the PMS-side occupancy record (the
     # EntryExitLog row, the open session, the alert). They must NOT suppress the
@@ -486,6 +576,14 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
             "sent_sources": set(confirm_snapshots.keys()),
         })
 
+    # HikCentral imagery is fetched only now that suppression has been decided,
+    # so a duplicate or anti-bounced burst — which will never become a session —
+    # never costs a download. Still above the DB writes, so no write lock is held
+    # across this network await (see the deadlock note below).
+    hik_images = HikImages()
+    if not suppress_occupancy:
+        hik_images = await hikcentral.download_hik_images(hik_outcome)
+
     # ── DB WRITES — must complete and COMMIT before any network await below.
     #
     # NEVER hold an uncommitted write across an `await` that does I/O. The DB
@@ -507,6 +605,11 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
         vehicle = vehicle_service.ensure_unregistered_vehicle(db, plate)
         vehicle_type = vehicle.vehicle_type if vehicle else "unknown"
 
+        # A recovered entry has no gate image of its own, and an Entry-V2-style
+        # flush may carry none either — fall back to HikCentral's vehicle shot so
+        # the stay is not imageless on the dashboard.
+        entry_snapshot = snapshot_path or hik_images.vehicle_image_path
+
         log_entry = EntryExitLog(
             plate_number=plate,
             vehicle_id=vehicle.id if vehicle else None,
@@ -514,22 +617,32 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
             gate="entry",
             camera_id=camera_id,
             event_time=event_time,
-            snapshot_path=snapshot_path,
+            snapshot_path=entry_snapshot,
             plate_confidence=confidence,
             created_at=facility_now_naive(),
         )
         db.add(log_entry)
-        parking_session_service.open_session(
+        session = parking_session_service.open_session(
             db,
             plate_number=plate,
             event_time=event_time,
             camera_id=camera_id,
-            snapshot_path=snapshot_path,
+            snapshot_path=entry_snapshot,
             vehicle=vehicle,
+        )
+        # open_session() flushes, so both ids are populated by now.
+        hikcentral.record_hik_validation(
+            db,
+            outcome=hik_outcome,
+            direction=hikcentral.DIRECTION_ENTRY,
+            images=hik_images,
+            session_id=session.id if session else None,
+            entry_exit_log_id=log_entry.id,
         )
         logger.info(
             f"[UC1] Entry CONFIRMED (burst flush): plate={plate} "
-            f"source={buf.get('confirm_source') or 'idle/boundary'}"
+            f"source={buf.get('confirm_source') or 'idle/boundary'} "
+            f"plate_source={hik_outcome.plate_source}"
         )
     else:
         logger.info(
@@ -716,7 +829,10 @@ async def handle_anpr_event(
     if gate == "entry":
         await _buffer_entry_read(event, plate, event_time)
         return
-
+    # HikCentral is intentionally entry-only. Exit ANPR remains the legacy
+    # single-read path: dedup, vehicle/session resolution, alerts, and VA
+    # forwarding all operate on the plate reported by the exit camera.
+    exit_snapshot = event.snapshot_path
     # Build the VA notification before deduplication. If PMS committed the first
     # delivery and then crashed before the post-commit forward could run or spool,
     # the camera's duplicate webhook is the only recovery signal. Returning this
@@ -774,7 +890,7 @@ async def handle_anpr_event(
         gate=gate,
         camera_id=event.camera_id,
         event_time=event_time,
-        snapshot_path=event.snapshot_path,
+        snapshot_path=exit_snapshot,
         created_at=facility_now_naive(),
     )
 
@@ -815,7 +931,7 @@ async def handle_anpr_event(
         plate_number=plate,
         event_time=event_time,
         camera_id=event.camera_id,
-        snapshot_path=event.snapshot_path,
+        snapshot_path=exit_snapshot,
     )
     from app.services.occupancy_service import (
         reconcile_zone_counts_from_open_sessions,
@@ -855,6 +971,9 @@ async def handle_anpr_event(
 
     if log_entry not in db.new:
         db.add(log_entry)
+
+    if log_entry.id is None:
+        db.flush()
 
     # Network delivery is intentionally deferred until the router commits.
     # SQL Server transaction-owned application locks are released by that

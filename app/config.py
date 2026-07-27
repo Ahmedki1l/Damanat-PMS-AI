@@ -35,6 +35,20 @@ def parse_camera_source_networks(value: str) -> tuple[Any, ...]:
     )
 
 
+def join_resource_ids(value: str) -> str:
+    """Normalize a comma-separated HikCentral resource-ID list.
+
+    HikCentral's VehicleLogs `ResourceIDs` is a single comma-joined string, so
+    this trims blanks and de-duplicates while preserving configured order.
+    """
+    seen: list[str] = []
+    for item in (value or "").split(","):
+        item = item.strip()
+        if item and item not in seen:
+            seen.append(item)
+    return ",".join(seen)
+
+
 def apply_gate_rules(cameras: dict) -> dict:
     """Stamp the canonical entry/exit gate onto each known camera in-place."""
     for cam_id, gate in GATE_RULES.items():
@@ -626,6 +640,63 @@ class Settings(BaseSettings):
     # popping a live notification for it. Set to "" to notify on everything.
     SUPPRESSED_ALERT_NOTIFICATION_TYPES: str = "silent_entry"
 
+    # ── HikCentral plate validation / recovery ────────────────────────────
+    # HikCentral is NOT the normal plate source — the ANPR camera already
+    # reports the plate. HikCentral has exactly two jobs: validate the plate
+    # the camera reported, and recover a plate when the camera reported none
+    # (~22% of cars, today lost entirely as `silent_entry`).
+    #
+    # off           — never contacted; behaviour identical to before this layer.
+    # shadow        — looked up and logged, but the ANPR plate always wins and
+    #                 no recovery session is created. Changes NO behaviour;
+    #                 exists to measure mismatch/recovery rates before trusting
+    #                 them. This is the safe rollout default.
+    # authoritative — a disagreeing HikCentral plate replaces the ANPR plate,
+    #                 and a unique HikCentral record recovers a missing plate.
+    HIK_VALIDATION_MODE: Literal["off", "shadow", "authoritative"] = "off"
+    HIK_BASE_URL: str = ""
+    HIK_USERNAME: str = ""
+    HIK_PASSWORD: str = ""
+    HIK_SESSION_COOKIE_NAME: str = "WebSession"
+    HIK_SESSION_COOKIE: str = ""
+    HIK_VERIFY_TLS: bool = True
+    # HikCentral resource IDs (camera handles) for the entry LPR camera.
+    # Comma-separated; the request sends them as one string.
+    HIK_ENTRY_RESOURCE_IDS: str = ""
+    # Lookup window around the anchor event (the ANPR read for a validation,
+    # the ramp crossing for a recovery). Deliberately tiny: HikCentral is asked
+    # about ONE car, never for history. Lookback covers the camera->platform
+    # ingestion delay; lookahead covers clock skew between the two systems.
+    HIK_QUERY_LOOKBACK_SECONDS: float = Field(
+        default=30.0, gt=0, le=300.0, allow_inf_nan=False,
+    )
+    HIK_QUERY_LOOKAHEAD_SECONDS: float = Field(
+        default=5.0, ge=0, le=60.0, allow_inf_nan=False,
+    )
+    # PageSize must leave room for cars that passed AFTER the anchor, because
+    # results come back newest-first and the upper bound is filtered locally.
+    HIK_QUERY_PAGE_SIZE: int = Field(default=10, gt=0, le=50)
+    # HikCentral shifts BeginTime by the facility's UTC offset applied TWICE
+    # (measured: +6h at UTC+3 — a window sent as 09:00 filtered from 15:00), and
+    # ignores EndTime entirely. The client pre-subtracts this and re-applies the
+    # upper bound locally. Configurable because it was derived by measurement,
+    # not documentation, and may differ on another platform build or timezone.
+    HIK_QUERY_TIME_SHIFT_HOURS: float = Field(
+        default=6.0, ge=-24.0, le=24.0, allow_inf_nan=False,
+    )
+    # A HikCentral record may only be paired with a gate event this far away.
+    HIK_MATCH_MAX_SKEW_SECONDS: float = Field(
+        default=10.0, gt=0, le=120.0, allow_inf_nan=False,
+    )
+    HIK_CONNECT_TIMEOUT_SECONDS: float = Field(
+        default=3.0, gt=0, le=30.0, allow_inf_nan=False,
+    )
+    HIK_READ_TIMEOUT_SECONDS: float = Field(
+        default=5.0, gt=0, le=60.0, allow_inf_nan=False,
+    )
+    # Hard cap on a single downloaded vehicle/plate image.
+    HIK_IMAGE_MAX_BYTES: int = Field(default=8 * 1024 * 1024, gt=0)
+
     # ── Logging ───────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 
@@ -633,6 +704,60 @@ class Settings(BaseSettings):
 
     LOG_CAMERA_FILTER: str = ""
     LOG_CAMERA_EXCLUDE: str = ""
+
+    @model_validator(mode="after")
+    def _validate_hikcentral(self) -> "Settings":
+        """Fail closed when the HikCentral layer is on but unconfigured.
+
+        Mirrors the ENTRY_V2_MODE guard above: an active integration with a
+        blank host would silently degrade to "never matches", which in
+        authoritative mode means no session is ever created.
+        """
+        if self.HIK_VALIDATION_MODE == "off":
+            return self
+
+        base_url = self.HIK_BASE_URL.strip()
+        if not base_url:
+            raise ValueError(
+                "HIK_BASE_URL is required when HIK_VALIDATION_MODE is active"
+            )
+        try:
+            parsed_url = urlsplit(base_url)
+            _ = parsed_url.port
+        except ValueError as exc:
+            raise ValueError(
+                "HIK_BASE_URL must be a valid absolute HTTP(S) URL when "
+                "HIK_VALIDATION_MODE is active"
+            ) from exc
+        if (
+            parsed_url.scheme not in {"http", "https"}
+            or not parsed_url.hostname
+            or parsed_url.username
+            or parsed_url.password
+            or parsed_url.query
+            or parsed_url.fragment
+        ):
+            raise ValueError(
+                "HIK_BASE_URL must be a credential-free absolute HTTP(S) base "
+                "URL without a query or fragment when HIK_VALIDATION_MODE is "
+                "active"
+            )
+        self.HIK_BASE_URL = base_url.rstrip("/")
+
+        # The real HikCentral login payload has not been captured yet. Do not
+        # require username/password here: the client authenticates through its
+        # isolated authenticate() boundary and can be seeded with a browser
+        # session cookie until the real flow is known.
+        if not self.hik_entry_resource_ids():
+            raise ValueError(
+                "HIK_ENTRY_RESOURCE_IDS is required when HIK_VALIDATION_MODE "
+                "is active"
+            )
+        return self
+
+    def hik_entry_resource_ids(self) -> str:
+        """Entry LPR resource IDs, comma-joined as HikCentral expects."""
+        return join_resource_ids(self.HIK_ENTRY_RESOURCE_IDS)
 
     def suppressed_alert_notification_types(self) -> set[str]:
         """alert_type values excluded from the real-time SSE stream."""

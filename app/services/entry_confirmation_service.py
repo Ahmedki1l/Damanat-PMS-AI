@@ -1,4 +1,23 @@
-"""Transactional application of VA entry confirmations to existing tables."""
+"""Transactional application of VA entry confirmations to existing tables.
+
+HikCentral validation is deliberately NOT wired into this path. Two hard
+blockers, both external to this module:
+
+1. VA's callback ACK contract (`src/entry/callback.py:_validate_ack`) requires
+   the `plate_number` we echo to equal VA's own plate key. Returning a
+   HikCentral-corrected plate raises a NON-retryable `callback_plate_mismatch`,
+   which latches VA's fatal-delivery flag and takes its health endpoint down.
+   Correcting a plate here is therefore impossible without a VA-side change.
+2. The confirmation router is a sync endpoint (blocking pyodbc runs in a
+   threadpool, off the event loop) and the writer below runs inside a
+   transaction-owned application lock. There is nowhere in this path to await
+   network I/O without either moving blocking DB calls onto the event loop or
+   holding a DB lock across an await.
+
+Entry V2 is `off` in production, so the legacy path in entry_exit_service.py is
+where HikCentral actually runs. Revisit this once the ACK contract carries a
+`corrected_plate` field.
+"""
 
 from contextlib import contextmanager
 from dataclasses import dataclass

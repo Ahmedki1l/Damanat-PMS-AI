@@ -30,6 +30,11 @@ def isolate_external_side_effects(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "PMS_API_URL", "", raising=False)
     monkeypatch.setattr(settings, "NODEBACK_URL", "", raising=False)
     monkeypatch.setattr(settings, "ENTRY_V2_MODE", "off", raising=False)
+    # Same reasoning as the spool above: an active HikCentral mode would make
+    # every entry-path test issue a real VehicleLogs lookup against the customer's
+    # platform (and wait on its timeouts). Tests that exercise the layer set the
+    # mode themselves on their own settings object.
+    monkeypatch.setattr(settings, "HIK_VALIDATION_MODE", "off", raising=False)
     monkeypatch.setattr(
         settings,
         "CAMERA_EVENT_ALLOWED_SOURCE_CIDRS",

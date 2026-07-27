@@ -27,6 +27,10 @@ from app.services.entry_v2_forwarder import (
     start_entry_v2_shadow_worker,
     stop_entry_v2_shadow_worker,
 )
+from app.services.hikcentral import (
+    close_hikcentral_http_client,
+    start_hikcentral_http_client,
+)
 from app.utils.core_backend_client import (
     close_core_backend_http_client,
     start_core_backend_http_client,
@@ -148,6 +152,7 @@ async def startup():
     await start_entry_v2_http_client()
     await start_entry_v2_shadow_worker()
     await start_core_backend_http_client()
+    await start_hikcentral_http_client()
 
     # Background flusher for the ANPR entry-burst buffer. The CAM-23 ramp-top
     # crossing CONFIRMS each car, but the correct plate read lands 1-3s after the
@@ -220,3 +225,4 @@ async def shutdown():
                 pass
     await close_entry_v2_http_client()
     await close_core_backend_http_client()
+    await close_hikcentral_http_client()
