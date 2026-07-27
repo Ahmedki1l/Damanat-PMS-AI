@@ -125,6 +125,11 @@ async def authenticate(client: Optional[httpx.AsyncClient] = None) -> bool:
 async def start_hikcentral_http_client() -> None:
     """Create the one app-lifetime HikCentral client."""
     global _http_client
+    # Config could not use the logger (app.utils.logger imports app.config), so
+    # a forced fallback to "off" is surfaced here, where operators will see it.
+    disabled_reason = settings.hik_disabled_reason()
+    if disabled_reason:
+        logger.error("[Hik] %s", disabled_reason)
     if _http_client is None and settings.HIK_VALIDATION_MODE != "off":
         _http_client = _new_client()
         await authenticate(_http_client)

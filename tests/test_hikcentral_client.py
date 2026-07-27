@@ -5,6 +5,7 @@ failure degrades to an empty result — so most of these tests assert on what
 comes back rather than on an exception.
 """
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -50,7 +51,29 @@ def _install_transport(monkeypatch, handler):
 
 
 def test_extract_records_from_named_envelope():
+    """A renamed wrapper must still yield its rows — extraction is structural."""
     payload = {
+        "SomeFutureWrapper": {
+            "Rows": [
+                {"GUID": "A", "PassTime": "2026-07-27T15:05:24+03:00"},
+                {"GUID": "B", "PassTime": "2026-07-27T15:05:30+03:00"},
+            ]
+        }
+    }
+    assert [r["GUID"] for r in hik_client._extract_raw_records(payload)] == [
+        "A",
+        "B",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_records_outside_the_requested_window_are_dropped(monkeypatch):
+    """The platform ignores EndTime, so the upper bound is enforced here."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
                 "ResponseStatus": {
                     "ErrorCode": 0,
                     "Data": {
@@ -63,11 +86,20 @@ def test_extract_records_from_named_envelope():
                                     "VehicleImageUrl": "Vsm://vehicle",
                                     "PlateImageUrl": "Vsm://plate",
                                     "ResourceID": "447",
-                                }
+                                },
+                                {
+                                    # Hours later — the live platform really does
+                                    # return these past the requested EndTime.
+                                    "GUID": "8ABB4B81BB6A42CC83FC9417629EE656",
+                                    "PassTime": "2026-07-27T17:58:22+03:00",
+                                    "PlateLicense": "9640RDJ",
+                                    "ResourceID": "447",
+                                },
                             ]
                         }
                     },
                 }
+            },
         )
 
     _install_transport(monkeypatch, handler)
@@ -123,11 +155,72 @@ def test_integer_resource_id_and_vehicle_type_are_accepted():
 
 @pytest.mark.asyncio
 async def test_vehicle_logs_sends_the_discovered_request_body(monkeypatch):
+    # The BeginTime shift compensation has its own test; neutralise it here so
+    # the asserted times are exactly the window the caller asked for.
+    monkeypatch.setattr(settings, "HIK_QUERY_TIME_SHIFT_HOURS", 0.0)
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["path"] = request.url.path
-        captured["body"] = __import__("json").loads(request.content)
+        captured["params"] = dict(request.url.params)
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "ResponseStatus": {
+                    "ErrorCode": 0,
+                    "Data": {
+                        "VehicleLogsList": {
+                            "VehicleLog": [
+                                {
+                                    "GUID": "FDA8B5C9338A4CD29154B63D59E7F148",
+                                    "PassTime": "2026-07-27T15:05:24+03:00",
+                                    "PlateLicense": "5625JKA",
+                                    "ResourceID": "447",
+                                }
+                            ]
+                        }
+                    },
+                }
+            },
+        )
+
+    _install_transport(monkeypatch, handler)
+    records = await hik_client.query_vehicle_logs(
+        WIN_BEGIN, WIN_END, "447", 5
+    )
+
+    assert captured["path"] == hik_client.VEHICLE_LOGS_PATH
+    # Without ?MT=GET the live platform answers ErrorCode 217 and no data.
+    assert captured["params"] == {"MT": "GET"}
+
+    request_body = captured["body"]["VehicleLogsRequest"]
+    assert request_body["PageIndex"] == 1
+    assert request_body["PageSize"] == 5
+    assert request_body["RequestSortType"] == {"SortType": 1}
+
+    criteria = request_body["SearchCriteria"]
+    assert criteria["ResourceType"] == 0
+    assert criteria["RequestTimeType"] == 0
+    # Must be a comma-joined STRING: a JSON array is accepted but silently not
+    # applied, which returns every camera's traffic while looking successful.
+    assert criteria["ResourceIDs"] == "447"
+    assert criteria["BeginTime"].startswith("2026-07-27T15:00:00")
+    assert criteria["EndTime"].startswith("2026-07-27T15:10:00")
+
+    assert len(records) == 1
+    assert records[0].guid == "FDA8B5C9338A4CD29154B63D59E7F148"
+    # HikCentral is digits-first; this DB stores letters-first.
+    assert records[0].plate_license == "5625JKA"
+    assert records[0].canonical_plate == "JKA-5625"
+
+
+@pytest.mark.asyncio
+async def test_vehicle_logs_drops_records_without_guid_or_passtime(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
                 "ResponseStatus": {
                     "ErrorCode": 0,
                     "Data": {
@@ -146,30 +239,6 @@ async def test_vehicle_logs_sends_the_discovered_request_body(monkeypatch):
                         }
                     },
                 }
-        )
-
-    _install_transport(monkeypatch, handler)
-    records = await hik_client.query_vehicle_logs(
-        WIN_BEGIN, WIN_END, "447", 5
-    )
-
-    assert len(records) == 1
-    assert records[0].guid == "FDA8B5C9338A4CD29154B63D59E7F148"
-    # HikCentral is digits-first; this DB stores letters-first.
-    assert records[0].plate_license == "5625JKA"
-    assert records[0].canonical_plate == "JKA-5625"
-
-
-@pytest.mark.asyncio
-async def test_vehicle_logs_drops_records_without_guid_or_passtime(monkeypatch):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "rows": [
-                    {"GUID": "A", "PassTime": "not-a-date", "PlateLicense": "5625JKA"},
-                    {"GUID": "B", "PassTime": "2026-07-27T15:05:24+03:00"},
-                ]
             },
         )
 

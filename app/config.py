@@ -4,11 +4,12 @@ Application configuration using Pydantic-Settings.
 All settings can be overridden via environment variables or .env file.
 """
 
+import warnings
 from ipaddress import ip_network
 from typing import Any, Literal, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, PrivateAttr, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -705,54 +706,84 @@ class Settings(BaseSettings):
     LOG_CAMERA_FILTER: str = ""
     LOG_CAMERA_EXCLUDE: str = ""
 
-    @model_validator(mode="after")
-    def _validate_hikcentral(self) -> "Settings":
-        """Fail closed when the HikCentral layer is on but unconfigured.
+    # Set when an active HIK_VALIDATION_MODE was forced to "off" because the
+    # layer was misconfigured. Startup logs it; see _validate_hikcentral.
+    _hik_disabled_reason: str = PrivateAttr(default="")
 
-        Mirrors the ENTRY_V2_MODE guard above: an active integration with a
-        blank host would silently degrade to "never matches", which in
-        authoritative mode means no session is ever created.
-        """
-        if self.HIK_VALIDATION_MODE == "off":
-            return self
+    def hik_disabled_reason(self) -> str:
+        """Why HikCentral was force-disabled at startup, or "" if it wasn't."""
+        return self._hik_disabled_reason
 
+    def _hikcentral_config_error(self) -> Optional[str]:
+        """Why the HikCentral layer cannot run, or None when it is usable."""
         base_url = self.HIK_BASE_URL.strip()
         if not base_url:
-            raise ValueError(
-                "HIK_BASE_URL is required when HIK_VALIDATION_MODE is active"
-            )
+            return "HIK_BASE_URL is required"
         try:
             parsed_url = urlsplit(base_url)
             _ = parsed_url.port
-        except ValueError as exc:
-            raise ValueError(
-                "HIK_BASE_URL must be a valid absolute HTTP(S) URL when "
-                "HIK_VALIDATION_MODE is active"
-            ) from exc
+        except ValueError:
+            return f"HIK_BASE_URL={base_url!r} is not a valid URL"
+        if parsed_url.scheme not in {"http", "https"}:
+            return (
+                f"HIK_BASE_URL={base_url!r} has no http:// or https:// scheme "
+                f"(use e.g. 'https://{base_url}')"
+            )
         if (
-            parsed_url.scheme not in {"http", "https"}
-            or not parsed_url.hostname
+            not parsed_url.hostname
             or parsed_url.username
             or parsed_url.password
             or parsed_url.query
             or parsed_url.fragment
         ):
-            raise ValueError(
-                "HIK_BASE_URL must be a credential-free absolute HTTP(S) base "
-                "URL without a query or fragment when HIK_VALIDATION_MODE is "
-                "active"
+            return (
+                f"HIK_BASE_URL={base_url!r} must be a credential-free base URL "
+                "with no query or fragment"
             )
-        self.HIK_BASE_URL = base_url.rstrip("/")
-
-        # The real HikCentral login payload has not been captured yet. Do not
-        # require username/password here: the client authenticates through its
-        # isolated authenticate() boundary and can be seeded with a browser
-        # session cookie until the real flow is known.
+        # The real HikCentral login payload has not been captured yet, so
+        # username/password are deliberately NOT required here: the client
+        # authenticates behind its own authenticate() boundary and can be
+        # seeded with a browser session cookie until the real flow is known.
         if not self.hik_entry_resource_ids():
-            raise ValueError(
-                "HIK_ENTRY_RESOURCE_IDS is required when HIK_VALIDATION_MODE "
-                "is active"
+            return "HIK_ENTRY_RESOURCE_IDS is required"
+        return None
+
+    @model_validator(mode="after")
+    def _validate_hikcentral(self) -> "Settings":
+        """Disable the HikCentral layer when it is on but unconfigured.
+
+        This deliberately does NOT mirror the ENTRY_V2_MODE guard, which raises.
+        The difference is what "off" means for each. Entry V2 owns the entry
+        path, so a misconfigured one has no safe fallback and must stop the
+        process. HikCentral is purely additive — `off` is exactly the behaviour
+        that shipped before this layer existed — so degrading to it is both
+        correct and survivable.
+
+        Raising here instead cost a production outage on 2026-07-27: a deployed
+        `HIK_BASE_URL` without its scheme crash-looped every worker at import
+        time, taking down the whole backend for a feature nothing depends on.
+        A validation add-on must never be able to stop the app from booting.
+        """
+        if self.HIK_VALIDATION_MODE == "off":
+            return self
+
+        reason = self._hikcentral_config_error()
+        if reason:
+            requested = self.HIK_VALIDATION_MODE
+            self.HIK_VALIDATION_MODE = "off"
+            message = (
+                f"HIK_VALIDATION_MODE={requested} was requested but the layer "
+                f"is misconfigured: {reason}. Falling back to "
+                "HIK_VALIDATION_MODE=off. Plate validation and recovery are "
+                "DISABLED. Nothing else is affected."
             )
+            self._hik_disabled_reason = message
+            # app.utils.logger imports this module, so no logger exists yet;
+            # startup re-emits this at ERROR once logging is configured.
+            warnings.warn(f"[Hik] {message}", RuntimeWarning, stacklevel=2)
+            return self
+
+        self.HIK_BASE_URL = self.HIK_BASE_URL.strip().rstrip("/")
         return self
 
     def hik_entry_resource_ids(self) -> str:
