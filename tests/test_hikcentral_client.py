@@ -5,15 +5,28 @@ failure degrades to an empty result — so most of these tests assert on what
 comes back rather than on an exception.
 """
 
+import base64
 import json
 from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from app.config import settings
 from app.services.hikcentral import client as hik_client
 from app.services.hikcentral.models import VehicleLogRecord
+
+# A throwaway RSA-2048 key so the login tests never embed a real platform key.
+# HikCentral hands back the public key as a PKCS#1 RSAPublicKey (what JSEncrypt
+# emits), so export it in exactly that form.
+_TEST_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+_TEST_PUBKEY_B64 = base64.b64encode(
+    _TEST_KEY.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.PKCS1
+    )
+).decode()
 
 FACILITY_TZ = timezone(timedelta(hours=3))
 # Records in these fixtures sit at 15:05:24; the client now enforces the
@@ -498,3 +511,89 @@ def test_record_parses_all_reported_fields():
     assert record.vehicle_type == "car"
     assert record.vehicle_direction_type == "1"
     assert record.pass_time.utcoffset() == timedelta(hours=3)
+
+
+# ── Login handshake ─────────────────────────────────────────────────────────
+# The full PreLogin -> Crypto -> Login sequence was reproduced from the real web
+# client (HCP Professional V3.0.0). These pin the request shape and the
+# fail-closed credential policy that keeps a wrong password from locking the
+# shared account.
+
+
+def _crypto_ok() -> httpx.Response:
+    return httpx.Response(200, json={"ResponseStatus": {"ErrorCode": 0, "Data": {
+        "CryptoResponse": {"SID": "CRYPTOSID", "CryptoType": 1, "CryptoMode": 2,
+                           "CryptoKey": _TEST_PUBKEY_B64}}}})
+
+
+@pytest.mark.asyncio
+async def test_authenticate_runs_prelogin_crypto_login_and_stores_session(monkeypatch):
+    """Happy path: the exact 3-step handshake, ending with a usable SID cookie."""
+    monkeypatch.setattr(settings, "HIK_SESSION_COOKIE", "")
+    monkeypatch.setattr(settings, "HIK_SESSION_COOKIE_NAME", "SID")
+    monkeypatch.setattr(settings, "HIK_BASE_URL", "https://hik.test")
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path.rsplit("/", 1)[-1])
+        path = request.url.path
+        if path.endswith("/PreLogin"):
+            return httpx.Response(200, json={"ResponseStatus": {"ErrorCode": 0}})
+        if path.endswith("/Security/Crypto"):
+            return _crypto_ok()
+        if path.endswith("/Login"):
+            assert request.url.params.get("MT") == "POST"
+            login = json.loads(request.content)["LoginRequest"]
+            assert login["UserName"] == "user"
+            assert login["LoginModel"] == 1 and login["IsRSMWebLogin"] == 0
+            assert login["LoginAddress"] == "hik.test"
+            # Password is RSA-2048 ciphertext (256 raw bytes), decryptable by the
+            # matching private key back to the real password.
+            cipher = base64.b64decode(login["Password"])
+            assert len(cipher) == 256
+            from cryptography.hazmat.primitives.asymmetric import padding
+            assert _TEST_KEY.decrypt(cipher, padding.PKCS1v15()) == b"pass"
+            return httpx.Response(200, json={"ResponseStatus": {"ErrorCode": 0, "Data": {
+                "Login": {"SID": "SESSIONSID", "UserID": 8, "UserName": "user"}}}})
+        return httpx.Response(200, json={"ResponseStatus": {"ErrorCode": 0}})
+
+    _install_transport(monkeypatch, handler)
+    assert await hik_client.authenticate(hik_client._http_client) is True
+    assert seen[:3] == ["PreLogin", "Crypto", "Login"]
+    assert hik_client._http_client.cookies.get("SID") == "SESSIONSID"
+
+
+@pytest.mark.asyncio
+async def test_authenticate_fails_closed_without_retry_on_bad_credentials(monkeypatch):
+    """A rejected login must fail ONCE — never loop, or it could lock the account."""
+    monkeypatch.setattr(settings, "HIK_SESSION_COOKIE", "")
+    login_attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/Security/Crypto"):
+            return _crypto_ok()
+        if path.endswith("/Login"):
+            login_attempts.append(1)
+            return httpx.Response(200, json={"ResponseStatus": {"ErrorCode": 18, "Data": ""}})
+        return httpx.Response(200, json={"ResponseStatus": {"ErrorCode": 0}})
+
+    _install_transport(monkeypatch, handler)
+    assert await hik_client.authenticate(hik_client._http_client) is False
+    assert len(login_attempts) == 1
+    assert not hik_client._http_client.cookies.get("SID")
+
+
+@pytest.mark.asyncio
+async def test_seeded_cookie_short_circuits_login(monkeypatch):
+    """An operator-seeded cookie is trusted; no handshake is attempted."""
+    monkeypatch.setattr(settings, "HIK_SESSION_COOKIE", "SEEDED")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"ResponseStatus": {"ErrorCode": 0}})
+
+    _install_transport(monkeypatch, handler)
+    assert await hik_client.authenticate(hik_client._http_client) is True
+    assert calls == []

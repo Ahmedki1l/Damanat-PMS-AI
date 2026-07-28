@@ -658,7 +658,9 @@ class Settings(BaseSettings):
     HIK_BASE_URL: str = ""
     HIK_USERNAME: str = ""
     HIK_PASSWORD: str = ""
-    HIK_SESSION_COOKIE_NAME: str = "WebSession"
+    # Confirmed against the live HCP Professional V3.0.0 platform: the session
+    # cookie is named SID (Set-Cookie: SID=...), not WebSession.
+    HIK_SESSION_COOKIE_NAME: str = "SID"
     HIK_SESSION_COOKIE: str = ""
     HIK_VERIFY_TLS: bool = True
     # HikCentral resource IDs (camera handles) for the entry LPR camera.
