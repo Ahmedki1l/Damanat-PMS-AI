@@ -656,15 +656,15 @@ class Settings(BaseSettings):
     #                 and a unique HikCentral record recovers a missing plate.
     HIK_VALIDATION_MODE: Literal["off", "shadow", "authoritative"] = "off"
     HIK_BASE_URL: str = ""
-    HIK_USERNAME: str = ""
-    HIK_PASSWORD: str = ""
-    # Confirmed against the live HCP Professional V3.0.0 platform: the session
-    # cookie is named SID (Set-Cookie: SID=...), not WebSession.
-    HIK_SESSION_COOKIE_NAME: str = "SID"
-    HIK_SESSION_COOKIE: str = ""
+    # Artemis OpenAPI credentials (AppKey/AppSecret) from the HikCentral
+    # Integration Partner. Every request is HmacSHA256-signed with these — there
+    # is no login, session, or cookie. Keep HIK_APP_SECRET secret (env only).
+    HIK_APP_KEY: str = ""
+    HIK_APP_SECRET: str = ""
     HIK_VERIFY_TLS: bool = True
-    # HikCentral resource IDs (camera handles) for the entry LPR camera.
-    # Comma-separated; the request sends them as one string.
+    # OpenAPI camera indexCode for the entry LPR camera (e.g. "447" = ANPR-1
+    # Entry, discovered via /artemis/api/resource/v1/cameras). One code per
+    # lookup; kept as a string for symmetry with the exit camera when added.
     HIK_ENTRY_RESOURCE_IDS: str = ""
     # Lookup window around the anchor event (the ANPR read for a validation,
     # the ramp crossing for a recovery). Deliberately tiny: HikCentral is asked
@@ -742,10 +742,12 @@ class Settings(BaseSettings):
                 f"HIK_BASE_URL={base_url!r} must be a credential-free base URL "
                 "with no query or fragment"
             )
-        # The real HikCentral login payload has not been captured yet, so
-        # username/password are deliberately NOT required here: the client
-        # authenticates behind its own authenticate() boundary and can be
-        # seeded with a browser session cookie until the real flow is known.
+        # The OpenAPI signs every request with these, so both are required for
+        # any non-off mode. A missing one degrades to off (below), never raises.
+        if not self.HIK_APP_KEY.strip():
+            return "HIK_APP_KEY is required"
+        if not self.HIK_APP_SECRET.strip():
+            return "HIK_APP_SECRET is required"
         if not self.hik_entry_resource_ids():
             return "HIK_ENTRY_RESOURCE_IDS is required"
         return None

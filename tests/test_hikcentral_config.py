@@ -17,6 +17,8 @@ from app.config import Settings
 
 VALID = {
     "HIK_BASE_URL": "https://10.1.20.51",
+    "HIK_APP_KEY": "56519745",
+    "HIK_APP_SECRET": "s3cr3t",
     "HIK_ENTRY_RESOURCE_IDS": "447",
 }
 
@@ -51,6 +53,8 @@ def test_scheme_less_base_url_disables_the_layer_instead_of_crashing(mode):
         ({"HIK_BASE_URL": "https://10.1.20.51/?a=b"}, "credential-free"),
         ({"HIK_BASE_URL": "https://10.1.20.51#frag"}, "credential-free"),
         ({"HIK_BASE_URL": "https://10.1.20.51:notaport"}, "not a valid URL"),
+        ({"HIK_APP_KEY": ""}, "HIK_APP_KEY is required"),
+        ({"HIK_APP_SECRET": "  "}, "HIK_APP_SECRET is required"),
         ({"HIK_ENTRY_RESOURCE_IDS": " , "}, "HIK_ENTRY_RESOURCE_IDS is required"),
     ],
 )
@@ -62,19 +66,6 @@ def test_every_misconfiguration_degrades_rather_than_raises(overrides, expected)
 
     assert configured.HIK_VALIDATION_MODE == "off"
     assert configured.hik_disabled_reason()
-
-
-def test_missing_credentials_do_not_disable_the_layer():
-    """The real login payload is not captured yet; the client owns auth."""
-    configured = _settings(
-        HIK_VALIDATION_MODE="shadow",
-        HIK_USERNAME="",
-        HIK_PASSWORD="",
-        **VALID,
-    )
-
-    assert configured.HIK_VALIDATION_MODE == "shadow"
-    assert configured.hik_disabled_reason() == ""
 
 
 # ── The happy path still works ──────────────────────────────────────────────
@@ -91,9 +82,8 @@ def test_valid_configuration_is_preserved(mode):
 
 def test_trailing_slash_is_stripped_so_paths_do_not_double_up():
     configured = _settings(
-        HIK_VALIDATION_MODE="shadow",
-        HIK_BASE_URL="https://10.1.20.51/",
-        HIK_ENTRY_RESOURCE_IDS="447",
+        **{**VALID, "HIK_VALIDATION_MODE": "shadow",
+           "HIK_BASE_URL": "https://10.1.20.51/"}
     )
 
     assert configured.HIK_BASE_URL == "https://10.1.20.51"

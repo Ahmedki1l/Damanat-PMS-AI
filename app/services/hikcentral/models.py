@@ -117,6 +117,45 @@ class VehicleLogRecord:
             vehicle_type=_text(raw, _FIELD_VEHICLE_TYPE),
         )
 
+    @classmethod
+    def from_openapi_record(cls, raw: Any) -> Optional["VehicleLogRecord"]:
+        """Build a record from one Artemis OpenAPI `crossRecords/page` row.
+
+        The OpenAPI is the supported integration (AK/SK signed), and it spells
+        the same pass in different keys than the web `VehicleLogs` endpoint:
+        `crossRecordSyscode` is the dedup identity, `crossTime` is already a
+        clean ISO-8601 value with the correct offset (no `+6h` shift to undo),
+        and `vehiclePicUri` is the one image handle. Mapping here keeps the rest
+        of the package — matching, mode policy, storage — completely unchanged.
+        """
+        if not isinstance(raw, dict):
+            return None
+        guid = _text(raw, "crossRecordSyscode")
+        raw_cross_time = _text(raw, "crossTime")
+        if not guid or not raw_cross_time:
+            return None
+        try:
+            pass_time = datetime.fromisoformat(raw_cross_time)
+        except ValueError:
+            return None
+        plate_license = _text(raw, "plateNo") or ""
+        direction = raw.get("vehicleDirectionType")
+        vehicle_type = raw.get("vehicleType")
+        return cls(
+            guid=guid,
+            pass_time=pass_time,
+            plate_license=plate_license,
+            canonical_plate=normalize_plate(plate_license),
+            # The OpenAPI returns a single vehicle picture; the plate crop is
+            # burned into that image's overlay, so there is no separate handle.
+            vehicle_image_url=_text(raw, "vehiclePicUri"),
+            plate_image_url=None,
+            resource_id=_text(raw, "cameraIndexCode"),
+            resource_name=None,
+            vehicle_direction_type=str(direction) if direction is not None else None,
+            vehicle_type=str(vehicle_type) if vehicle_type is not None else None,
+        )
+
 
 @dataclass(frozen=True)
 class HikImages:
