@@ -458,6 +458,212 @@ async def _recover_silent_entry(db: Session, crossing: dict) -> bool:
     return True
 
 
+# ── HikCentral reconciliation (event-driven) ──────────────────────────────
+# A gate-area event (CAM-23/03/ENTRY for entries, CAM-08/EXIT for exits) is the
+# heartbeat that sweeps HikCentral for cars the edge pipeline missed ENTIRELY —
+# neither the ANPR read nor the ramp/occupancy crossing reached PMS-AI, so no
+# session exists at all. A missed entry opens a session; a missed exit closes
+# one. Fire-and-forget and debounced per direction, so it never blocks the
+# camera webhook and a busy camera cannot fire a HikCentral call per frame. The
+# grace window keeps a sweep from racing a car still in the live pipeline, and
+# the hik_validations GUID makes overlapping sweeps idempotent.
+#
+# NOTE: a reconciled session has NO physical ramp confirmation (that is the
+# point — the edge missed it). HikCentral's server-side record is its only
+# evidence, recorded with plate_source="hik_polled" for audit.
+
+_last_reconcile_at: dict[str, float] = {}
+
+
+def note_gate_event(camera_id: str) -> None:
+    """Trigger a debounced HikCentral reconcile sweep for a gate-area event.
+
+    Cheap and synchronous: decides the direction, applies the debounce, and (if
+    due) spawns a background task. Safe to call from the camera webhook — it
+    never awaits, never raises, and never delays the response.
+    """
+    if not hikcentral.is_enabled():
+        return
+    if camera_id in settings.hik_reconcile_entry_trigger_cameras():
+        direction = hikcentral.DIRECTION_ENTRY
+    elif camera_id in settings.hik_reconcile_exit_trigger_cameras():
+        direction = hikcentral.DIRECTION_EXIT
+    else:
+        return
+
+    now = monotonic()
+    if now - _last_reconcile_at.get(direction, 0.0) < settings.HIK_RECONCILE_DEBOUNCE_SECONDS:
+        return
+    _last_reconcile_at[direction] = now
+
+    try:
+        asyncio.get_running_loop().create_task(_run_reconcile(direction))
+    except RuntimeError:
+        # No running loop (sync context/tests): skip rather than raise.
+        pass
+
+
+async def _run_reconcile(direction: str) -> None:
+    """Background sweep with its own DB session. Never raises."""
+    from app.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        if direction == hikcentral.DIRECTION_ENTRY:
+            await _reconcile_missed_entries(db)
+        else:
+            await _reconcile_missed_exits(db)
+    except Exception as exc:  # a sweep must never escape into the event loop
+        logger.warning("[Hik][reconcile] %s sweep failed: %r", direction, exc)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+def _reconcile_window() -> tuple[datetime, datetime]:
+    """[lookback, grace] window in naive facility-local time."""
+    now = facility_now_naive()
+    return (
+        now - timedelta(seconds=settings.HIK_RECONCILE_LOOKBACK_SECONDS),
+        now - timedelta(seconds=settings.HIK_RECONCILE_GRACE_SECONDS),
+    )
+
+
+def _gate_event_already_logged(
+    db: Session, plate: str, gate: str, when: datetime, window: timedelta
+) -> bool:
+    """True when an EntryExitLog for this plate/gate sits within ±window — i.e.
+    the edge pipeline already noticed this pass."""
+    return (
+        db.query(EntryExitLog.id)
+        .filter(
+            EntryExitLog.plate_number == plate,
+            EntryExitLog.gate == gate,
+            EntryExitLog.event_time >= when - window,
+            EntryExitLog.event_time <= when + window,
+        )
+        .first()
+        is not None
+    )
+
+
+async def _reconcile_missed_entries(db: Session) -> None:
+    begin, end = _reconcile_window()
+    records = await hikcentral.list_unconsumed_records(
+        settings.hik_entry_resource_ids(), begin, end, db
+    )
+    match_s = timedelta(seconds=settings.HIK_RECONCILE_MATCH_SECONDS)
+    for rec in records:
+        outcome = hikcentral.polled_outcome(rec)
+        pass_local = outcome.pass_time_local
+        if _gate_event_already_logged(db, rec.canonical_plate, "entry", pass_local, match_s):
+            continue
+        if not hikcentral.is_authoritative():
+            logger.warning(
+                "[Hik][reconcile] shadow: MISSED entry plate=%s guid=%s at %s "
+                "(would open a session)",
+                rec.canonical_plate, rec.guid, pass_local,
+            )
+            continue
+        # Reuse the exact recovery flush: dedup, vehicle, session, image,
+        # hik_validation (which consumes the GUID) and the VA forward.
+        await _flush_entry_burst(
+            db,
+            _recovered_burst(
+                outcome, {"ts": pass_local, "source": "HIK-RECON", "snapshot": None}
+            ),
+        )
+        db.commit()  # release locks before the next record's network await
+        logger.warning(
+            "[Hik][reconcile] OPENED missed entry plate=%s guid=%s at %s",
+            rec.canonical_plate, rec.guid, pass_local,
+        )
+
+
+async def _reconcile_missed_exits(db: Session) -> None:
+    begin, end = _reconcile_window()
+    records = await hikcentral.list_unconsumed_records(
+        settings.hik_exit_resource_ids(), begin, end, db
+    )
+    match_s = timedelta(seconds=settings.HIK_RECONCILE_MATCH_SECONDS)
+    for rec in records:
+        outcome = hikcentral.polled_outcome(rec)
+        pass_local = outcome.pass_time_local
+        if _gate_event_already_logged(db, rec.canonical_plate, "exit", pass_local, match_s):
+            continue
+        if not hikcentral.is_authoritative():
+            logger.warning(
+                "[Hik][reconcile] shadow: MISSED exit plate=%s guid=%s at %s "
+                "(would close the open session)",
+                rec.canonical_plate, rec.guid, pass_local,
+            )
+            continue
+        images = await hikcentral.download_hik_images(outcome)
+        session = parking_session_service.close_session(
+            db,
+            plate_number=rec.canonical_plate,
+            event_time=pass_local,
+            camera_id="CAM-EXIT",
+            snapshot_path=images.vehicle_image_path,
+        )
+        _write_reconciled_exit_log(db, rec.canonical_plate, pass_local, images.vehicle_image_path)
+        # Consume the GUID (unique) so a later sweep never redoes this exit.
+        hikcentral.record_hik_validation(
+            db,
+            outcome=outcome,
+            direction=hikcentral.DIRECTION_EXIT,
+            images=images,
+            session_id=session.id if session else None,
+        )
+        db.commit()
+        logger.warning(
+            "[Hik][reconcile] %s plate=%s guid=%s at %s",
+            "CLOSED missed exit" if session else "logged exit (no open session)",
+            rec.canonical_plate, rec.guid, pass_local,
+        )
+
+
+def _write_reconciled_exit_log(
+    db: Session, plate: str, when: datetime, snapshot: Optional[str]
+) -> None:
+    """Write the audit exit row for a reconciled exit, matched to its open entry
+    with a computed duration — the same shape the live exit path produces."""
+    vehicle = vehicle_service.ensure_unregistered_vehicle(db, plate)
+    log_entry = EntryExitLog(
+        plate_number=plate,
+        vehicle_id=vehicle.id if vehicle else None,
+        vehicle_type=vehicle.vehicle_type if vehicle else "unknown",
+        gate="exit",
+        camera_id="CAM-EXIT",
+        event_time=when,
+        snapshot_path=snapshot,
+        created_at=facility_now_naive(),
+    )
+    matching_entry = (
+        db.query(EntryExitLog)
+        .filter(
+            EntryExitLog.plate_number == plate,
+            EntryExitLog.gate == "entry",
+            EntryExitLog.matched_entry_id.is_(None),
+            EntryExitLog.event_time <= when,
+        )
+        .order_by(EntryExitLog.event_time.desc())
+        .first()
+    )
+    db.add(log_entry)
+    db.flush()
+    if matching_entry is not None:
+        entry_time = matching_entry.event_time
+        if entry_time.tzinfo is not None:
+            entry_time = entry_time.astimezone(facility_tz()).replace(tzinfo=None)
+        log_entry.parking_duration = max(0, int((when - entry_time).total_seconds()))
+        log_entry.matched_entry_id = matching_entry.id
+        matching_entry.matched_entry_id = log_entry.id
+
+
 async def _flush_entry_burst(db: Session, buf: dict) -> None:
     """Write ONE entry for a burst, labeled by the LAST read (winning plate).
     Runs dedup, anti-bounce, the PMS-API forward (port 8000) and vehicle

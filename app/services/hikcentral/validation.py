@@ -22,6 +22,7 @@ from app.services.hikcentral.models import (
     PLATE_SOURCE_EDGE_ANPR,
     PLATE_SOURCE_HIK_CONFIRMED,
     PLATE_SOURCE_HIK_CORRECTED,
+    PLATE_SOURCE_HIK_POLLED,
     PLATE_SOURCE_HIK_RECOVERED,
     HikImages,
     HikOutcome,
@@ -35,6 +36,7 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 DIRECTION_ENTRY = "entry"
+DIRECTION_EXIT = "exit"
 
 
 def _enabled() -> bool:
@@ -314,6 +316,60 @@ async def recover_entry_plate(
         reported_plate=None,
         candidates_considered=len(records),
     )
+
+
+def is_enabled() -> bool:
+    """Whether the HikCentral layer is on (shadow or authoritative)."""
+    return _enabled()
+
+
+def is_authoritative() -> bool:
+    """Whether HikCentral may change behaviour (create/close sessions)."""
+    return _authoritative()
+
+
+def polled_outcome(record: VehicleLogRecord) -> HikOutcome:
+    """Wrap a reconciliation-poller record as an actionable outcome.
+
+    Distinct source (`hik_polled`) because this pass was never confirmed by any
+    edge event — HikCentral's record is the sole evidence for the session.
+    """
+    return HikOutcome(
+        plate=record.canonical_plate,
+        plate_source=PLATE_SOURCE_HIK_POLLED,
+        matched=True,
+        reason="hik_polled_reconcile",
+        record=record,
+        reported_plate=None,
+        candidates_considered=1,
+    )
+
+
+async def list_unconsumed_records(
+    resource_ids: str,
+    window_begin_naive,
+    window_end_naive,
+    db: Optional[Session],
+) -> list[VehicleLogRecord]:
+    """Recent HikCentral passes at one camera that no session has consumed yet.
+
+    Used by the reconciliation poller to find gate events the edge pipeline
+    never noticed. A record whose GUID is already in `hik_validations` was
+    consumed by an earlier pass (or an earlier poll), so overlapping windows are
+    idempotent. Returns [] when the layer is off or the camera is unconfigured.
+    """
+    if not _enabled() or not resource_ids:
+        return []
+    begin = from_facility_naive(window_begin_naive)
+    end = from_facility_naive(window_end_naive)
+    records = await client.query_vehicle_logs(
+        begin, end, resource_ids, settings.HIK_RECONCILE_PAGE_SIZE
+    )
+    return [
+        r
+        for r in records
+        if r.canonical_plate and not guid_already_used(db, r.guid)
+    ]
 
 
 async def download_hik_images(outcome: Optional[HikOutcome]) -> HikImages:

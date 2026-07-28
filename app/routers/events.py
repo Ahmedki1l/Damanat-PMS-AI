@@ -27,7 +27,10 @@ from app.services.entry_v2_forwarder import (
     resolve_entry_v2_camera_alias,
 )
 from app.services.entry_state_lock import EntryStateLockUnavailable
-from app.services.entry_exit_service import SourceTimestampUnavailable
+from app.services.entry_exit_service import (
+    SourceTimestampUnavailable,
+    note_gate_event,
+)
 from app.services.occupancy_service import record_event_in_cache
 from app.utils.logger import get_logger
 
@@ -212,6 +215,11 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
         # the normalized-plate SQL Server application lock.
         for forward in dispatch_result.get("anpr_forwards", []):
             await forward.deliver()
+
+        # A gate-area event is the heartbeat that sweeps HikCentral for cars the
+        # edge pipeline missed entirely. Debounced + fire-and-forget: it spawns a
+        # background sweep (own DB session) and never blocks this acknowledgement.
+        note_gate_event(event.camera_id)
 
         # Shadow is observation-only: legacy state and all transaction-owned
         # post-commit work are complete before the bounded FIFO takes ownership

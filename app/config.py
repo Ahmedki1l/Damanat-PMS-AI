@@ -664,8 +664,11 @@ class Settings(BaseSettings):
     HIK_VERIFY_TLS: bool = True
     # OpenAPI camera indexCode for the entry LPR camera (e.g. "447" = ANPR-1
     # Entry, discovered via /artemis/api/resource/v1/cameras). One code per
-    # lookup; kept as a string for symmetry with the exit camera when added.
+    # lookup.
     HIK_ENTRY_RESOURCE_IDS: str = ""
+    # OpenAPI camera indexCode for the exit LPR camera ("453" = ANPR-2 Exit).
+    # Only used by the reconciliation poller to close sessions for missed exits.
+    HIK_EXIT_RESOURCE_IDS: str = ""
     # Lookup window around the anchor event (the ANPR read for a validation,
     # the ramp crossing for a recovery). Deliberately tiny: HikCentral is asked
     # about ONE car, never for history. Lookback covers the camera->platform
@@ -699,6 +702,43 @@ class Settings(BaseSettings):
     )
     # Hard cap on a single downloaded vehicle/plate image.
     HIK_IMAGE_MAX_BYTES: int = Field(default=8 * 1024 * 1024, gt=0)
+
+    # ── Reconciliation (event-driven) ─────────────────────────────────────
+    # HikCentral is swept for gate events the edge pipeline never saw (ANPR +
+    # CAM-23/08 both missed), and they are applied: a missed ENTRY opens a
+    # recovery session, a missed EXIT closes an open one. This is NOT a timer —
+    # it is triggered by real gate-area events (below) and debounced, so it only
+    # runs when cars are actually moving. Runs in shadow (logs would-do) and
+    # authoritative (acts); off = never. GUID dedup (hik_validations) makes
+    # overlapping sweeps idempotent.
+    #
+    # Cameras whose events trigger an entry/exit sweep. Any event from one of
+    # these acts as the heartbeat for that direction.
+    HIK_RECONCILE_ENTRY_TRIGGER_CAMERAS: str = "CAM-23,CAM-03,CAM-ENTRY"
+    HIK_RECONCILE_EXIT_TRIGGER_CAMERAS: str = "CAM-08,CAM-EXIT"
+    # Minimum gap between sweeps of the same direction, so a busy camera does
+    # not fire a HikCentral call on every frame. Event-driven, just debounced.
+    HIK_RECONCILE_DEBOUNCE_SECONDS: float = Field(
+        default=30.0, ge=0, le=600.0, allow_inf_nan=False,
+    )
+    # Only reconcile records OLDER than this, so the live edge pipeline (burst
+    # buffer + pending-crossing timeout) has already had its chance — the sweep
+    # never races an in-flight car.
+    HIK_RECONCILE_GRACE_SECONDS: float = Field(
+        default=120.0, gt=0, le=3600.0, allow_inf_nan=False,
+    )
+    # How far back each poll looks. Overlaps are safe (GUID dedup), so this is
+    # generous enough to survive a poll or two being skipped.
+    HIK_RECONCILE_LOOKBACK_SECONDS: float = Field(
+        default=900.0, gt=0, le=86400.0, allow_inf_nan=False,
+    )
+    # A HikCentral pass counts as "already noticed" if an EntryExitLog for the
+    # same plate/gate sits within this many seconds of it.
+    HIK_RECONCILE_MATCH_SECONDS: float = Field(
+        default=60.0, gt=0, le=600.0, allow_inf_nan=False,
+    )
+    # Max records pulled per camera per poll (crossRecords pageSize, ≤ 500).
+    HIK_RECONCILE_PAGE_SIZE: int = Field(default=100, gt=0, le=500)
 
     # ── Logging ───────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
@@ -791,8 +831,28 @@ class Settings(BaseSettings):
         return self
 
     def hik_entry_resource_ids(self) -> str:
-        """Entry LPR resource IDs, comma-joined as HikCentral expects."""
+        """Entry LPR camera indexCode."""
         return join_resource_ids(self.HIK_ENTRY_RESOURCE_IDS)
+
+    def hik_exit_resource_ids(self) -> str:
+        """Exit LPR camera indexCode (reconciliation only)."""
+        return join_resource_ids(self.HIK_EXIT_RESOURCE_IDS)
+
+    def hik_reconcile_entry_trigger_cameras(self) -> set[str]:
+        """Cameras whose events trigger an entry reconcile sweep."""
+        return {
+            c.strip()
+            for c in self.HIK_RECONCILE_ENTRY_TRIGGER_CAMERAS.split(",")
+            if c.strip()
+        }
+
+    def hik_reconcile_exit_trigger_cameras(self) -> set[str]:
+        """Cameras whose events trigger an exit reconcile sweep."""
+        return {
+            c.strip()
+            for c in self.HIK_RECONCILE_EXIT_TRIGGER_CAMERAS.split(",")
+            if c.strip()
+        }
 
     def suppressed_alert_notification_types(self) -> set[str]:
         """alert_type values excluded from the real-time SSE stream."""

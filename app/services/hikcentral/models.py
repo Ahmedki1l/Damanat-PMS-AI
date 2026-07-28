@@ -18,6 +18,12 @@ PLATE_SOURCE_EDGE_ANPR = "edge_anpr"
 PLATE_SOURCE_HIK_CONFIRMED = "hik_confirmed"
 PLATE_SOURCE_HIK_CORRECTED = "hik_corrected"
 PLATE_SOURCE_HIK_RECOVERED = "hik_recovered"
+# Recovered by the reconciliation poller: HikCentral saw an entry the edge
+# pipeline never noticed at all (no ANPR event, no CAM-23 crossing reached
+# PMS-AI). Distinct from hik_recovered (which is anchored to a real crossing)
+# because this session has NO physical ramp confirmation — HikCentral's record
+# is its only evidence.
+PLATE_SOURCE_HIK_POLLED = "hik_polled"
 
 # HikCentral spells its JSON in PascalCase. Kept as a table rather than inline
 # string literals so the live-probe script and the parser can never drift.
