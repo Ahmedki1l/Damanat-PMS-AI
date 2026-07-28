@@ -152,6 +152,15 @@ async def create_alert(
     Uses a nested savepoint for the DB insert so that a constraint failure on the
     alert table does NOT roll back the parent transaction (entry_exit_log, parking_session).
     """
+    # Fully-disabled alert types are dropped before anything is written: no DB
+    # row, no log, no stream. Distinct from SUPPRESSED_ALERT_NOTIFICATION_TYPES,
+    # which silences only the live notification but still records the row.
+    if alert_type in settings.disabled_alert_types():
+        logger.debug(
+            "[ALERT] %s is disabled (DISABLED_ALERT_TYPES) — not recorded", alert_type
+        )
+        return None
+
     try:
         severity = _resolve_severity(alert_type)
         zone_meta = settings.get_zone_metadata(zone_id)

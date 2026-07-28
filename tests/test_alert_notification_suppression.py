@@ -103,3 +103,46 @@ def test_setting_parses_into_a_trimmed_set():
         settings, "SUPPRESSED_ALERT_NOTIFICATION_TYPES", " silent_entry , foo ,, "
     ):
         assert settings.suppressed_alert_notification_types() == {"silent_entry", "foo"}
+
+
+# ── Full disable (DISABLED_ALERT_TYPES): no DB row, no stream ────────────────
+
+
+@pytest.mark.asyncio
+async def test_disabled_alert_is_not_written_and_not_streamed(published):
+    """The stronger switch: a disabled type is dropped before anything writes."""
+    from unittest.mock import MagicMock
+    from app.services.alert_service import create_alert
+
+    db = MagicMock()
+    with patch.object(settings, "DISABLED_ALERT_TYPES", "silent_entry"):
+        result = await create_alert(
+            db=db, alert_type="silent_entry", camera_id="CAM-23",
+            zone_id="entry", event_type="linedetection", description="x",
+        )
+
+    assert result is None
+    assert not db.add.called, "a disabled alert must NOT be persisted"
+    assert published == []
+
+
+@pytest.mark.asyncio
+async def test_disable_list_only_affects_listed_types(published):
+    """Disabling silent_entry must not affect other alert types."""
+    from unittest.mock import MagicMock
+    from app.services.alert_service import create_alert
+
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = None
+    with patch.object(settings, "DISABLED_ALERT_TYPES", "silent_entry"):
+        await create_alert(
+            db=db, alert_type="vehicle_intrusion", camera_id="CAM-01",
+            zone_id="restricted-vip", event_type="linedetection", description="x",
+        )
+
+    assert db.add.called, "a non-disabled alert is unaffected and still written"
+
+
+def test_disabled_setting_parses_into_a_trimmed_set():
+    with patch.object(settings, "DISABLED_ALERT_TYPES", " silent_entry , foo ,, "):
+        assert settings.disabled_alert_types() == {"silent_entry", "foo"}

@@ -640,6 +640,12 @@ class Settings(BaseSettings):
     # and still served by GET /api/v1/alerts — the dashboard just stops
     # popping a live notification for it. Set to "" to notify on everything.
     SUPPRESSED_ALERT_NOTIFICATION_TYPES: str = "silent_entry"
+    # Comma-separated alert_type values that are turned OFF entirely: no DB row,
+    # no log, no stream — create_alert() drops them before anything is written.
+    # Use this (not the notification list above) to make an alert type vanish
+    # completely, e.g. DISABLED_ALERT_TYPES=silent_entry once HikCentral
+    # recovery/reconciliation makes those alerts redundant.
+    DISABLED_ALERT_TYPES: str = ""
 
     # ── HikCentral plate validation / recovery ────────────────────────────
     # HikCentral is NOT the normal plate source — the ANPR camera already
@@ -859,6 +865,14 @@ class Settings(BaseSettings):
         return {
             t.strip()
             for t in self.SUPPRESSED_ALERT_NOTIFICATION_TYPES.split(",")
+            if t.strip()
+        }
+
+    def disabled_alert_types(self) -> set[str]:
+        """alert_type values turned off entirely (no DB row, no stream)."""
+        return {
+            t.strip()
+            for t in self.DISABLED_ALERT_TYPES.split(",")
             if t.strip()
         }
 
