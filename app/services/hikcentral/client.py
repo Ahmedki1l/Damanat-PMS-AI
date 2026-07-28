@@ -224,8 +224,11 @@ async def query_vehicle_logs(
 
     body = {
         "cameraIndexCode": camera_index_code,
-        "startTime": begin.isoformat(),
-        "endTime": end.isoformat(),
+        # Whole-second ISO-8601 with offset. The platform rejects fractional
+        # seconds ("startTime parameter error"), and facility_now_naive() carries
+        # microseconds, so they must be dropped here.
+        "startTime": begin.replace(microsecond=0).isoformat(),
+        "endTime": end.replace(microsecond=0).isoformat(),
         "pageNo": 1,
         "pageSize": page_size,
         "sortField": "PassTime",

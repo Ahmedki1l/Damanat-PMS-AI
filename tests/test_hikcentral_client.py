@@ -135,6 +135,26 @@ async def test_query_sends_crossrecords_body_and_parses_records(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_start_end_times_carry_no_fractional_seconds(monkeypatch):
+    """The platform rejects microseconds ('startTime parameter error'), and
+    facility_now_naive() carries them — so they must be stripped."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"code": "0", "data": {"list": []}})
+
+    _install_transport(monkeypatch, handler)
+    begin = datetime(2026, 7, 28, 14, 0, 0, 123456, tzinfo=FACILITY_TZ)
+    end = datetime(2026, 7, 28, 14, 30, 0, 987654, tzinfo=FACILITY_TZ)
+    await hik_client.query_vehicle_logs(begin, end, "447", 5)
+
+    assert captured["body"]["startTime"] == "2026-07-28T14:00:00+03:00"
+    assert captured["body"]["endTime"] == "2026-07-28T14:30:00+03:00"
+    assert "." not in captured["body"]["startTime"]
+
+
+@pytest.mark.asyncio
 async def test_only_the_first_camera_index_code_is_used(monkeypatch):
     """crossRecords takes ONE camera; a stray comma-list uses the first code."""
     captured = {}
