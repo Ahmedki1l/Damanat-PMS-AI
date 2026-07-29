@@ -804,17 +804,26 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
     # 2026-07-12 (the PMS being down stretched the forward long enough to collide
     # with the next event) and made entry_exit_log unreadable to every client.
     # Keep every network await BELOW the commit.
+    # A recovered entry has no gate image of its own (_recovered_entry_buffer
+    # sets snapshot_path=None outright — HikCentral proved the crossing, the
+    # gate camera never fired), and an Entry-V2-style flush may carry none
+    # either — fall back to HikCentral's vehicle shot so the stay is not
+    # imageless on the dashboard.
+    #
+    # Computed HERE, above the occupancy branch, because the UC4 alert below
+    # needs it too. It previously lived inside that branch and the alert used
+    # the raw `snapshot_path`, so every recovered entry produced an
+    # unknown_vehicle alert with a NULL snapshot while the entry_exit_log row
+    # for the same car carried the Hik image — operators got an evidence-less
+    # alert for a car we did in fact have a picture of.
+    entry_snapshot = snapshot_path or hik_images.vehicle_image_path
+
     vehicle = None
     if not suppress_occupancy:
         # UC4: resolve the vehicle for the WINNING plate only — so the only
         # vehicles row this entry creates is for the final, correct plate.
         vehicle = vehicle_service.ensure_unregistered_vehicle(db, plate)
         vehicle_type = vehicle.vehicle_type if vehicle else "unknown"
-
-        # A recovered entry has no gate image of its own, and an Entry-V2-style
-        # flush may carry none either — fall back to HikCentral's vehicle shot so
-        # the stay is not imageless on the dashboard.
-        entry_snapshot = snapshot_path or hik_images.vehicle_image_path
 
         log_entry = EntryExitLog(
             plate_number=plate,
@@ -873,7 +882,7 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
             camera_id=camera_id,
             zone_id="entry",
             plate_number=plate,
-            snapshot_path=snapshot_path,
+            snapshot_path=entry_snapshot,
             triggered_at=event_time,
         )
     else:
@@ -886,7 +895,7 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
             event_type="AccessControllerEvent",
             description=f"Unregistered vehicle at entry gate: plate {plate}",
             plate_number=plate,
-            snapshot_path=snapshot_path,
+            snapshot_path=entry_snapshot,
         )
 
     # Release the write locks BEFORE any network I/O (see the note above). The
