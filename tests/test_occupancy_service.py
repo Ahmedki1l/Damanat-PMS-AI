@@ -136,8 +136,15 @@ class TestOccupancyService:
 
     @pytest.mark.asyncio
     async def test_entrance_reconciles_drift_from_open_sessions(self, db):
-        """A line event replaces drifted aggregates; it never adds a delta."""
-        seed_zones(db, total=99, b1=99, b2=99)
+        """A non-ramp line event replaces the drifted total and re-derives B1.
+
+        CAM-03 is not a B2 ramp camera, so it pushes no delta — it only wakes
+        the reconciliation. GARAGE-TOTAL comes back from open sessions and B1
+        follows as TOTAL - B2, so both drifted values are corrected at once.
+        B2 is seeded empty here; the case where it is NOT is covered by
+        test_occupancy_simulation.py's heal-down test.
+        """
+        seed_zones(db, total=99, b1=99, b2=0)
         seed_open_sessions(db, ["B1", "B1"])
 
         with patch("app.services.occupancy_service.create_alert", new_callable=AsyncMock):

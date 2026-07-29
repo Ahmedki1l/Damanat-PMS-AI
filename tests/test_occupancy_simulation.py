@@ -1,8 +1,21 @@
-"""Transaction-level simulations for session-derived occupancy aggregates.
+"""Transaction-level simulations for the occupancy aggregates.
 
-Line crossings are wake-up signals only.  The aggregate rows must always be
-replaced from open ``parking_sessions``; direction and duplicate line events
-must never add/subtract a counter that can drift over time.
+Three rows, two sources:
+
+  GARAGE-TOTAL = COUNT(open parking_sessions)      — authoritative, cannot drift
+  B2-PARKING   = running delta from the ramp cams  — the only counted aggregate
+  B1-PARKING   = GARAGE-TOTAL - B2                 — derived, never counted
+
+B2 cannot be session-derived: ``parking_sessions.floor`` is only written when
+VA binds the car to a slot, so between the gate and the bind a car has
+floor=NULL and no per-floor query can see it. The ramp cameras see it cross
+immediately, which is why B2 is counted from crossings instead.
+
+That makes B2 the one number that can drift, so the drift is BOUNDED rather
+than banned: it is clamped to [0, max_capacity] and healed down to
+GARAGE-TOTAL whenever it exceeds it — an empty garage therefore always ends
+with an empty B2. A crossing from any non-ramp camera is still a wake-up
+signal only.
 """
 
 import os
@@ -149,50 +162,144 @@ def counts(db) -> tuple[int, int, int]:
 
 class TestSessionDerivedJourney:
     @pytest.mark.asyncio
-    async def test_entry_transition_and_exit_follow_session_state(self, db):
-        """Each line only republishes the current open-session projection."""
-        seed_zones(db, total=5, b1=3, b2=2)
-        for index in range(3):
-            add_open_session(db, f"B1-{index}", "B1")
-        for index in range(2):
-            add_open_session(db, f"B2-{index}", "B2")
-        db.commit()
+    async def test_one_cars_full_journey_through_both_floors(self, db):
+        """Entry → down to B2 → back up to B1 → exit, one car at a time.
 
-        entering = add_open_session(db, "JOURNEY-1", "B1")
+        This is the model in full: the total follows sessions, B2 follows the
+        ramp, and B1 is whatever is in the garage but not on B2.
+        """
+        seed_zones(db, total=0, b1=0, b2=0)
+
+        # Enters the garage. Lands on B1 by definition — nothing has taken it
+        # down the ramp yet.
+        add_open_session(db, "JOURNEY-1", None)
         await process_and_commit(make_event("CAM-03"), db)
-        assert counts(db) == (6, 4, 2)
+        assert counts(db) == (1, 1, 0)
 
-        entering.floor = "B2"
-        entering.updated_at = datetime.now(UTC).replace(tzinfo=None)
-        await process_and_commit(make_event("CAM-09"), db)
-        assert counts(db) == (6, 3, 3)
+        # Drives down the ramp past CAM-09's entrance-facing line.
+        _processed_events_cache.clear()
+        await process_and_commit(make_event("CAM-09", region_id="1"), db)
+        assert counts(db) == (1, 0, 1)
 
-        entering.status = "closed"
-        entering.exit_time = datetime.now(UTC).replace(tzinfo=None)
-        entering.updated_at = entering.exit_time
+        # Comes back up past the exit-facing line.
+        _processed_events_cache.clear()
+        await process_and_commit(make_event("CAM-09", region_id="2"), db)
+        assert counts(db) == (1, 1, 0)
+
+        # Leaves the garage.
+        session = db.query(ParkingSession).filter_by(plate_number="JOURNEY-1").one()
+        session.status = "closed"
+        session.exit_time = datetime.now(UTC).replace(tzinfo=None)
+        _processed_events_cache.clear()
         await process_and_commit(make_event("CAM-08"), db)
-        assert counts(db) == (5, 3, 2)
-        assert count(db, TOTAL) == count(db, B1) + count(db, B2)
+        assert counts(db) == (0, 0, 0)
 
     @pytest.mark.asyncio
-    async def test_direction_cannot_change_counts_without_session_change(self, db):
-        seed_zones(db, total=99, b1=99, b2=99)
-        add_open_session(db, "STABLE-1", "B1")
-        add_open_session(db, "STABLE-2", "B2")
+    async def test_the_floors_always_add_up_to_the_total(self, db):
+        """B1 + B2 == GARAGE-TOTAL is an invariant, not a coincidence.
+
+        It holds because B1 is derived as TOTAL - B2 rather than counted
+        separately — two independent counters could not guarantee it.
+        """
+        seed_zones(db, total=0, b1=0, b2=0)
+        for index in range(5):
+            add_open_session(db, f"CAR-{index}", None)
+        db.commit()
+
+        for region in ("1", "1", "2", "1"):
+            _processed_events_cache.clear()
+            await process_and_commit(make_event("CAM-09", region_id=region), db)
+            total, b1, b2 = counts(db)
+            assert b1 + b2 == total, f"floors {b1}+{b2} != total {total}"
+
+        assert counts(db) == (5, 3, 2)
+
+    @pytest.mark.asyncio
+    async def test_a_non_ramp_camera_never_moves_b2(self, db):
+        """CAM-03/CAM-08 crossings stay wake-up signals only, in either
+        direction. Only the configured ramp cameras push a delta."""
+        seed_zones(db, total=0, b1=0, b2=0)
+        add_open_session(db, "STABLE-1", None)
+        add_open_session(db, "STABLE-2", None)
         db.commit()
 
         await process_and_commit(make_event("CAM-03", region_id="1"), db)
-        assert counts(db) == (2, 1, 1)
+        assert counts(db) == (2, 2, 0)
 
         _processed_events_cache.clear()
         await process_and_commit(make_event("CAM-03", region_id="2"), db)
-        assert counts(db) == (2, 1, 1)
+        assert counts(db) == (2, 2, 0)
+
+
+class TestB2CrossingDeltas:
+    @pytest.mark.asyncio
+    async def test_both_ramp_cameras_count_independently(self, db):
+        """CAM-09 and CAM-10 cover separate passages, so a car crosses exactly
+        one of them and BOTH cameras' crossings count. Nothing is deduped
+        across cameras — see Settings.B2_CROSSING_CAMERAS."""
+        seed_zones(db, total=0, b1=0, b2=0)
+        for index in range(4):
+            add_open_session(db, f"RAMP-{index}", None)
+        db.commit()
+
+        await process_and_commit(make_event("CAM-09", region_id="1"), db)
+        await process_and_commit(make_event("CAM-10", region_id="1"), db)
+        assert counts(db) == (4, 2, 2)
+
+    @pytest.mark.asyncio
+    async def test_two_cars_down_the_same_ramp_both_count(self, db):
+        """The regression the 30s dedup window would have caused.
+
+        Two cars past the same camera and line, seconds apart, are two cars.
+        Only a repeat inside OCCUPANCY_CROSSING_DEDUP_SECONDS — one physical
+        crossing that Hikvision fired twice — may be dropped.
+        """
+        seed_zones(db, total=0, b1=0, b2=0)
+        for index in range(2):
+            add_open_session(db, f"CONVOY-{index}", None)
+        db.commit()
+
+        await process_and_commit(make_event("CAM-09", region_id="1"), db)
+        assert count(db, B2) == 1
+
+        # Same camera + line again, but the immediate repeat is the duplicate
+        # of a single crossing and must NOT count.
+        assert await process_and_commit(make_event("CAM-09", region_id="1"), db) is None
+        assert count(db, B2) == 1
+
+        # Once the short window has passed it is a second car, and it counts.
+        _processed_events_cache.clear()
+        await process_and_commit(make_event("CAM-09", region_id="1"), db)
+        assert counts(db) == (2, 0, 2)
+
+    @pytest.mark.asyncio
+    async def test_b2_never_goes_negative(self, db):
+        """An exit-facing crossing with nothing on B2 clamps at zero rather
+        than parking a negative count in the dashboard forever."""
+        seed_zones(db, total=0, b1=0, b2=0)
+        add_open_session(db, "PHANTOM-1", None)
+        db.commit()
+
+        await process_and_commit(make_event("CAM-09", region_id="2"), db)
+        assert counts(db) == (1, 1, 0)
+
+    @pytest.mark.asyncio
+    async def test_b2_heals_down_when_it_exceeds_open_sessions(self, db):
+        """A missed exit crossing leaves B2 too high. Open sessions are
+        authoritative for how many cars exist at all, so B2 is healed down to
+        the total instead of drifting until someone resets the zone by hand."""
+        seed_zones(db, total=0, b1=0, b2=7)
+        add_open_session(db, "REAL-1", None)
+        db.commit()
+
+        await process_and_commit(make_event("CAM-03"), db)
+        assert counts(db) == (1, 0, 1)
 
 
 class TestDedupAndTransactions:
     @pytest.mark.asyncio
     async def test_duplicate_line_event_is_dropped_without_applying_a_delta(self, db):
-        seed_zones(db, total=50, b1=50, b2=50)
+        seed_zones(db, total=50, b1=50, b2=0)
         add_open_session(db, "DUP-1", "B1")
         db.commit()
 

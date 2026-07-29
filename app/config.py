@@ -617,6 +617,21 @@ class Settings(BaseSettings):
     OCCUPANCY_ENTRANCE_ZONES: str = "1"
     OCCUPANCY_EXIT_ZONES: str= "2"
 
+    # Cameras whose line crossings drive the B2 count as a running DELTA
+    # (+1 on the entrance-facing line, -1 on the exit-facing one). Each camera
+    # covers its own passage, so a car going down to B2 crosses exactly ONE of
+    # them and every crossing counts — do NOT add a camera here that sees the
+    # same ramp as another, or one car will be counted twice.
+    B2_CROSSING_CAMERAS: str = "CAM-09,CAM-10"
+
+    # Dedup window for the delta cameras above, in seconds. Deliberately MUCH
+    # shorter than EVENT_STREAM_SUPPRESS_SECONDS: that 30s window exists to
+    # suppress a redundant *recount*, which is free to drop. A delta is not —
+    # two cars down the same ramp 10s apart are two events that must both
+    # count, so a 30s window would silently lose the second one. This only
+    # needs to absorb Hikvision firing one physical crossing twice.
+    OCCUPANCY_CROSSING_DEDUP_SECONDS: float = 2.0
+
     # ── Storage ───────────────────────────────────────────────────────────
     STORAGE_MODE: str = "local"          # "local" or "spaces"
     DO_SPACES_KEY: str = ""
@@ -875,6 +890,10 @@ class Settings(BaseSettings):
             for t in self.DISABLED_ALERT_TYPES.split(",")
             if t.strip()
         }
+
+    def b2_crossing_cameras(self) -> set[str]:
+        """Camera ids whose line crossings move the B2 count by a delta."""
+        return {c.strip() for c in self.B2_CROSSING_CAMERAS.split(",") if c.strip()}
 
     def get_zone_metadata(self, zone_id: Optional[str]) -> dict[str, Any]:
         """Return canonical metadata for a logical zone or gate."""
