@@ -16,6 +16,7 @@ from app.routers import (
     events, occupancy,
     health, alerts, vehicles, entry_exit, parking_stats, parking_sessions_internal,
     entry_confirmations,
+    slot_recoveries,
     snapshots,
 )
 from app.database import SessionLocal, create_tables, engine
@@ -116,6 +117,7 @@ app.include_router(vehicles.router,      prefix="/api/v1", tags=["🔍 Vehicles 
 
 app.include_router(parking_sessions_internal.router, prefix="/api/v1", tags=["Internal Sessions"])
 app.include_router(entry_confirmations.router, prefix="/api/v1", tags=["Entry V2"])
+app.include_router(slot_recoveries.router, prefix="/api/v1", tags=["Slot Recovery"])
 
 app.include_router(snapshots.router, tags=["📸 Snapshots"])
 

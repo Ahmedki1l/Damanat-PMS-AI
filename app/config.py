@@ -761,6 +761,20 @@ class Settings(BaseSettings):
     # Max records pulled per camera per poll (crossRecords pageSize, ≤ 500).
     HIK_RECONCILE_PAGE_SIZE: int = Field(default=100, gt=0, le=500)
 
+    # ── VA slot recovery ──────────────────────────────────────────────────
+    # Opens a session for a car Video Analytics finds parked with no record of it
+    # entering — the entry was missed entirely (no ANPR, no HikCentral, no ramp
+    # crossing). OFF by default: it creates sessions from evidence that never
+    # passed the gate, so it is opt-in per deployment.
+    SLOT_RECOVERY_ENABLED: bool = False
+    # PMS-AI's own bar, applied on top of VA's. Deliberately duplicated rather than
+    # trusted: the two services deploy independently, and this is the side that
+    # owns parking_sessions. Defaults match VA's measured floors — verified-correct
+    # answers scored 0.620-0.909 with margins 0.102-0.483 on the live fleet
+    # (2026-07-30), while an unenrolled car scores 0.218-0.339 against everything.
+    SLOT_RECOVERY_MIN_REID_SCORE: float = Field(default=0.55, ge=0.0, le=1.0)
+    SLOT_RECOVERY_MIN_REID_MARGIN: float = Field(default=0.10, ge=0.0, le=1.0)
+
     # ── Logging ───────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 
