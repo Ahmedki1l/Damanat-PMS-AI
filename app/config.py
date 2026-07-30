@@ -849,6 +849,25 @@ class Settings(BaseSettings):
             return self
 
         self.HIK_BASE_URL = self.HIK_BASE_URL.strip().rstrip("/")
+
+        # The reconcile sweep must never see a pass the burst buffer is still
+        # deciding about. A refused burst only becomes invisible to the sweep once
+        # it has been dropped (at ANPR_BURST_MAX_SECONDS) and its HikCentral GUID
+        # consumed — so a grace shorter than that lets the sweep re-open an entry
+        # the crossing gate was about to refuse. Clamp rather than raise: this
+        # layer is additive and must not stop the app from booting.
+        min_grace = self.ANPR_BURST_MAX_SECONDS + 30.0
+        if self.HIK_RECONCILE_GRACE_SECONDS < min_grace:
+            warnings.warn(
+                f"[Hik] HIK_RECONCILE_GRACE_SECONDS="
+                f"{self.HIK_RECONCILE_GRACE_SECONDS} is below "
+                f"ANPR_BURST_MAX_SECONDS={self.ANPR_BURST_MAX_SECONDS} + 30s "
+                f"margin; raising it to {min_grace} so the reconcile sweep "
+                "cannot re-open an entry the crossing gate refused.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self.HIK_RECONCILE_GRACE_SECONDS = min_grace
         return self
 
     def hik_entry_resource_ids(self) -> str:

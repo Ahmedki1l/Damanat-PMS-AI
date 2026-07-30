@@ -34,6 +34,8 @@ from app.services.hikcentral.models import (
 from app.services.hikcentral.validation import (
     DIRECTION_ENTRY,
     DIRECTION_EXIT,
+    REFUSED_NO_CROSSING,
+    consume_refused_entry,
     download_hik_images,
     is_authoritative,
     is_enabled,
@@ -47,6 +49,7 @@ from app.services.hikcentral.validation import (
 __all__ = [
     "DIRECTION_ENTRY",
     "DIRECTION_EXIT",
+    "REFUSED_NO_CROSSING",
     "HikImages",
     "HikOutcome",
     "PLATE_SOURCE_EDGE_ANPR",
@@ -55,6 +58,7 @@ __all__ = [
     "PLATE_SOURCE_HIK_POLLED",
     "PLATE_SOURCE_HIK_RECOVERED",
     "close_hikcentral_http_client",
+    "consume_refused_entry",
     "download_hik_images",
     "is_authoritative",
     "is_enabled",

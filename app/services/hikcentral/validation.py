@@ -38,6 +38,11 @@ logger = get_logger(__name__)
 DIRECTION_ENTRY = "entry"
 DIRECTION_EXIT = "exit"
 
+# `match_reason` for a pass the crossing gate refused. Stored so the audit trail
+# distinguishes "we never saw this car" from "we saw it and decided it did not
+# enter" — the reconciler must only ever act on the first.
+REFUSED_NO_CROSSING = "edge_refused_no_crossing"
+
 
 def _enabled() -> bool:
     return settings.HIK_VALIDATION_MODE != "off"
@@ -370,6 +375,90 @@ async def list_unconsumed_records(
         for r in records
         if r.canonical_plate and not guid_already_used(db, r.guid)
     ]
+
+
+async def consume_refused_entry(
+    db: Optional[Session], reported_plate: str, event_time
+) -> Optional[str]:
+    """Consume the HikCentral record behind an entry the crossing gate REFUSED.
+
+    The ANPR camera fired but no ramp crossing ever confirmed a car, so the edge
+    concluded nothing entered and deliberately wrote no `EntryExitLog`. That is
+    precisely the condition `_reconcile_missed_entries` reads as "the edge missed
+    this car" — so without this, the reconciler re-opens every entry the gate
+    refuses, and the crossing confirmation is decorative.
+
+    Recording a `matched=False` row consumes the GUID, which is all it takes:
+    `list_unconsumed_records` already filters consumed GUIDs, so the reconciler
+    needs no knowledge of refusals and stays a pure "what did we never see?" sweep.
+
+    Returns the consumed GUID, or None when there was nothing to consume — layer
+    off, no HikCentral record in the window, or already consumed. All are safe:
+    if HikCentral holds no record for this pass, the reconciler has nothing to
+    act on either.
+    """
+    if not _enabled() or db is None:
+        return None
+    resource_ids = settings.hik_entry_resource_ids()
+    if not resource_ids:
+        return None
+
+    try:
+        records = await _lookup(event_time, resource_ids)
+    except Exception as exc:  # a refusal must never break the flusher
+        logger.warning(
+            "[Hik] refused-entry lookup failed for plate=%s at %s: %r",
+            reported_plate, event_time, exc,
+        )
+        return None
+
+    usable = [
+        r
+        for r in records
+        if r.canonical_plate
+        and _within_skew(r, event_time)
+        and not guid_already_used(db, r.guid)
+    ]
+    if not usable:
+        logger.info(
+            "%s entry refused for plate=%s at %s — no unconsumed HikCentral "
+            "record to tombstone (nothing for the reconciler to re-open)",
+            _log_tag(), reported_plate, event_time,
+        )
+        return None
+
+    # Prefer the record agreeing with what the camera read; otherwise the closest
+    # pass in the window — the same one the reconciler would otherwise act on.
+    canonical = normalize_plate(reported_plate) or reported_plate
+    agreeing = [r for r in usable if r.canonical_plate == canonical]
+    match = _closest(agreeing or usable, event_time)
+
+    db.add(
+        HikValidation(
+            session_id=None,
+            entry_exit_log_id=None,
+            direction=DIRECTION_ENTRY,
+            guid=match.guid,
+            plate_license=match.plate_license,
+            canonical_plate=match.canonical_plate,
+            reported_plate=reported_plate,
+            # The ANPR camera is what reported this plate; HikCentral only
+            # supplies the identity of the pass we are refusing.
+            plate_source=PLATE_SOURCE_EDGE_ANPR,
+            pass_time=to_facility_naive(match.pass_time),
+            resource_id=match.resource_id,
+            resource_name=match.resource_name,
+            matched=False,
+            match_reason=REFUSED_NO_CROSSING,
+            created_at=facility_now_naive(),
+        )
+    )
+    logger.warning(
+        "[Hik] entry REFUSED by the crossing gate — consuming guid=%s plate=%s "
+        "pass_time=%s so the reconciler cannot re-open it",
+        match.guid, match.canonical_plate, to_facility_naive(match.pass_time),
+    )
+    return match.guid
 
 
 async def download_hik_images(outcome: Optional[HikOutcome]) -> HikImages:

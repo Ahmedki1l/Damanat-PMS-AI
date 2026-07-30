@@ -382,6 +382,11 @@ async def flush_due_entry_bursts(db: Session) -> None:
             f"[UC1] Entry burst dropped (no ramp confirmation within {max_age:.0f}s): "
             f"cam={buf['camera_id']} reads={len(buf['reads'])}"
         )
+        # The refusal only sticks if HikCentral's record for the same pass is
+        # consumed too — otherwise the reconciler re-opens it. See
+        # _tombstone_refused_burst.
+        if await _tombstone_refused_burst(db, buf):
+            changed = True
     for c in silent:
         # A crossing with no plate is only "silent" once HikCentral has also
         # failed to name the car. Recovery is attempted first, never after.
@@ -392,6 +397,48 @@ async def flush_due_entry_bursts(db: Session) -> None:
         changed = True
     if changed:
         db.commit()
+
+
+def _winning_read(reads: list[dict]) -> dict:
+    """The read that labels a burst: highest picNum, then latest arrival.
+
+    The entry ANPR fires several reads per car and the early ones are the bad
+    ones (plate far/small/blurry), so the burst is labeled by its last read. Kept
+    as one function because the refusal tombstone must name the same plate the
+    flush would have written — if these two ever disagreed, a refused burst would
+    tombstone one plate and the reconciler would re-open under another.
+    """
+    return max(
+        reads,
+        key=lambda r: (r["pic_num"] if r["pic_num"] is not None else -1, r["event_time"]),
+    )
+
+
+async def _tombstone_refused_burst(db: Session, buf: dict) -> bool:
+    """Stop the HikCentral reconciler from re-opening a burst the gate refused.
+
+    A dropped burst leaves no `EntryExitLog` on purpose. `_reconcile_missed
+    _entries` treats "HikCentral has a pass with no EntryExitLog" as a missed
+    entry, so the refusal would be silently undone a few minutes later — which is
+    exactly what produced the phantom open sessions that surface as overstays.
+    Consuming the GUID here closes that loop. Returns True when a row was added.
+    """
+    reads = buf.get("reads") or []
+    if not reads:
+        return False
+    winner = _winning_read(reads)
+    plate = winner.get("plate")
+    event_time = winner.get("event_time") or buf.get("first_event_time")
+    if not plate or event_time is None:
+        return False
+    try:
+        guid = await hikcentral.consume_refused_entry(db, plate, event_time)
+    except Exception as exc:  # never let a tombstone break the flusher
+        logger.warning(
+            "[UC1] Could not tombstone refused burst plate=%s: %r", plate, exc
+        )
+        return False
+    return guid is not None
 
 
 def _recovered_burst(outcome, crossing: dict) -> dict:
@@ -673,11 +720,7 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
     if not reads:
         return
 
-    # Winning read = last of the burst: highest picNum, then latest arrival.
-    winner = max(
-        reads,
-        key=lambda r: (r["pic_num"] if r["pic_num"] is not None else -1, r["event_time"]),
-    )
+    winner = _winning_read(reads)
     plate = winner["plate"]
     event_time = winner["event_time"]
     snapshot_path = winner["snapshot_path"]
