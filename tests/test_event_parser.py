@@ -196,3 +196,39 @@ class TestPlateNormalization:
         from app.services.event_parser import _normalize_plate
         assert _normalize_plate(raw) is None
 
+
+
+class TestPlateTruncation:
+    """`plate_digits_lost` / `same_vehicle_plate` — the primitive that tells a
+    re-read of one car apart from the arrival of the next one."""
+
+    @pytest.mark.parametrize("partial,full", [
+        ("KKR-4", "KKR-6294"),      # 2026-08-09: last digit only survived
+        ("KKR-62", "KKR-6294"),     # leading digits survived
+        ("KKR-294", "KKR-6294"),    # one digit lost off the front
+    ])
+    def test_detects_a_truncated_read(self, partial, full):
+        from app.services.event_parser import plate_digits_lost
+        assert plate_digits_lost(partial, full) is True
+        assert plate_digits_lost(full, partial) is False   # direction matters
+
+    @pytest.mark.parametrize("a,b", [
+        ("KKR-6294", "KKR-6295"),   # same length → two cars, not a truncation
+        ("KKR-4", "ZZT-4"),         # different letter group
+        ("KKR-29", "KKR-6294"),     # middle substring — no camera does this
+        ("KKR-6294", "KKR-6294"),   # identical is not "digits lost"
+        ("KKR-4", None),
+        (None, "KKR-6294"),
+        ("TEST-001", "TEST-0012"),  # unparseable format → exact match only
+    ])
+    def test_rejects_everything_else(self, a, b):
+        from app.services.event_parser import plate_digits_lost
+        assert plate_digits_lost(a, b) is False
+
+    def test_same_vehicle_plate_covers_both_directions_and_equality(self):
+        from app.services.event_parser import same_vehicle_plate
+        assert same_vehicle_plate("KKR-6294", "KKR-4") is True
+        assert same_vehicle_plate("KKR-4", "KKR-6294") is True
+        assert same_vehicle_plate("KKR-6294", "KKR-6294") is True
+        assert same_vehicle_plate("KKR-6294", "KKR-6295") is False
+        assert same_vehicle_plate("KKR-6294", None) is False

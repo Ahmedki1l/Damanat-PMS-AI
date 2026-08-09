@@ -39,7 +39,7 @@ from app.services.entry_state_lock import acquire_plate_transaction_lock
 from app.models.entry_exit_log import EntryExitLog
 from app.services import parking_session_service
 from app.services import vehicle_service
-from app.services.event_parser import ParsedCameraEvent
+from app.services.event_parser import ParsedCameraEvent, same_vehicle_plate
 from app.services.alert_service import create_alert
 from app.services import hikcentral
 from app.services.hikcentral import HikImages
@@ -179,6 +179,28 @@ def _attach_pending_crossing(buf: dict) -> None:
         buf["confirm_source"] = src
 
 
+def _is_same_car_reread(buf: dict, plate: str, event_time) -> bool:
+    """True when a picNum tie is one car re-read, not the next car arriving.
+
+    `pic <= max_pic` is genuinely ambiguous — a new car whose pic 1-2 events were
+    lost also opens at 3 — so the plate has to carry the decision. A read whose
+    plate is a truncation of one already buffered (or identical to it), arriving
+    within seconds, is the same car: two cars cannot occupy one gate that close
+    together, and their plates would have to be truncations of each other on top
+    of that. Anything else still splits, exactly as before.
+    """
+    limit = settings.ANPR_BURST_SAME_CAR_SECONDS
+    for read in buf["reads"]:
+        if not same_vehicle_plate(read["plate"], plate):
+            continue
+        previous = read["event_time"]
+        if event_time is None or previous is None:
+            return True     # no usable timestamps — the plate match is the evidence
+        if abs((event_time - previous).total_seconds()) <= limit:
+            return True
+    return False
+
+
 async def _buffer_entry_read(event: ParsedCameraEvent, plate: str, event_time) -> None:
     """Append one ANPR read to the per-car entry burst. No DB write / no PMS
     forward here — those run once, at flush, on the winning (last) read."""
@@ -196,6 +218,17 @@ async def _buffer_entry_read(event: ParsedCameraEvent, plate: str, event_time) -
             # crossing (recognition lag) for the SAME car. Only picNum-reset (or
             # the idle gap, handled by the flusher) splits cars.
             picnum_reset = pic is not None and max_pic is not None and pic <= max_pic
+            if picnum_reset and _is_same_car_reread(buf, plate, event_time):
+                # Not a new car: the SAME plate came back truncated under a
+                # repeated picNum. Splitting here is what wrote KKR-4 for
+                # KKR-6294 on 2026-08-09 — the good read was force-flushed into
+                # a burst the ramp crossing could no longer confirm, so it was
+                # dropped as a ghost while the partial read became the entry.
+                logger.info(
+                    f"[UC1] Same-car re-read kept in burst id={buf['id']}: "
+                    f"plate={plate} pic={pic} (already buffered up to pic={max_pic})"
+                )
+                picnum_reset = False
             if picnum_reset:
                 buf["force_flush"] = True   # close it; the flusher will write it
                 buf = None
@@ -400,17 +433,27 @@ async def flush_due_entry_bursts(db: Session) -> None:
 
 
 def _winning_read(reads: list[dict]) -> dict:
-    """The read that labels a burst: highest picNum, then latest arrival.
+    """The read that labels a burst: highest picNum, then confidence, then latest.
 
     The entry ANPR fires several reads per car and the early ones are the bad
     ones (plate far/small/blurry), so the burst is labeled by its last read. Kept
     as one function because the refusal tombstone must name the same plate the
     flush would have written — if these two ever disagreed, a refused burst would
     tombstone one plate and the reconciler would re-open under another.
+
+    picNum stays the primary key: a later frame really is the better one. But the
+    camera repeats a picNum often enough that arrival order alone decided those
+    ties, which on 2026-08-09 labeled a car KKR-4 (conf 89) when the same burst
+    held KKR-6294 (conf 96) at the same picNum. Confidence breaks the tie before
+    arrival order does; `event_time` still settles the rest.
     """
     return max(
         reads,
-        key=lambda r: (r["pic_num"] if r["pic_num"] is not None else -1, r["event_time"]),
+        key=lambda r: (
+            r["pic_num"] if r["pic_num"] is not None else -1,
+            r["confidence"] if r["confidence"] is not None else -1,
+            r["event_time"],
+        ),
     )
 
 
@@ -583,18 +626,30 @@ def _gate_event_already_logged(
     db: Session, plate: str, gate: str, when: datetime, window: timedelta
 ) -> bool:
     """True when an EntryExitLog for this plate/gate sits within ±window — i.e.
-    the edge pipeline already noticed this pass."""
-    return (
-        db.query(EntryExitLog.id)
+    the edge pipeline already noticed this pass.
+
+    A truncated read of the SAME car counts as already logged. The camera files
+    both its full and its partial read with HikCentral, but the burst now merges
+    them and writes ONE entry under the fuller plate — leaving the partial record
+    unconsumed. Matching on exact plate alone, this sweep would read that
+    leftover as a car nobody logged and open a phantom session for it, which is
+    the overstay-generating failure the crossing gate exists to prevent.
+
+    Deliberately bidirectional. Two cars whose plates truncate to each other
+    passing inside the match window is vanishingly rare, and if it ever happens,
+    missing one entry (the car is still caught as an unmatched exit) is cheaper
+    than an open session that never closes.
+    """
+    logged_plates = (
+        db.query(EntryExitLog.plate_number)
         .filter(
-            EntryExitLog.plate_number == plate,
             EntryExitLog.gate == gate,
             EntryExitLog.event_time >= when - window,
             EntryExitLog.event_time <= when + window,
         )
-        .first()
-        is not None
+        .all()
     )
+    return any(same_vehicle_plate(plate, row[0]) for row in logged_plates)
 
 
 async def _reconcile_missed_entries(db: Session) -> None:

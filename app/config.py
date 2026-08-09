@@ -524,6 +524,21 @@ class Settings(BaseSettings):
     # write ONE entry labeled by the LAST read, committed after a short debounce
     # window (idle gap after the final read) — never the first/wrong read.
     ANPR_BURST_WINDOW_SECONDS: float = 2.5   # idle gap after last read → flush
+    # How close two reads must be for a REPEATED picNum to count as the same car
+    # re-read rather than the next car. Only consulted when the plates are also
+    # the same or one is a truncation of the other (see _is_same_car_reread), so
+    # this bounds an already plate-gated exception.
+    #
+    # Measured against the CAMERA's trigger time, not arrival time — the two are
+    # not the same clock. On 2026-08-09 the reads arrived 1s apart but carried
+    # trigger times 3s apart (09:27:16 and 09:27:19), so a 2s window would have
+    # split the car anyway and the fix would not have fixed anything. One car
+    # sits in front of the gate ANPR for several seconds; 5s covers that.
+    #
+    # It does not need to be tight. ANPR_BURST_WINDOW_SECONDS already closes a
+    # burst that goes idle, so two reads can only reach this check if they landed
+    # inside that debounce — this window just rejects a stale trigger time.
+    ANPR_BURST_SAME_CAR_SECONDS: float = 5.0
     # A CAM-23 crossing can reach PMS-AI before Hikvision emits the associated
     # ANPR webhook. This is a separate correlation window, not the read-idle
     # debounce above. Keep it tight because the crossing itself has no plate.
@@ -714,6 +729,15 @@ class Settings(BaseSettings):
     # A HikCentral record may only be paired with a gate event this far away.
     HIK_MATCH_MAX_SKEW_SECONDS: float = Field(
         default=10.0, gt=0, le=120.0, allow_inf_nan=False,
+    )
+    # How close a FULLER record must be to be treated as the same car's better
+    # read of a plate this camera truncated. Deliberately tighter than the match
+    # skew above: the two reads of one car are seconds apart, while a genuinely
+    # short-plated car passing near a long-plated one is a different car whose
+    # plate must not be rewritten. Effective value is capped by
+    # HIK_MATCH_MAX_SKEW_SECONDS — a candidate must clear both.
+    HIK_PARTIAL_MATCH_MAX_SKEW_SECONDS: float = Field(
+        default=5.0, gt=0, le=120.0, allow_inf_nan=False,
     )
     HIK_CONNECT_TIMEOUT_SECONDS: float = Field(
         default=3.0, gt=0, le=30.0, allow_inf_nan=False,

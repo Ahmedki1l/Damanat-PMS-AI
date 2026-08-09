@@ -1164,6 +1164,46 @@ def normalize_plate(raw: str) -> Optional[str]:
 _normalize_plate = normalize_plate
 
 
+# A normalized plate in its canonical "LLL-DDDD" shape. Only reads that parse
+# here can be compared for truncation; anything else (test plates, non-Saudi
+# formats, "UNKNOWN-3") falls back to exact equality.
+_CANONICAL_PLATE_RE = re.compile(r"^([A-Z]{2,3})-(\d{1,4})$")
+
+
+def plate_digits_lost(partial: Optional[str], full: Optional[str]) -> bool:
+    """True when `partial` is `full` with one or more digits dropped.
+
+    The entry ANPR can emit a truncated read of a plate it read completely a
+    moment earlier — "6294KKR" normalises to KKR-6294, then "4KKR" to KKR-4 on a
+    blurrier frame. Same letter group with a strictly shorter digit group that is
+    a prefix or suffix of the fuller one means digits were lost off one end, not
+    that a different car arrived.
+
+    Deliberately strict: equal-length digits are a genuine disagreement (KKR-6294
+    vs KKR-6295 are two cars), and a digit group that is only a *middle*
+    substring is not a truncation any camera produces.
+    """
+    if not partial or not full or partial == full:
+        return False
+    m_partial = _CANONICAL_PLATE_RE.match(partial)
+    m_full = _CANONICAL_PLATE_RE.match(full)
+    if not m_partial or not m_full:
+        return False
+    if m_partial.group(1) != m_full.group(1):
+        return False
+    short, long = m_partial.group(2), m_full.group(2)
+    if len(short) >= len(long):
+        return False
+    return long.startswith(short) or long.endswith(short)
+
+
+def same_vehicle_plate(a: Optional[str], b: Optional[str]) -> bool:
+    """True when two reads name the same car — identical, or one truncated."""
+    if not a or not b:
+        return False
+    return a == b or plate_digits_lost(a, b) or plate_digits_lost(b, a)
+
+
 def _parse_json_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
     """Parse Phase 2 JSON events (AccessControllerEvent / vehicleMatchResult from ANPR cameras)."""
     try:

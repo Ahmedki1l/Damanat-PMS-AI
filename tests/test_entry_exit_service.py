@@ -25,6 +25,7 @@ from app.services.entry_exit_service import (
     _entry_bursts,
     _pending_crossings,
     _recent_entries,
+    _winning_read,
     CAM03_PMS_DIRECTION,
     SourceTimestampUnavailable,
 )
@@ -117,6 +118,7 @@ def configure_settings(mock_settings, *, two_phase: bool):
     }
     mock_settings.ENTRY_ANTIBOUNCE_SECONDS = 0  # disabled — keeps DB queries simple
     mock_settings.ANPR_BURST_WINDOW_SECONDS = 2.5
+    mock_settings.ANPR_BURST_SAME_CAR_SECONDS = 5.0
     mock_settings.ENTRY_PENDING_CROSSING_SECONDS = 10.0
     mock_settings.ANPR_BURST_MAX_SECONDS = 8.0
     mock_settings.ENTRY_CONFIRM_DIRECTIONS = "CAM-23:ramp-entry,CAM-03:B-entry"
@@ -245,6 +247,129 @@ class TestEntryExitService:
 
         # Two distinct bursts now exist (A closed for flush, B open).
         assert len(_entry_bursts) == 2
+
+    # ── UC1: a REPEATED picNum on the same car must not split it ───────────
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.open_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_truncated_reread_keeps_the_full_plate(self, mock_vs, mock_open, mock_alert, mock_settings, mock_pms):
+        """2026-08-09 regression. The camera read KKR-6294, then re-read the same
+        car as the truncated KKR-4 under the SAME picNum. The repeat must not
+        open a second burst (the first one would be force-flushed out of reach of
+        the ramp crossing and dropped), and the fuller, more confident read must
+        label the entry."""
+        configure_settings(mock_settings, two_phase=True)
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle(plate="KKR-6294")
+        db = make_db()
+
+        # The real spacing from the incident: trigger times 3s apart, NOT the ~0s
+        # gap a default-timestamped event produces. The camera clock is what this
+        # window is measured against, and it ran ahead of arrival order (the two
+        # reads reached PMS 1s apart). Anchored to now so the burst is not stale.
+        now = facility_now_naive()
+        await handle_anpr_event(make_anpr_event(
+            plate="KKR-6294", pic_num=3, plate_confidence=96,
+            trigger_time=now - timedelta(seconds=3),
+        ), db)
+        await handle_anpr_event(make_anpr_event(
+            plate="KKR-4", pic_num=3, plate_confidence=89,
+            trigger_time=now,
+        ), db)
+
+        assert len(_entry_bursts) == 1          # one car, not two
+        await confirm_entry_crossing(db, snapshot="ramp.jpg", source_cam="CAM-23")
+        _force_idle()
+        await flush_due_entry_bursts(db)
+
+        db.add.assert_called_once()
+        log = db.add.call_args[0][0]
+        assert log.plate_number == "KKR-6294"
+        assert log.plate_confidence == 96
+        assert "KKR-4" not in [c.args[0] for c in mock_pms.await_args_list]
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.open_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_repeated_picnum_with_unrelated_plate_still_splits(self, mock_vs, mock_open, mock_alert, mock_settings, mock_pms):
+        """The same-car exception is plate-gated: a repeated picNum carrying an
+        unrelated plate is still the next car, exactly as before."""
+        configure_settings(mock_settings, two_phase=True)
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+        db = make_db()
+
+        await handle_anpr_event(make_anpr_event(plate="KKR-6294", pic_num=3), db)
+        await handle_anpr_event(make_anpr_event(plate="ZZT-1111", pic_num=3), db)
+
+        assert len(_entry_bursts) == 2
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.open_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_repeated_picnum_with_neighbouring_plate_still_splits(self, mock_vs, mock_open, mock_alert, mock_settings, mock_pms):
+        """Same letters and the same number of digits is a genuine disagreement —
+        KKR-6294 and KKR-6295 are two cars, not one truncated read."""
+        configure_settings(mock_settings, two_phase=True)
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+        db = make_db()
+
+        await handle_anpr_event(make_anpr_event(plate="KKR-6294", pic_num=3), db)
+        await handle_anpr_event(make_anpr_event(plate="KKR-6295", pic_num=3), db)
+
+        assert len(_entry_bursts) == 2
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.open_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_a_stale_trigger_time_still_splits(self, mock_vs, mock_open, mock_alert, mock_settings, mock_pms):
+        """The same-car exception is time-bounded as well as plate-gated: a
+        compatible plate whose trigger time is far away is not this car."""
+        configure_settings(mock_settings, two_phase=True)
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+        db = make_db()
+
+        now = facility_now_naive()
+        await handle_anpr_event(make_anpr_event(
+            plate="KKR-6294", pic_num=3, trigger_time=now - timedelta(seconds=12),
+        ), db)
+        await handle_anpr_event(make_anpr_event(
+            plate="KKR-4", pic_num=3, trigger_time=now,
+        ), db)
+
+        assert len(_entry_bursts) == 2
+
+    # ── UC1: winner selection ──────────────────────────────────────────────
+
+    def test_winning_read_breaks_picnum_ties_on_confidence(self):
+        """Tied picNum used to fall through to arrival order, which is what let
+        the later, worse read label the car."""
+        early = {"pic_num": 3, "confidence": 96, "event_time": datetime(2026, 8, 9, 9, 27, 16)}
+        late = {"pic_num": 3, "confidence": 89, "event_time": datetime(2026, 8, 9, 9, 27, 19)}
+        assert _winning_read([early, late]) is early
+
+    def test_winning_read_still_prefers_a_later_picnum(self):
+        """picNum stays primary: a later frame beats a confident early one."""
+        early = {"pic_num": 1, "confidence": 99, "event_time": datetime(2026, 8, 9, 9, 27, 16)}
+        late = {"pic_num": 3, "confidence": 70, "event_time": datetime(2026, 8, 9, 9, 27, 19)}
+        assert _winning_read([early, late]) is late
+
+    def test_winning_read_tolerates_missing_confidence(self):
+        """A read with no confidenceLevel must not outrank a scored one."""
+        scored = {"pic_num": 2, "confidence": 80, "event_time": datetime(2026, 8, 9, 9, 27, 16)}
+        unscored = {"pic_num": 2, "confidence": None, "event_time": datetime(2026, 8, 9, 9, 27, 19)}
+        assert _winning_read([scored, unscored]) is scored
 
     # ── UC1: two-phase disabled — idle window alone commits ────────────────
 

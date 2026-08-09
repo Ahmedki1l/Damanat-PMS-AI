@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.config import facility_now_naive, settings
 from app.models.hik_validation import HikValidation
-from app.services.event_parser import normalize_plate
+from app.services.event_parser import normalize_plate, plate_digits_lost
 from app.services.hikcentral import client
 from app.services.hikcentral.models import (
     PLATE_SOURCE_EDGE_ANPR,
@@ -103,6 +103,23 @@ def _within_skew(record: VehicleLogRecord, anchor_naive) -> bool:
     return delta <= settings.HIK_MATCH_MAX_SKEW_SECONDS
 
 
+def _within_partial_skew(record: VehicleLogRecord, anchor_naive) -> bool:
+    """The tighter window a record must also clear to complete a truncated plate.
+
+    Never wider than the ordinary match skew, so this can only ever narrow the
+    candidate set — a misconfigured value cannot admit a record that is not
+    already an acceptable match.
+    """
+    limit = min(
+        settings.HIK_PARTIAL_MATCH_MAX_SKEW_SECONDS,
+        settings.HIK_MATCH_MAX_SKEW_SECONDS,
+    )
+    delta = abs(
+        (to_facility_naive(record.pass_time) - anchor_naive).total_seconds()
+    )
+    return delta <= limit
+
+
 async def _validate_plate(
     reported_plate: str,
     event_time,
@@ -153,6 +170,75 @@ async def _validate_plate(
         )
 
     usable = [r for r in records if not guid_already_used(db, r.guid)]
+
+    # Agreement alone does not mean the plate is right. This platform is fed by
+    # the SAME entry LPR, so when the camera truncates a read it files that
+    # truncation here too — and the lookup is plate-blind, so the fuller read of
+    # the same car is usually sitting in `records` alongside it. Check for that
+    # BEFORE accepting agreement, or the fuller record is never examined.
+    # (2026-08-09: HikCentral held 6294KKR at 09:27:16 and 4KKR at 09:27:19, both
+    # inside the skew window; this function confirmed KKR-4 and the correct row
+    # was later tombstoned as refused.)
+    fuller = [
+        r
+        for r in usable
+        if _within_partial_skew(r, event_time)
+        and plate_digits_lost(canonical, r.canonical_plate)
+    ]
+    # Completing a plate REWRITES it in authoritative mode, so it follows the
+    # same discipline as `recover_entry_plate`: act only when the evidence names
+    # exactly one car. Two different fuller plates in the window means two
+    # candidates and nothing says which one this truncation came from.
+    distinct_fuller = {r.canonical_plate for r in fuller}
+    if len(distinct_fuller) > 1:
+        logger.warning(
+            "%s %s ambiguous partial plate=%s — %d candidates %s; keeping the "
+            "ANPR plate",
+            _log_tag(),
+            direction,
+            canonical,
+            len(distinct_fuller),
+            sorted(distinct_fuller),
+        )
+        fuller = []
+    if fuller:
+        match = _closest(fuller, event_time)
+        if _authoritative():
+            logger.warning(
+                "[Hik] %s partial plate completed %s -> %s guid=%s",
+                direction,
+                canonical,
+                match.canonical_plate,
+                match.guid,
+            )
+            return HikOutcome(
+                plate=match.canonical_plate,
+                plate_source=PLATE_SOURCE_HIK_CORRECTED,
+                matched=True,
+                reason="plate_completed",
+                record=match,
+                reported_plate=reported_plate,
+                candidates_considered=len(records),
+            )
+        logger.warning(
+            "%s %s partial plate anpr=%s hik=%s guid=%s "
+            "(shadow: keeping the ANPR plate)",
+            _log_tag(),
+            direction,
+            canonical,
+            match.canonical_plate,
+            match.guid,
+        )
+        return HikOutcome(
+            plate=reported_plate,
+            plate_source=PLATE_SOURCE_EDGE_ANPR,
+            matched=False,
+            reason="plate_partial_shadow",
+            record=match,
+            reported_plate=reported_plate,
+            candidates_considered=len(records),
+        )
+
     agreeing = [
         r
         for r in usable

@@ -99,3 +99,63 @@ async def test_list_unconsumed_records_empty_when_off(monkeypatch):
         "447", datetime.now(FTZ), datetime.now(FTZ), None
     )
     assert out == [] and called == []
+
+
+# ── The sweep must not re-open a car the edge logged under a fuller plate ────
+
+
+@pytest.fixture
+def recon_db():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from app.database import Base
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    session = sessionmaker(bind=engine)()
+    try:
+        yield session
+    finally:
+        session.close()
+        Base.metadata.drop_all(bind=engine)
+
+
+WHEN = datetime(2026, 8, 9, 9, 27, 19)
+MATCH_WINDOW = timedelta(seconds=30)
+
+
+def _log_entry(db, plate, when=WHEN, gate="entry"):
+    from app.models.entry_exit_log import EntryExitLog
+
+    db.add(EntryExitLog(plate_number=plate, gate=gate, event_time=when, camera_id="CAM-ENTRY"))
+    db.commit()
+
+
+def test_leftover_truncated_record_counts_as_already_logged(recon_db):
+    """The 2026-08-09 pair: the burst merges 6294KKR + 4KKR and writes ONE entry
+    as KKR-6294, so HikCentral's KKR-4 row is left unconsumed. The sweep must
+    recognise it as the same pass, not open a phantom session."""
+    _log_entry(recon_db, "KKR-6294")
+
+    assert ees._gate_event_already_logged(recon_db, "KKR-4", "entry", WHEN, MATCH_WINDOW) is True
+
+
+def test_exact_plate_still_counts_as_already_logged(recon_db):
+    _log_entry(recon_db, "KKR-6294")
+
+    assert ees._gate_event_already_logged(recon_db, "KKR-6294", "entry", WHEN, MATCH_WINDOW) is True
+
+
+def test_a_genuinely_missed_car_is_still_reported(recon_db):
+    """An unrelated plate in the window must NOT be suppressed — that is the
+    whole point of the sweep."""
+    _log_entry(recon_db, "KKR-6294")
+
+    assert ees._gate_event_already_logged(recon_db, "ZZT-1111", "entry", WHEN, MATCH_WINDOW) is False
+
+
+def test_the_other_gate_and_far_passes_do_not_suppress(recon_db):
+    _log_entry(recon_db, "KKR-6294", gate="exit")
+    _log_entry(recon_db, "KKR-6294", when=WHEN - timedelta(minutes=5))
+
+    assert ees._gate_event_already_logged(recon_db, "KKR-4", "entry", WHEN, MATCH_WINDOW) is False
