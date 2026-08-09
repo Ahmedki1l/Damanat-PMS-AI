@@ -242,6 +242,40 @@ def close_session(
     return None
 
 
+def close_matched_session(
+    db: Session,
+    session: ParkingSession,
+    *,
+    exit_time: datetime,
+    camera_id: str,
+    snapshot_path: Optional[str],
+) -> ParkingSession:
+    """Close ONE specific session identified by evidence other than its plate.
+
+    `close_session` looks the stay up by plate, which is exactly what fails when
+    the entry read was wrong. `exit_match_service` resolves the stay by other
+    means (digit group, truncation, appearance) and hands the row here.
+
+    The session's plate is deliberately left alone: the misread stays in the
+    audit trail as the only evidence that can later prove the match right or
+    wrong. `exit_camera_id` records which camera closed it.
+    """
+    logger.warning(
+        "[ParkingSession] Closing session id=%s plate=%s from an exit read as a "
+        "DIFFERENT plate — resolved by exit matching",
+        session.id,
+        session.plate_number,
+    )
+    return _close_session_record(
+        db,
+        session,
+        exit_time=_naive(exit_time),
+        camera_id=camera_id,
+        snapshot_path=snapshot_path,
+        clear_vehicle_location=True,
+    )
+
+
 def bind_slot(
     db: Session,
     plate_number: str,

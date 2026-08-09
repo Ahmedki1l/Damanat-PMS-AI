@@ -37,6 +37,7 @@ from sqlalchemy.orm import Session
 
 from app.services.entry_state_lock import acquire_plate_transaction_lock
 from app.models.entry_exit_log import EntryExitLog
+from app.services import exit_match_service
 from app.services import parking_session_service
 from app.services import vehicle_service
 from app.services.event_parser import ParsedCameraEvent, same_vehicle_plate
@@ -1239,13 +1240,45 @@ async def handle_anpr_event(
     else:
         logger.warning(f"[UC2] No matching entry found for vehicle {plate}")
 
-    parking_session_service.close_session(
+    closed = parking_session_service.close_session(
         db,
         plate_number=plate,
         event_time=event_time,
         camera_id=event.camera_id,
         snapshot_path=exit_snapshot,
     )
+
+    # Nothing closed under this plate. Either the plate is right and the ENTRY was
+    # lost, or the entry read was wrong and the stay is open under another string.
+    # exit_match_service separates those; only the second is ever matched.
+    if closed is None:
+        resolution = await exit_match_service.resolve_with_appearance(
+            db, plate, event_time, vehicle,
+            event.local_snapshot_path or event.snapshot_path,
+        )
+        if resolution.matched:
+            closed = parking_session_service.close_matched_session(
+                db,
+                resolution.session,
+                exit_time=event_time,
+                camera_id=event.camera_id,
+                snapshot_path=exit_snapshot,
+            )
+            logger.warning(
+                "[UC2] Exit %s resolved to session id=%s plate=%s — %s",
+                plate, resolution.session.id, resolution.session.plate_number,
+                resolution.reason,
+            )
+            if log_entry.parking_duration is None and closed is not None:
+                duration = int((event_time - closed.entry_time).total_seconds())
+                log_entry.parking_duration = max(0, duration)
+        else:
+            logger.warning(
+                "[UC2] Exit %s unresolved (%s): %s | %s",
+                plate, resolution.kind, resolution.reason,
+                exit_match_service.describe(resolution),
+            )
+
     from app.services.occupancy_service import (
         reconcile_zone_counts_from_open_sessions,
     )

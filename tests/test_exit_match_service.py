@@ -1,0 +1,334 @@
+"""Resolving an exit that matched no open session.
+
+The invariant under test throughout: an exit whose plate we have independent
+reason to trust is NEVER matched against another car's session, and an ambiguous
+exit closes nothing at all.
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from datetime import datetime, timedelta
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.config import settings
+from app.database import Base
+from app.models.parking_session import ParkingSession
+from app.models.vehicle import Vehicle
+from app.services import exit_match_service as ems
+
+EXIT_TIME = datetime(2026, 8, 5, 15, 50, 47)
+
+engine = create_engine("sqlite:///:memory:")
+TestSession = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+@pytest.fixture
+def db():
+    Base.metadata.create_all(bind=engine)
+    session = TestSession()
+    try:
+        yield session
+    finally:
+        session.close()
+        Base.metadata.drop_all(bind=engine)
+
+
+def open_session(db, plate, *, hours_ago=4.0):
+    entered = EXIT_TIME - timedelta(hours=hours_ago)
+    row = ParkingSession(
+        plate_number=plate,
+        entry_time=entered,
+        entry_camera_id="CAM-ENTRY",
+        status="open",
+        vehicle_type="unknown",
+        created_at=entered,
+        updated_at=entered,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def vehicle(*, registered=False, slot=None, floor=None):
+    return Vehicle(
+        plate_number="X",
+        owner_name="",
+        title="",
+        vehicle_type="unknown",
+        is_registered=registered,
+        current_slot_id=slot,
+        floor=floor,
+    )
+
+
+# ── The vehicles check runs first and is terminal ────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("veh", "why"),
+    [
+        (vehicle(registered=True), "a human vouched for the plate"),
+        (vehicle(slot="B1-07"), "VA watched it parked in a slot"),
+        (vehicle(floor="B1"), "VA watched it on a floor"),
+    ],
+)
+def test_a_trusted_plate_is_never_matched(db, veh, why):
+    """A trusted plate means the ENTRY was lost, not the identity. Matching it
+    against another car's session would close a stranger's stay."""
+    open_session(db, "KXR-2538")   # a perfect digit match sits right there
+
+    out = ems.resolve_unmatched_exit(db, "AAB-2538", EXIT_TIME, veh)
+
+    assert out.kind == ems.ENTRY_LOST, why
+    assert out.session is None
+
+
+def test_a_placeholder_row_does_not_count_as_trust(db):
+    """ensure_unregistered_vehicle mints a row for any unknown plate — including
+    during this very exit. The flags are the signal, never the row's existence."""
+    open_session(db, "KXR-2538")
+
+    out = ems.resolve_unmatched_exit(db, "AAB-2538", EXIT_TIME, vehicle())
+
+    assert out.kind == ems.MATCHED
+    assert out.session.plate_number == "KXR-2538"
+
+
+# ── Deterministic matching ───────────────────────────────────────────────────
+
+
+def test_digit_group_resolves_the_production_case(db):
+    """2026-08-05: KXR-2538 entered 11:18, left as AAB-2538 at 15:50."""
+    open_session(db, "KXR-2538")
+    open_session(db, "HVA-77")
+    open_session(db, "GLD-5965")
+
+    out = ems.resolve_unmatched_exit(db, "AAB-2538", EXIT_TIME, vehicle())
+
+    assert out.matched
+    assert out.session.plate_number == "KXR-2538"
+    assert "2538" in out.reason
+
+
+def test_a_truncated_entry_plate_resolves(db):
+    """The other observed shape: entered as KKR-4, leaves as KKR-6294."""
+    open_session(db, "KKR-4")
+    open_session(db, "GLD-5965")
+
+    out = ems.resolve_unmatched_exit(db, "KKR-6294", EXIT_TIME, vehicle())
+
+    assert out.matched
+    assert out.session.plate_number == "KKR-4"
+
+
+def test_two_digit_matches_refuse_rather_than_guess(db):
+    """A tiebreak here would be a guess, and a wrong close corrupts two stays."""
+    open_session(db, "KXR-2538")
+    open_session(db, "ZZT-2538")
+
+    out = ems.resolve_unmatched_exit(db, "AAB-2538", EXIT_TIME, vehicle())
+
+    assert out.kind == ems.AMBIGUOUS
+    assert out.session is None
+    assert len(out.candidates) == 2
+
+
+def test_short_digit_groups_do_not_nominate(db):
+    """Plenty of real plates share one or two digits."""
+    open_session(db, "ZZT-77")
+
+    out = ems.resolve_unmatched_exit(db, "HVA-77", EXIT_TIME, vehicle())
+
+    assert out.kind != ems.MATCHED
+
+
+def test_unrelated_plates_produce_no_match(db):
+    """BHD-9990 was never detected at either gate — there is nothing to match,
+    and inventing a pairing would close an innocent session."""
+    open_session(db, "GLD-5965")
+    open_session(db, "HGD-2926")
+
+    out = ems.resolve_unmatched_exit(db, "BHD-9990", EXIT_TIME, vehicle())
+
+    assert out.kind == ems.AMBIGUOUS
+    assert out.session is None
+
+
+def test_no_open_sessions_at_all(db):
+    out = ems.resolve_unmatched_exit(db, "AAB-2538", EXIT_TIME, vehicle())
+
+    assert out.kind == ems.NO_CANDIDATES
+
+
+# ── Bounds ───────────────────────────────────────────────────────────────────
+
+
+def test_a_car_cannot_leave_before_it_arrived(db):
+    open_session(db, "KXR-2538", hours_ago=-2.0)   # entered AFTER this exit
+
+    out = ems.resolve_unmatched_exit(db, "AAB-2538", EXIT_TIME, vehicle())
+
+    assert out.kind == ems.NO_CANDIDATES
+
+
+def test_an_abandoned_phantom_is_not_revived(db, monkeypatch):
+    """A stale session must not be closed by an unrelated car days later."""
+    monkeypatch.setattr(settings, "EXIT_MATCH_MAX_AGE_HOURS", 72.0)
+    open_session(db, "KXR-2538", hours_ago=200.0)
+
+    out = ems.resolve_unmatched_exit(db, "AAB-2538", EXIT_TIME, vehicle())
+
+    assert out.kind == ems.NO_CANDIDATES
+
+
+def test_the_feature_can_be_switched_off(db, monkeypatch):
+    monkeypatch.setattr(settings, "EXIT_MATCH_ENABLED", False)
+    open_session(db, "KXR-2538")
+
+    out = ems.resolve_unmatched_exit(db, "AAB-2538", EXIT_TIME, vehicle())
+
+    assert out.kind == ems.DISABLED
+    assert out.session is None
+
+
+# ── Appearance scoring: only where the plate rules gave up ───────────────────
+
+
+def va_payload(*scores, quality_ok=True):
+    return {
+        "query_quality_ok": quality_ok,
+        "query_sharpness": 180.0,
+        "results": [{"plate": p, "score": s, "refs": 8} for p, s in scores],
+    }
+
+
+@pytest.mark.asyncio
+async def test_appearance_breaks_a_plate_tie(db, monkeypatch):
+    """Two identical digit groups — the plate rules refuse, appearance decides."""
+    open_session(db, "KXR-2538")
+    open_session(db, "ZZT-2538")
+
+    async def fake(image_path, plates):
+        assert set(plates) == {"KXR-2538", "ZZT-2538"}
+        return va_payload(("KXR-2538", 0.91), ("ZZT-2538", 0.44))
+
+    monkeypatch.setattr("app.utils.va_reid_client.compare", fake)
+
+    out = await ems.resolve_with_appearance(
+        db, "AAB-2538", EXIT_TIME, vehicle(), "exit.jpg"
+    )
+
+    assert out.matched
+    assert out.session.plate_number == "KXR-2538"
+    assert "appearance" in out.reason
+
+
+@pytest.mark.asyncio
+async def test_a_thin_margin_closes_nothing(db, monkeypatch):
+    open_session(db, "KXR-2538")
+    open_session(db, "ZZT-2538")
+
+    async def fake(image_path, plates):
+        return va_payload(("KXR-2538", 0.71), ("ZZT-2538", 0.68))
+
+    monkeypatch.setattr("app.utils.va_reid_client.compare", fake)
+
+    out = await ems.resolve_with_appearance(
+        db, "AAB-2538", EXIT_TIME, vehicle(), "exit.jpg"
+    )
+
+    assert out.kind == ems.AMBIGUOUS
+    assert out.session is None
+
+
+@pytest.mark.asyncio
+async def test_a_wide_margin_between_two_bad_scores_is_not_enough(db, monkeypatch):
+    """The absolute floor stops a margin being 'won' by two poor matches."""
+    open_session(db, "KXR-2538")
+    open_session(db, "ZZT-2538")
+
+    async def fake(image_path, plates):
+        return va_payload(("KXR-2538", 0.41), ("ZZT-2538", 0.02))
+
+    monkeypatch.setattr("app.utils.va_reid_client.compare", fake)
+
+    out = await ems.resolve_with_appearance(
+        db, "AAB-2538", EXIT_TIME, vehicle(), "exit.jpg"
+    )
+
+    assert out.kind == ems.AMBIGUOUS
+
+
+@pytest.mark.asyncio
+async def test_an_unusable_exit_crop_is_refused_not_scored(db, monkeypatch):
+    open_session(db, "KXR-2538")
+    open_session(db, "ZZT-2538")
+
+    async def fake(image_path, plates):
+        return va_payload(("KXR-2538", 0.99), ("ZZT-2538", 0.10), quality_ok=False)
+
+    monkeypatch.setattr("app.utils.va_reid_client.compare", fake)
+
+    out = await ems.resolve_with_appearance(
+        db, "AAB-2538", EXIT_TIME, vehicle(), "exit.jpg"
+    )
+
+    assert out.kind == ems.AMBIGUOUS
+
+
+@pytest.mark.asyncio
+async def test_va_being_down_degrades_to_the_plate_answer(db, monkeypatch):
+    open_session(db, "KXR-2538")
+    open_session(db, "ZZT-2538")
+
+    async def fake(image_path, plates):
+        return None
+
+    monkeypatch.setattr("app.utils.va_reid_client.compare", fake)
+
+    out = await ems.resolve_with_appearance(
+        db, "AAB-2538", EXIT_TIME, vehicle(), "exit.jpg"
+    )
+
+    assert out.kind == ems.AMBIGUOUS
+    assert out.session is None
+
+
+@pytest.mark.asyncio
+async def test_appearance_never_second_guesses_a_trusted_plate(db, monkeypatch):
+    """ENTRY_LOST is terminal — VA must not even be asked."""
+    open_session(db, "KXR-2538")
+
+    async def explode(image_path, plates):  # pragma: no cover
+        raise AssertionError("VA must not be consulted for a trusted plate")
+
+    monkeypatch.setattr("app.utils.va_reid_client.compare", explode)
+
+    out = await ems.resolve_with_appearance(
+        db, "AAB-2538", EXIT_TIME, vehicle(registered=True), "exit.jpg"
+    )
+
+    assert out.kind == ems.ENTRY_LOST
+
+
+@pytest.mark.asyncio
+async def test_a_decided_plate_rule_is_not_re_opened(db, monkeypatch):
+    """A unique digit match is already decisive; VA is not consulted."""
+    open_session(db, "KXR-2538")
+
+    async def explode(image_path, plates):  # pragma: no cover
+        raise AssertionError("VA must not be consulted once a plate rule fired")
+
+    monkeypatch.setattr("app.utils.va_reid_client.compare", explode)
+
+    out = await ems.resolve_with_appearance(
+        db, "AAB-2538", EXIT_TIME, vehicle(), "exit.jpg"
+    )
+
+    assert out.matched
+    assert out.session.plate_number == "KXR-2538"

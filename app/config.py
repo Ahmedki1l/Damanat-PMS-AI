@@ -517,6 +517,37 @@ class Settings(BaseSettings):
     USE_EXIT_CONFIRM_WINDOW: bool = True
     USE_CAM03_ENTRY_CONFIRMATION: bool = True
 
+    # ── Unmatched-exit resolution (UC2) ──────────────────────────────────
+    # An exit whose plate matches no open session is usually one of two things:
+    # a car whose ENTRY was lost (plate is right), or a car whose entry plate was
+    # misread (plate is wrong). exit_match_service separates them; these bound
+    # what it may consider.
+    EXIT_MATCH_ENABLED: bool = True
+    # A digit group shorter than this is too weak to nominate a match on — plenty
+    # of real plates share one or two digits.
+    EXIT_MATCH_MIN_DIGITS: int = 3
+    # How many ranked candidates to keep for logging / appearance scoring. Only
+    # ever a shortlist: the deterministic rules below decide on uniqueness, not
+    # on rank.
+    EXIT_MATCH_SHORTLIST: int = 5
+    # Never match an exit against a session older than this. A long-abandoned
+    # phantom must not be revived by an unrelated car days later.
+    EXIT_MATCH_MAX_AGE_HOURS: float = 72.0
+    # Appearance scoring (VA /api/reid/compare) for exits the plate rules cannot
+    # settle — the "both letters AND digits misread" case, where no string logic
+    # can help. VA scores, PMS-AI decides.
+    EXIT_MATCH_REID_ENABLED: bool = True
+    EXIT_MATCH_REID_TIMEOUT_SECONDS: float = 5.0
+    # Gap between the best and second-best candidate. A margin, not a threshold:
+    # absolute similarity drifts with light and viewpoint, while the gap to the
+    # runner-up is what actually carries the decision. 0.35 is the 100%-precision
+    # floor measured on the 50-identity gallery (see slot_recovery_solo_min_margin
+    # in VA). It is a starting point for a DIFFERENT geometry — entry camera vs
+    # exit camera — and should be re-measured against exits that matched on plate.
+    EXIT_MATCH_REID_MIN_MARGIN: float = 0.35
+    # Absolute floor. Without it a margin can be "won" by two equally bad scores.
+    EXIT_MATCH_REID_MIN_SCORE: float = 0.50
+
     # ── ANPR entry burst aggregation (UC1) ───────────────────────────────
     # The entry ANPR camera fires several reads for one car as it approaches
     # (each <picNum> with its own <licensePlate>/<confidenceLevel>). The early
