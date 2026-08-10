@@ -72,7 +72,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 from app.database import SessionLocal  # noqa: E402
 from app.services import hikcentral, parking_session_service  # noqa: E402
-from app.services.hikcentral import client  # noqa: E402
+from app.services.hikcentral import client, validation  # noqa: E402
 from app.services.hikcentral.models import from_facility_naive  # noqa: E402
 from app.services.entry_exit_service import _reconcile_missed_exits  # noqa: E402
 from app.config import settings  # noqa: E402
@@ -89,6 +89,64 @@ def _parse_when(raw: str) -> datetime:
     )
 
 
+async def _diagnose(db, begin, end) -> int:
+    """Read-only. Why did the sweep find nothing?
+
+    "No unconsumed exit records" collapses three very different causes into one
+    message, so this pulls the raw platform response apart and shows which one
+    it is:
+
+      * the platform returned nothing for this camera/window  -> wrong
+        indexCode, or a timezone mismatch on the query bounds
+      * records came back but carry no usable plate           -> normalisation
+      * records came back and every GUID is already consumed  -> the passes were
+        recorded; the sessions were left open for some OTHER reason, and closing
+        them is not this script's job
+    """
+    from app.models.hik_validation import HikValidation
+
+    for label, resource_ids in (
+        ("EXIT ", settings.hik_exit_resource_ids()),
+        ("ENTRY", settings.hik_entry_resource_ids()),
+    ):
+        raw = await client.query_vehicle_logs(
+            from_facility_naive(begin), from_facility_naive(end),
+            resource_ids, settings.HIK_RECONCILE_PAGE_SIZE,
+        )
+        plateless = [r for r in raw if not r.canonical_plate]
+        consumed = [r for r in raw if r.canonical_plate
+                    and validation.guid_already_used(db, r.guid)]
+        fresh = [r for r in raw if r.canonical_plate
+                 and not validation.guid_already_used(db, r.guid)]
+        print(f"\n{label} camera (resource_ids={resource_ids or '(unset)'})")
+        print(f"  platform returned : {len(raw)}")
+        print(f"  no usable plate   : {len(plateless)}")
+        print(f"  GUID consumed     : {len(consumed)}")
+        print(f"  actionable        : {len(fresh)}")
+        for r in sorted(raw, key=lambda r: hikcentral.polled_outcome(r).pass_time_local)[:6]:
+            state = ("plateless" if not r.canonical_plate
+                     else "consumed" if validation.guid_already_used(db, r.guid)
+                     else "ACTIONABLE")
+            print(f"    {hikcentral.polled_outcome(r).pass_time_local}  "
+                  f"{r.canonical_plate or '-':<12} {state}")
+
+    total = db.query(HikValidation).filter(
+        HikValidation.direction == hikcentral.DIRECTION_EXIT,
+        HikValidation.pass_time >= begin,
+        HikValidation.pass_time <= end,
+    ).count()
+    print(f"\nhik_validations rows already stored for exits in this window: {total}")
+    print("\nReading this:")
+    print("  EXIT returned 0 but ENTRY returned rows -> HIK_EXIT_RESOURCE_IDS is "
+          "wrong (the export calls the camera 'ANPR-2 Exit'; confirm its OpenAPI "
+          "indexCode).")
+    print("  BOTH returned 0 -> the query bounds miss the data: check the "
+          "timezone the platform stores pass times in.")
+    print("  Rows returned but all consumed -> the passes WERE recorded; the "
+          "sessions stayed open for another reason. Send me this output.")
+    return 0
+
+
 async def _run(args) -> int:
     begin, end = args.begin, args.end
     mode = "authoritative" if hikcentral.is_authoritative() else (
@@ -97,7 +155,12 @@ async def _run(args) -> int:
     print(f"HikCentral: {settings.HIK_BASE_URL}  mode={mode}")
     print(f"Window    : {begin} -> {end}  (facility-local)")
     print(f"Exit cam  : resource_ids={settings.hik_exit_resource_ids() or '(unset)'}")
-    if mode != "authoritative":
+    if mode == "OFF":
+        print("\nABORT: the HikCentral layer is OFF here, so no query can be "
+              "issued. Run this inside the production pod.")
+        return 2
+    if mode != "authoritative" and not args.diagnose:
+        # --diagnose only reads, so shadow mode is fine for it.
         print("\nABORT: the HikCentral layer is not authoritative here, so the sweep "
               "cannot close anything. Run this inside the production pod.")
         return 2
@@ -107,6 +170,8 @@ async def _run(args) -> int:
 
     db = SessionLocal()
     try:
+        if args.diagnose:
+            return await _diagnose(db, begin, end)
         records = await hikcentral.list_unconsumed_records(
             settings.hik_exit_resource_ids(), begin, end, db
         )
@@ -207,6 +272,9 @@ def main() -> int:
                          "the window")
     ap.add_argument("--apply", action="store_true",
                     help="actually mutate (default: report only)")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="read-only: show the raw platform response and why "
+                         "records were filtered out. Changes nothing.")
     args = ap.parse_args()
     if args.end <= args.begin:
         ap.error("--to must be after --from")
