@@ -816,6 +816,24 @@ class Settings(BaseSettings):
     # Max records pulled per camera per poll (crossRecords pageSize, ≤ 500).
     HIK_RECONCILE_PAGE_SIZE: int = Field(default=100, gt=0, le=500)
 
+    # ── Restart catch-up ──────────────────────────────────────────────────
+    # The rolling sweep above is near-sighted by design (it runs on every gate
+    # event), so it cannot heal downtime: a 4h outage on 2026-08-09 stranded 25
+    # exits that a 15-minute window could never reach. On startup, sweep from
+    # the last HikCentral pass actually consumed (hik_validations.pass_time)
+    # through to now instead of a fixed lookback.
+    HIK_CATCHUP_ON_STARTUP: bool = True
+    # Upper bound on how far back a catch-up will reach, so a DB restored from
+    # an old backup cannot trigger a week-long sweep. Older gaps are a
+    # deliberate operator decision: scripts/setup/backfill_missed_exits.py.
+    HIK_CATCHUP_MAX_HOURS: float = Field(default=24.0, gt=0, le=168.0)
+    # The gap is walked in chunks because query_vehicle_logs does NOT paginate
+    # (pageNo=1, newest-first): a window holding more than
+    # HIK_RECONCILE_PAGE_SIZE records silently drops the OLDEST ones, which are
+    # exactly what a catch-up is looking for. Keep chunk * peak-arrival-rate
+    # comfortably under the page size.
+    HIK_CATCHUP_CHUNK_MINUTES: float = Field(default=30.0, gt=0, le=1440.0)
+
     # ── VA slot recovery ──────────────────────────────────────────────────
     # Opens a session for a car Video Analytics finds parked with no record of it
     # entering — the entry was missed entirely (no ANPR, no HikCentral, no ramp

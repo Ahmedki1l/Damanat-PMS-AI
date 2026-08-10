@@ -37,6 +37,7 @@ from sqlalchemy.orm import Session
 
 from app.services.entry_state_lock import acquire_plate_transaction_lock
 from app.models.entry_exit_log import EntryExitLog
+from app.models.hik_validation import HikValidation
 from app.services import exit_match_service
 from app.services import parking_session_service
 from app.services import vehicle_service
@@ -594,16 +595,61 @@ def note_gate_event(camera_id: str) -> None:
         pass
 
 
+_sweep_in_flight: set[str] = set()
+
+
 async def _run_reconcile(direction: str) -> None:
-    """Background sweep with its own DB session. Never raises."""
+    """Background sweep with its own DB session. Never raises.
+
+    Walks from the last HikCentral pass we actually consumed up to now, so every
+    gate event heals whatever fell in the gap since the previous one. After a
+    normal quiet period that span is minutes; after an outage it is however long
+    the outage was, and the sweep closes all of it.
+    """
     from app.database import SessionLocal
+
+    # A long catch-up can outlive the 30s debounce. Two sweeps of the same
+    # direction would re-query the same span and race each other on the same
+    # records; GUID uniqueness keeps that correct but it is wasted platform
+    # load, so the second one simply yields to the one already running.
+    if direction in _sweep_in_flight:
+        logger.info("[Hik][reconcile] %s sweep already running — skipping", direction)
+        return
+    _sweep_in_flight.add(direction)
 
     db = SessionLocal()
     try:
-        if direction == hikcentral.DIRECTION_ENTRY:
-            await _reconcile_missed_entries(db)
-        else:
-            await _reconcile_missed_exits(db)
+        sweep = (
+            _reconcile_missed_entries
+            if direction == hikcentral.DIRECTION_ENTRY
+            else _reconcile_missed_exits
+        )
+        begin, end = _reconcile_window(db, direction)
+        if begin >= end:
+            return
+        # query_vehicle_logs does NOT paginate (pageNo=1, newest-first), so a
+        # window holding more than HIK_RECONCILE_PAGE_SIZE records silently
+        # drops the OLDEST — exactly what a catch-up is hunting for. Walk it.
+        chunk = timedelta(minutes=settings.HIK_CATCHUP_CHUNK_MINUTES)
+        if end - begin > chunk:
+            logger.warning(
+                "[Hik][reconcile] %s: %s gap since the last consumed pass (%s) "
+                "— sweeping it in %s chunks",
+                direction, end - begin, begin, chunk,
+            )
+        cursor = begin
+        while cursor < end:
+            upper = min(cursor + chunk, end)
+            try:
+                await sweep(db, window=(cursor, upper))
+            except Exception as exc:
+                # One bad chunk must not abandon the rest of the gap.
+                logger.warning(
+                    "[Hik][reconcile] %s chunk %s..%s failed: %r",
+                    direction, cursor, upper, exc,
+                )
+                db.rollback()
+            cursor = upper
     except Exception as exc:  # a sweep must never escape into the event loop
         logger.warning("[Hik][reconcile] %s sweep failed: %r", direction, exc)
         try:
@@ -611,16 +657,77 @@ async def _run_reconcile(direction: str) -> None:
         except Exception:
             pass
     finally:
+        _sweep_in_flight.discard(direction)
         db.close()
 
 
-def _reconcile_window() -> tuple[datetime, datetime]:
-    """[lookback, grace] window in naive facility-local time."""
-    now = facility_now_naive()
-    return (
-        now - timedelta(seconds=settings.HIK_RECONCILE_LOOKBACK_SECONDS),
-        now - timedelta(seconds=settings.HIK_RECONCILE_GRACE_SECONDS),
+async def startup_catchup() -> None:
+    """Run both sweeps once at boot, without waiting for a car to show up.
+
+    The watermark window in `_reconcile_window` already recovers an outage on
+    the first gate event after a restart — but only when one arrives. A service
+    that comes back at 02:00 would otherwise sit on the gap until the morning
+    rush, reporting overstays the whole time. Never raises: a HikCentral that is
+    unreachable at boot must not stop the service from starting.
+    """
+    if not settings.HIK_CATCHUP_ON_STARTUP or not hikcentral.is_enabled():
+        return
+    for direction in (hikcentral.DIRECTION_EXIT, hikcentral.DIRECTION_ENTRY):
+        await _run_reconcile(direction)
+
+
+def _catchup_watermark(db: Session, direction: str) -> Optional[datetime]:
+    """The newest HikCentral pass this deployment has already consumed.
+
+    `hik_validations.pass_time` is the only durable record of how far the gate
+    pipeline actually got, and the GUID uniqueness that backs it is what makes
+    re-sweeping the same span harmless. Returns None when the table holds
+    nothing for this direction — a fresh DB has no gap to close.
+    """
+    row = (
+        db.query(HikValidation.pass_time)
+        .filter(
+            HikValidation.direction == direction,
+            HikValidation.pass_time.isnot(None),
+        )
+        .order_by(HikValidation.pass_time.desc())
+        .first()
     )
+    return row[0] if row else None
+
+
+def _reconcile_window(db: Session, direction: str) -> tuple[datetime, datetime]:
+    """[begin, grace] window in naive facility-local time, anchored on the
+    last HikCentral pass this deployment actually consumed.
+
+    A fixed lookback cannot heal downtime. On 2026-08-09 PMS-AI stopped
+    ingesting for ~4h; 25 exits landed in that hole, and when it came back the
+    15-minute window could only see the last few minutes of it. Every one of
+    those sessions stayed open and surfaced as a 24h+ overstay for cars that had
+    driven home hours earlier.
+
+    Anchoring on the watermark makes each sweep self-healing: it resumes exactly
+    where the previous one stopped, so a gap of any length is picked up by the
+    next gate event. HIK_RECONCILE_LOOKBACK_SECONDS remains the FLOOR (never ask
+    for less than that, so a fresh or stale watermark still gets normal cover)
+    and HIK_CATCHUP_MAX_HOURS the ceiling, so a DB restored from an old backup
+    cannot trigger a week-long sweep.
+    """
+    now = facility_now_naive()
+    end = now - timedelta(seconds=settings.HIK_RECONCILE_GRACE_SECONDS)
+    default_begin = now - timedelta(seconds=settings.HIK_RECONCILE_LOOKBACK_SECONDS)
+    mark = _catchup_watermark(db, direction)
+    if mark is None:
+        return (default_begin, end)
+    floor = now - timedelta(hours=settings.HIK_CATCHUP_MAX_HOURS)
+    if mark < floor:
+        logger.warning(
+            "[Hik][reconcile] %s: last consumed pass %s predates the %sh cap — "
+            "sweeping back only to %s. Older gaps need "
+            "scripts/setup/backfill_missed_exits.py.",
+            direction, mark, settings.HIK_CATCHUP_MAX_HOURS, floor,
+        )
+    return (min(default_begin, max(mark, floor)), end)
 
 
 def _gate_event_already_logged(
@@ -653,13 +760,20 @@ def _gate_event_already_logged(
     return any(same_vehicle_plate(plate, row[0]) for row in logged_plates)
 
 
-async def _reconcile_missed_entries(db: Session) -> None:
-    begin, end = _reconcile_window()
+async def _reconcile_missed_entries(
+    db: Session, window: Optional[tuple[datetime, datetime]] = None
+) -> None:
+    begin, end = window or _reconcile_window(db, hikcentral.DIRECTION_ENTRY)
     records = await hikcentral.list_unconsumed_records(
         settings.hik_entry_resource_ids(), begin, end, db
     )
     match_s = timedelta(seconds=settings.HIK_RECONCILE_MATCH_SECONDS)
-    for rec in records:
+    # Oldest-first. HikCentral returns newest-first (orderType=1) and each
+    # processed record consumes its GUID, which is what the watermark reads. If
+    # a record mid-way through raises, consuming the NEWEST first would leave
+    # the watermark ahead of older unprocessed records in the same chunk — no
+    # later sweep looks behind the watermark, so they would be lost silently.
+    for rec in sorted(records, key=lambda r: hikcentral.polled_outcome(r).pass_time_local):
         outcome = hikcentral.polled_outcome(rec)
         pass_local = outcome.pass_time_local
         if _gate_event_already_logged(db, rec.canonical_plate, "entry", pass_local, match_s):
@@ -686,13 +800,27 @@ async def _reconcile_missed_entries(db: Session) -> None:
         )
 
 
-async def _reconcile_missed_exits(db: Session) -> None:
-    begin, end = _reconcile_window()
+async def _reconcile_missed_exits(
+    db: Session, window: Optional[tuple[datetime, datetime]] = None
+) -> None:
+    """Close sessions for HikCentral exits the edge pipeline never saw.
+
+    `window` overrides the rolling [lookback, grace] window. The live sweep
+    always passes None; only the one-off backfill after an ingest outage names
+    an explicit range, because HIK_RECONCILE_LOOKBACK_SECONDS is deliberately
+    short and can never reach back across hours of downtime.
+    """
+    begin, end = window or _reconcile_window(db, hikcentral.DIRECTION_EXIT)
     records = await hikcentral.list_unconsumed_records(
         settings.hik_exit_resource_ids(), begin, end, db
     )
     match_s = timedelta(seconds=settings.HIK_RECONCILE_MATCH_SECONDS)
-    for rec in records:
+    # Oldest-first. HikCentral returns newest-first (orderType=1) and each
+    # processed record consumes its GUID, which is what the watermark reads. If
+    # a record mid-way through raises, consuming the NEWEST first would leave
+    # the watermark ahead of older unprocessed records in the same chunk — no
+    # later sweep looks behind the watermark, so they would be lost silently.
+    for rec in sorted(records, key=lambda r: hikcentral.polled_outcome(r).pass_time_local):
         outcome = hikcentral.polled_outcome(rec)
         pass_local = outcome.pass_time_local
         if _gate_event_already_logged(db, rec.canonical_plate, "exit", pass_local, match_s):

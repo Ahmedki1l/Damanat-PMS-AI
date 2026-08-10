@@ -176,6 +176,19 @@ async def startup():
     app.state.pms_forward_drainer = asyncio.create_task(_pms_forward_drainer_loop())
     logger.info("📤 PMS/VA forward-spool drainer task started")
 
+    # Heal whatever the gate pipeline missed while this service was down. The
+    # event-driven reconcile only looks back 15 minutes, so without this a
+    # restart after any real outage leaves those sessions open forever and the
+    # dashboard reports the cars as overstays. Background and non-blocking: a
+    # HikCentral that is unreachable at boot must not delay startup.
+    if settings.HIK_CATCHUP_ON_STARTUP:
+        from app.services.entry_exit_service import startup_catchup
+
+        app.state.hik_catchup = asyncio.create_task(startup_catchup())
+        logger.info("🔁 HikCentral restart catch-up task started")
+    else:
+        app.state.hik_catchup = None
+
 
 async def _pms_forward_drainer_loop():
     """Periodically re-POST any spooled ANPR forwards to the VA backend so an
