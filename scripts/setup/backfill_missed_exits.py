@@ -89,6 +89,55 @@ def _parse_when(raw: str) -> datetime:
     )
 
 
+async def _list_cameras() -> int:
+    """Read-only. Print every camera this OpenAPI partner can actually see.
+
+    A wrong `cameraIndexCode` and a camera that exists but was never authorised
+    to the partner both return an empty list with HTTP 200 and code=0 — there is
+    no error to catch. Listing the resources tells them apart: if 'ANPR-2 Exit'
+    is absent entirely, the fix is authorising it in HikCentral, not editing
+    HIK_EXIT_RESOURCE_IDS.
+    """
+    for path, body in (
+        ("/artemis/api/resource/v1/cameras", {"pageNo": 1, "pageSize": 200}),
+        ("/artemis/api/resource/v2/camera/search",
+         {"pageNo": 1, "pageSize": 200, "name": ""}),
+    ):
+        print(f"\n--- {path} ---")
+        response = await client._signed_post(path, body)
+        if response is None:
+            print("  no response (see the warning logged above)")
+            continue
+        try:
+            payload = response.json()
+        except ValueError:
+            print(f"  non-JSON: {response.text[:200]}")
+            continue
+        code = client.response_code(payload)
+        if code != "0":
+            print(f"  refused code={code} msg={payload.get('msg')}")
+            continue
+        rows = ((payload.get("data") or {}).get("list")) or []
+        print(f"  {len(rows)} camera(s) visible to appKey={settings.HIK_APP_KEY}\n")
+        print(f"  {'indexCode':<38} name")
+        for cam in rows:
+            index_code = cam.get("cameraIndexCode") or cam.get("indexCode") or "?"
+            name = cam.get("cameraName") or cam.get("name") or "?"
+            flag = ""
+            if index_code == settings.hik_exit_resource_ids():
+                flag = "   <-- currently HIK_EXIT_RESOURCE_IDS"
+            elif index_code == settings.hik_entry_resource_ids():
+                flag = "   <-- currently HIK_ENTRY_RESOURCE_IDS"
+            print(f"  {str(index_code):<38} {name}{flag}")
+        if rows:
+            print("\n  Find the row named like 'ANPR-2 Exit' and put ITS indexCode "
+                  "in HIK_EXIT_RESOURCE_IDS (deployed config, not repo .env).")
+            print("  If no exit camera is listed at all, it is not authorised to "
+                  "this OpenAPI partner — fix that in HikCentral first.")
+            return 0
+    return 0
+
+
 async def _diagnose(db, begin, end) -> int:
     """Read-only. Why did the sweep find nothing?
 
@@ -148,6 +197,11 @@ async def _diagnose(db, begin, end) -> int:
 
 
 async def _run(args) -> int:
+    if args.list_cameras:
+        if not hikcentral.is_enabled():
+            print("ABORT: the HikCentral layer is OFF here. Run inside the pod.")
+            return 2
+        return await _list_cameras()
     begin, end = args.begin, args.end
     mode = "authoritative" if hikcentral.is_authoritative() else (
         "shadow" if hikcentral.is_enabled() else "OFF"
@@ -259,9 +313,9 @@ async def _run(args) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--from", dest="begin", required=True, type=_parse_when,
+    ap.add_argument("--from", dest="begin", type=_parse_when,
                     metavar="'YYYY-MM-DD HH:MM'", help="window start, facility-local")
-    ap.add_argument("--to", dest="end", required=True, type=_parse_when,
+    ap.add_argument("--to", dest="end", type=_parse_when,
                     metavar="'YYYY-MM-DD HH:MM'", help="window end, facility-local")
     ap.add_argument("--reopen-until", type=_parse_when, default=None,
                     metavar="'YYYY-MM-DD HH:MM'",
@@ -272,11 +326,16 @@ def main() -> int:
                          "the window")
     ap.add_argument("--apply", action="store_true",
                     help="actually mutate (default: report only)")
+    ap.add_argument("--list-cameras", dest="list_cameras", action="store_true",
+                    help="read-only: print every camera this OpenAPI partner "
+                         "can see, with its indexCode. Changes nothing.")
     ap.add_argument("--diagnose", action="store_true",
                     help="read-only: show the raw platform response and why "
                          "records were filtered out. Changes nothing.")
     args = ap.parse_args()
-    if args.end <= args.begin:
+    if not args.list_cameras and (args.begin is None or args.end is None):
+        ap.error("--from and --to are required (except with --list-cameras)")
+    if not args.list_cameras and args.end <= args.begin:
         ap.error("--to must be after --from")
     if args.reopen_until is None:
         from app.config import facility_now_naive

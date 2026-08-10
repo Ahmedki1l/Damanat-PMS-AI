@@ -733,8 +733,16 @@ class Settings(BaseSettings):
     # Entry, discovered via /artemis/api/resource/v1/cameras). One code per
     # lookup.
     HIK_ENTRY_RESOURCE_IDS: str = ""
-    # OpenAPI camera indexCode for the exit LPR camera ("453" = ANPR-2 Exit).
+    # OpenAPI camera indexCode for the exit LPR camera ("510" = ANPR-2 Exit,
+    # confirmed against /artemis/api/resource/v1/cameras on 2026-08-10).
     # Only used by the reconciliation poller to close sessions for missed exits.
+    #
+    # This was "453" — an indexCode that exists on NO camera. crossRecords
+    # answers an unknown cameraIndexCode with HTTP 200, code=0 and an empty
+    # list, exactly like a camera that genuinely had no passes, so the exit
+    # reconciler swept and found nothing every time without ever erroring. It
+    # had never closed a single missed exit. Verify any change to this value
+    # with `backfill_missed_exits.py --list-cameras`, never by eye.
     HIK_EXIT_RESOURCE_IDS: str = ""
     # Lookup window around the anchor event (the ANPR read for a validation,
     # the ramp crossing for a recovery). Deliberately tiny: HikCentral is asked
