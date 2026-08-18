@@ -283,11 +283,17 @@ def _slot_rows(db: Session, slot_ids: Sequence[str]) -> dict:
 def _slot_history(
     db: Session, slot_ids: Sequence[str], exit_time: datetime, window: timedelta
 ) -> dict:
-    """Transitions for each slot in [exit_time - window, exit_time], newest first.
+    """Transitions for each slot around this exit, newest first.
 
-    Bounded by the window rather than fetched wholesale: `slot_status` is an
-    append-only history and the only part of it that can speak about THIS exit is
-    the part around it.
+    The window is [exit_time - window, exit_time + vacancy_lag] and the tail is
+    NOT symmetry for its own sake: VA confirms a vacancy only after 5 frames at
+    roughly 0.1 fps, so its timestamp trails the car by a measured 3.1-41.4s and
+    a slot near the gate can be stamped empty after the car is already through
+    the barrier.
+
+    Bounded rather than fetched wholesale: `slot_status` is an append-only
+    history and the only part of it that can speak about THIS exit is the part
+    around it.
     """
     if not slot_ids:
         return {}
@@ -295,7 +301,12 @@ def _slot_history(
     binds = {f"s{i}": sid for i, sid in enumerate(ids)}
     placeholders = ", ".join(f":{k}" for k in binds)
     binds["lo"] = exit_time - window
-    binds["hi"] = exit_time
+    # Deliberately asymmetric. VA stamps a vacancy only after 5 confirming
+    # frames at ~0.1 fps, so the timestamp lags the physical departure by a
+    # measured 3.1-41.4s and can land AFTER the exit it belongs to.
+    binds["hi"] = exit_time + timedelta(
+        seconds=settings.EXIT_SLOT_VACANCY_LAG_SECONDS
+    )
     rows = db.execute(
         text(
             "SELECT slot_id, plate_number, status, time FROM slot_status "

@@ -546,7 +546,24 @@ class Settings(BaseSettings):
     # confirmations; too large lets a car that left the slot for an unrelated
     # reason confirm somebody else's exit.
     EXIT_DRIVE_OUT_SECONDS: float = Field(
-        default=300.0, gt=0, le=3600.0, allow_inf_nan=False,
+        default=120.0, gt=0, le=3600.0, allow_inf_nan=False,
+    )
+    # VA does not stamp a vacancy at the moment the car leaves. `state_machine`
+    # requires 5 confirming frames, and VA runs at roughly 0.1 fps per camera, so
+    # the recorded timestamp LAGS the physical departure. Measured over the
+    # 15 VACANT confirmations in va-logs.txt: 3.1s min, 15.6s median, 41.4s max
+    # (B9, 5 frames at 8.3s each).
+    #
+    # That lag can push a vacancy PAST the exit it belongs to — a car parked near
+    # the gate can be through the barrier before VA has finished agreeing its
+    # slot is empty. Without this lookahead the confirmation is dropped for
+    # exactly the fastest exits, which is the wrong half to lose.
+    #
+    # 45s, just above the measured maximum. It is not a second drive-out window:
+    # widening it lets a vacancy that happened AFTER this car left be read as
+    # this car's departure.
+    EXIT_SLOT_VACANCY_LAG_SECONDS: float = Field(
+        default=45.0, ge=0, le=300.0, allow_inf_nan=False,
     )
     # Slot evidence reads VA's tables. Off = the tier is skipped entirely and
     # Re-ID sees every candidate, which is the pre-Stage-4 behaviour. Present so

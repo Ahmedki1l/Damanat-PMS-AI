@@ -156,6 +156,39 @@ async def test_a_unique_vacancy_confirms_without_reid(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_vacancy_stamped_after_the_exit_still_confirms(db):
+    """VA stamps a vacancy only after 5 confirming frames at roughly 0.1 fps, so
+    the timestamp trails the physical departure by a measured 3.1-41.4s
+    (va-logs.txt, 15 confirmations, median 15.6s).
+
+    A car parked near the gate is therefore through the barrier BEFORE its slot
+    is agreed empty. A window ending at exit_time would drop the confirmation for
+    exactly the fastest exits — the wrong half to lose.
+    """
+    stay = _stay(db, "QUICK-1", slot_id="B7")
+    _slot(db, "B7", occupied=False)
+    _transition(db, "B7", "available", EXIT + timedelta(seconds=30))
+
+    out = await ems.resolve_with_appearance(db, "EXIT-1", EXIT, None, None)
+
+    assert out.matched
+    assert out.session.id == stay.id
+
+
+@pytest.mark.asyncio
+async def test_a_vacancy_long_after_the_exit_is_a_different_departure(db):
+    """The tail is a detection allowance, not a second drive-out window. A slot
+    that emptied five minutes after this car left belongs to another car."""
+    _stay(db, "LATER-1", slot_id="B7")
+    _slot(db, "B7", occupied=False)
+    _transition(db, "B7", "available", EXIT + timedelta(minutes=5))
+
+    verdicts, _ = _verdicts(db)
+
+    assert verdicts["LATER-1"].kind == ems.UNKNOWN
+
+
+@pytest.mark.asyncio
 async def test_a_vacancy_outside_the_window_confirms_nothing(db):
     """`EXIT_DRIVE_OUT_SECONDS` is how long a car may take to reach the gate.
     A slot that emptied an hour ago is a different departure."""
