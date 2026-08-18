@@ -529,7 +529,29 @@ class Settings(BaseSettings):
     # How many ranked candidates to keep for logging / appearance scoring. Only
     # ever a shortlist: the deterministic rules below decide on uniqueness, not
     # on rank.
-    EXIT_MATCH_SHORTLIST: int = 5
+    # Raised 5 -> 20 in Stage 4. The shortlist is ordered by edit distance, so a
+    # cap of 5 truncated exactly the case Re-ID exists for: a plate misread in
+    # BOTH its letters and its digits sorts to the bottom by distance and fell
+    # off the list before appearance ever saw it. 20 is VA's own ceiling
+    # (`api.py` scores `payload.plates[:20]`), so this is now the binding limit
+    # nowhere — the slot filter is what narrows the pool.
+    EXIT_MATCH_SHORTLIST: int = 20
+    # How long a car may take to get from its slot to the exit gate. A slot that
+    # went vacant inside [exit_time - this, exit_time] is evidence the car in it
+    # is the car now leaving.
+    #
+    # STARTS AT 300s AND IS NOT YET MEASURED. Re-measure against closed sessions
+    # (slot_left_at -> exit_time on stays that resolved by exact plate) before
+    # this is trusted to confirm a close on its own. Too small silently loses
+    # confirmations; too large lets a car that left the slot for an unrelated
+    # reason confirm somebody else's exit.
+    EXIT_DRIVE_OUT_SECONDS: float = Field(
+        default=300.0, gt=0, le=3600.0, allow_inf_nan=False,
+    )
+    # Slot evidence reads VA's tables. Off = the tier is skipped entirely and
+    # Re-ID sees every candidate, which is the pre-Stage-4 behaviour. Present so
+    # a bad EXIT_DRIVE_OUT_SECONDS can be disarmed without a redeploy.
+    EXIT_SLOT_EVIDENCE_ENABLED: bool = True
     # Never match an exit against a session older than this. A long-abandoned
     # phantom must not be revived by an unrelated car days later.
     # RETIRED 2026-08-18. Bounded the matcher's candidate pool to 72h while

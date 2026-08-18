@@ -55,6 +55,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Optional, Sequence
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -98,6 +99,9 @@ class ExitResolution:
     reason: str
     session: Optional[ParkingSession] = None
     candidates: Sequence[Candidate] = field(default_factory=tuple)
+    # What the slots said about each candidate, carried so the Log X line can
+    # print WHY each was or was not chosen without re-querying VA's tables.
+    slot_verdicts: dict = field(default_factory=dict)
 
     @property
     def matched(self) -> bool:
@@ -240,6 +244,162 @@ def resolve_unmatched_exit(
     )
 
 
+# ── Slot evidence: what VA physically watched ───────────────────────────────
+# Raw SQL because `parking_slots` and `slot_status` are VA-OWNED. PMS-AI has no
+# model for them and should not grow one to read four columns — the same reason
+# `slot_recovery_service._live_slot_state` reaches for `text()`.
+
+ELIMINATED = "eliminated"   # this car is still in its slot; it did not leave
+CONFIRMED = "confirmed"     # its slot emptied inside the drive-out window
+UNKNOWN = "unknown"         # no signal — NEVER read as evidence against
+
+
+@dataclass(frozen=True)
+class SlotVerdict:
+    """What the slot says about one candidate, and why."""
+
+    kind: str
+    reason: str
+    left_at: Optional[datetime] = None
+
+
+def _slot_rows(db: Session, slot_ids: Sequence[str]) -> dict:
+    """Live state for each slot: (occupied, current_plate)."""
+    if not slot_ids:
+        return {}
+    ids = list(dict.fromkeys(slot_ids))
+    binds = {f"s{i}": sid for i, sid in enumerate(ids)}
+    placeholders = ", ".join(f":{k}" for k in binds)
+    rows = db.execute(
+        text(
+            "SELECT slot_id, is_available, current_plate FROM parking_slots "
+            f"WHERE slot_id IN ({placeholders})"
+        ),
+        binds,
+    ).all()
+    return {r[0]: (not bool(r[1]), (r[2] or "").strip()) for r in rows}
+
+
+def _slot_history(
+    db: Session, slot_ids: Sequence[str], exit_time: datetime, window: timedelta
+) -> dict:
+    """Transitions for each slot in [exit_time - window, exit_time], newest first.
+
+    Bounded by the window rather than fetched wholesale: `slot_status` is an
+    append-only history and the only part of it that can speak about THIS exit is
+    the part around it.
+    """
+    if not slot_ids:
+        return {}
+    ids = list(dict.fromkeys(slot_ids))
+    binds = {f"s{i}": sid for i, sid in enumerate(ids)}
+    placeholders = ", ".join(f":{k}" for k in binds)
+    binds["lo"] = exit_time - window
+    binds["hi"] = exit_time
+    rows = db.execute(
+        text(
+            "SELECT slot_id, plate_number, status, time FROM slot_status "
+            f"WHERE slot_id IN ({placeholders}) "
+            "AND time >= :lo AND time <= :hi ORDER BY time DESC"
+        ),
+        binds,
+    ).all()
+    out: dict = {}
+    for slot_id, plate, status, when in rows:
+        out.setdefault(slot_id, []).append(
+            (plate or "", (status or "").strip().lower(), when)
+        )
+    return out
+
+
+def slot_evidence(
+    db: Session, candidates: Sequence, exit_time: datetime
+) -> dict:
+    """A verdict per candidate plate, from what VA watched in the slots.
+
+    Four rules, and the asymmetry between them is the whole design:
+
+      * the slot STILL shows this plate parked -> ELIMINATED. The car is inside;
+        it is not the one at the gate.
+      * the slot emptied inside the drive-out window -> CONFIRMED. Something left
+        that slot just now, and this exit is the only departure to attach it to.
+      * the slot now holds a DIFFERENT plate -> the candidate left by the
+        reassignment at the latest. That is an upper bound, not a verdict: a car
+        can move between slots, so this neither confirms nor eliminates. It is
+        recorded so the Log X line carries it.
+      * no slot, no row, no history -> UNKNOWN, and UNKNOWN is never read as
+        evidence against a candidate. 15 of 35 slots run VA_IDENTITY_DISABLED on
+        B2 and produce no plate signal at all; treating their silence as
+        elimination would quietly make every B2 car unmatchable.
+
+    Never raises. VA's tables are another service's, and an exit must not fail
+    because a join did.
+    """
+    verdicts = {c.plate: SlotVerdict(UNKNOWN, "no slot on this stay")
+                for c in candidates}
+    if not settings.EXIT_SLOT_EVIDENCE_ENABLED:
+        return {p: SlotVerdict(UNKNOWN, "slot evidence disabled") for p in verdicts}
+
+    by_slot = {
+        c.plate: getattr(c.session, "slot_id", None)
+        for c in candidates
+        if getattr(c.session, "slot_id", None)
+    }
+    if not by_slot:
+        return verdicts
+
+    window = timedelta(seconds=settings.EXIT_DRIVE_OUT_SECONDS)
+    try:
+        live = _slot_rows(db, list(by_slot.values()))
+        history = _slot_history(db, list(by_slot.values()), exit_time, window)
+    except Exception as exc:
+        logger.warning("[UC2] slot evidence unavailable: %r", exc)
+        return {p: SlotVerdict(UNKNOWN, "slot tables unreadable") for p in verdicts}
+
+    for plate, slot_id in by_slot.items():
+        occupied, current = live.get(slot_id, (None, ""))
+        if occupied is None:
+            verdicts[plate] = SlotVerdict(UNKNOWN, f"slot {slot_id} not found")
+            continue
+
+        if occupied and current and same_vehicle_plate(current, plate):
+            verdicts[plate] = SlotVerdict(
+                ELIMINATED, f"slot {slot_id} still shows {current} parked"
+            )
+            continue
+
+        vacated = next(
+            (
+                when
+                for candidate_plate, status, when in history.get(slot_id, ())
+                if status == "available"
+                or (candidate_plate and not same_vehicle_plate(candidate_plate, plate))
+            ),
+            None,
+        )
+        if vacated is not None:
+            verdicts[plate] = SlotVerdict(
+                CONFIRMED,
+                f"slot {slot_id} emptied at {vacated}, within "
+                f"{settings.EXIT_DRIVE_OUT_SECONDS:.0f}s of this exit",
+                left_at=vacated,
+            )
+            continue
+
+        if occupied and current:
+            verdicts[plate] = SlotVerdict(
+                UNKNOWN,
+                f"slot {slot_id} now holds {current} — this car left by then, "
+                "but a car can change slots, so that is a bound not a verdict",
+            )
+            continue
+
+        verdicts[plate] = SlotVerdict(
+            UNKNOWN, f"slot {slot_id} is vacant, but not within the window"
+        )
+    return verdicts
+
+
 async def resolve_with_appearance(
     db: Session,
     plate: str,
@@ -262,6 +422,55 @@ async def resolve_with_appearance(
     resolution = resolve_unmatched_exit(db, plate, exit_time, vehicle)
     if resolution.kind != AMBIGUOUS or not resolution.candidates:
         return resolution
+
+    # ── Slot evidence first. It is the only tier that can ELIMINATE, and it does
+    # so on something physical: VA watched that car sitting in its slot while
+    # this exit happened. Running it ahead of Re-ID means appearance is never
+    # asked to choose between a car that left and a car that demonstrably did not.
+    verdicts = slot_evidence(db, resolution.candidates, exit_time)
+    survivors = tuple(
+        c for c in resolution.candidates
+        if verdicts[c.plate].kind != ELIMINATED
+    )
+    confirmed = [c for c in resolution.candidates
+                 if verdicts[c.plate].kind == CONFIRMED]
+
+    if len(confirmed) == 1:
+        winner = confirmed[0]
+        return ExitResolution(
+            MATCHED,
+            f"slot evidence: {verdicts[winner.plate].reason}",
+            session=winner.session,
+            candidates=resolution.candidates,
+            slot_verdicts=verdicts,
+        )
+    if len(confirmed) > 1:
+        # Two slots emptied in the same window. One of them belongs to this exit
+        # and nothing here says which, so the tier declines and hands both on.
+        logger.info(
+            "[UC2] %d slots emptied within the drive-out window for %s — "
+            "slot evidence declines: %s",
+            len(confirmed), plate,
+            "; ".join(verdicts[c.plate].reason for c in confirmed),
+        )
+    if not survivors:
+        return ExitResolution(
+            NO_CANDIDATES,
+            "every candidate is still parked in its slot",
+            candidates=resolution.candidates,
+            slot_verdicts=verdicts,
+        )
+    if len(survivors) < len(resolution.candidates):
+        logger.info(
+            "[UC2] slot evidence eliminated %d of %d candidates for %s",
+            len(resolution.candidates) - len(survivors),
+            len(resolution.candidates), plate,
+        )
+    resolution = ExitResolution(
+        resolution.kind, resolution.reason, candidates=survivors,
+        slot_verdicts=verdicts,
+    )
+
     if not settings.EXIT_MATCH_REID_ENABLED or not exit_image_path:
         return resolution
 
@@ -301,6 +510,7 @@ async def resolve_with_appearance(
             f"appearance: {best_plate} score={best_score:.3f} margin={margin:.3f}",
             session=by_plate[best_plate].session,
             candidates=resolution.candidates,
+            slot_verdicts=resolution.slot_verdicts,
         )
 
     logger.info(
@@ -314,17 +524,31 @@ async def resolve_with_appearance(
         AMBIGUOUS,
         f"appearance inconclusive (best {best_score:.3f}, margin {margin:.3f})",
         candidates=resolution.candidates,
+        slot_verdicts=resolution.slot_verdicts,
     )
 
 
-def describe(resolution: ExitResolution) -> str:
-    """One-line candidate summary for the log, so an operator can audit the call."""
+def describe(
+    resolution: ExitResolution, verdicts: Optional[dict] = None
+) -> str:
+    """One-line candidate summary for the log, so an operator can audit the call.
+
+    This IS the Log X record. An exit that resolves to nothing must still leave
+    behind every candidate it considered and why each was not chosen — otherwise
+    "unresolved" is indistinguishable from "never looked", and the string metrics
+    that are no longer allowed to DECIDE are exactly what makes the line
+    readable afterwards.
+    """
     if not resolution.candidates:
         return "candidates=[]"
-    parts = [
-        f"{c.plate}(d={c.distance}"
-        f"{',digits' if c.digits_exact else ''}"
-        f"{',trunc' if c.truncated else ''})"
-        for c in resolution.candidates
-    ]
+    parts = []
+    for c in resolution.candidates:
+        marks = f"d={c.distance}"
+        if c.digits_exact:
+            marks += ",digits"
+        if c.truncated:
+            marks += ",trunc"
+        if verdicts and c.plate in verdicts:
+            marks += f",slot={verdicts[c.plate].kind}"
+        parts.append(f"{c.plate}({marks})")
     return "candidates=[" + " ".join(parts) + "]"

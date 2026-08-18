@@ -220,10 +220,14 @@ async def resolve(
         db, event.plate, event.event_time, vehicle, exit_image_path,
     )
     if not resolution.matched:
+        # LOG X. Nothing is closed and nothing is forced — but the exit must
+        # not vanish: every candidate it considered, its distance metrics and
+        # its slot verdict go into one line, so an operator can audit the
+        # refusal instead of finding an unexplained open stay days later.
         logger.warning(
-            "[UC2] Exit %s unresolved (%s) via %s: %s | %s",
+            "[UC2] Exit X %s unresolved (%s) via %s: %s | %s",
             event.plate, resolution.kind, event.source, resolution.reason,
-            exit_match_service.describe(resolution),
+            exit_match_service.describe(resolution, resolution.slot_verdicts),
         )
         return ExitOutcome(match=resolution)
 
