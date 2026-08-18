@@ -490,3 +490,70 @@ async def test_the_same_fuller_plate_twice_is_not_ambiguous(monkeypatch):
     assert outcome.plate == "KKR-6294"
     assert outcome.guid == "FULL-NEAR"
     assert outcome.reason == "plate_completed"
+
+
+# ── Direction: the exit wrapper ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_exit_validation_asks_the_exit_camera(monkeypatch):
+    """The wrapper's whole job is pointing the same rules at the other camera.
+
+    Worth an explicit assertion on the indexCode: `HIK_EXIT_RESOURCE_IDS` was
+    `453`, which matches no camera, and crossRecords answers an unknown code with
+    HTTP 200 / code=0 / an empty list — indistinguishable from a camera that
+    genuinely saw nothing. Asking the ENTRY camera about an exit would fail the
+    same silent way.
+    """
+    monkeypatch.setattr(settings, "HIK_EXIT_RESOURCE_IDS", "510")
+    calls = []
+    _stub_lookup(monkeypatch, [_record(plate="5625JKA")], calls=calls)
+
+    outcome = await validation.validate_exit_plate(ANPR_PLATE, EVENT_TIME)
+
+    assert [c["resource_ids"] for c in calls] == ["510"]
+    assert outcome.plate == ANPR_PLATE
+    assert outcome.plate_source == PLATE_SOURCE_HIK_CONFIRMED
+
+
+@pytest.mark.asyncio
+async def test_exit_validation_corrects_a_misread_exit_plate(monkeypatch):
+    """A wrong exit plate is not harmless — it is the evidence a session gets
+    rewritten from, so it is corrected before anything downstream sees it."""
+    monkeypatch.setattr(settings, "HIK_EXIT_RESOURCE_IDS", "510")
+    _stub_lookup(monkeypatch, [_record(plate="5625JKB", guid="EXIT-1")])
+
+    outcome = await validation.validate_exit_plate(ANPR_PLATE, EVENT_TIME)
+
+    assert outcome.plate == "JKB-5625"
+    assert outcome.plate_source == PLATE_SOURCE_HIK_CORRECTED
+    assert outcome.reason == "plate_corrected"
+
+
+@pytest.mark.asyncio
+async def test_exit_validation_without_a_configured_camera_is_a_no_op(monkeypatch):
+    monkeypatch.setattr(settings, "HIK_EXIT_RESOURCE_IDS", "")
+
+    async def explode(**kwargs):  # pragma: no cover
+        raise AssertionError("must not query without a configured camera")
+
+    monkeypatch.setattr(
+        "app.services.hikcentral.client.query_vehicle_logs", explode
+    )
+
+    outcome = await validation.validate_exit_plate(ANPR_PLATE, EVENT_TIME)
+
+    assert outcome.plate == ANPR_PLATE
+    assert outcome.reason == "no_resource_ids_configured"
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_never_rewrites_an_exit_plate(monkeypatch):
+    monkeypatch.setattr(settings, "HIK_VALIDATION_MODE", "shadow")
+    monkeypatch.setattr(settings, "HIK_EXIT_RESOURCE_IDS", "510")
+    _stub_lookup(monkeypatch, [_record(plate="5625JKB", guid="EXIT-2")])
+
+    outcome = await validation.validate_exit_plate(ANPR_PLATE, EVENT_TIME)
+
+    assert outcome.plate == ANPR_PLATE
+    assert outcome.plate_source == PLATE_SOURCE_EDGE_ANPR

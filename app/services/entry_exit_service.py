@@ -38,7 +38,7 @@ from sqlalchemy.orm import Session
 from app.services.entry_state_lock import acquire_plate_transaction_lock
 from app.models.entry_exit_log import EntryExitLog
 from app.models.hik_validation import HikValidation
-from app.services import exit_match_service
+from app.services import exit_pipeline
 from app.services import parking_session_service
 from app.services import vehicle_service
 from app.services.event_parser import ParsedCameraEvent, same_vehicle_plate
@@ -851,13 +851,18 @@ async def _reconcile_missed_exits(
             )
             continue
         images = await hikcentral.download_hik_images(outcome)
-        session = parking_session_service.close_session(
+        # The same pipeline the edge exit runs. Until this, the sweep stopped at
+        # `close_session`: an exit recovered here for a car whose ENTRY plate was
+        # misread matched nothing, closed nothing, and consumed its GUID on the
+        # way out, so no later sweep could retry it. That is SNA-226.
+        vehicle = vehicle_service.ensure_unregistered_vehicle(db, rec.canonical_plate)
+        result = await exit_pipeline.resolve(
             db,
-            plate_number=rec.canonical_plate,
-            event_time=pass_local,
-            camera_id="CAM-EXIT",
-            snapshot_path=images.vehicle_image_path,
+            exit_pipeline.from_polled_outcome(outcome, images.vehicle_image_path),
+            vehicle=vehicle,
+            exit_image_path=images.vehicle_image_path,
         )
+        session = result.session
         _write_reconciled_exit_log(db, rec.canonical_plate, pass_local, images.vehicle_image_path)
         # Consume the GUID (unique) so a later sweep never redoes this exit.
         hikcentral.record_hik_validation(
@@ -1295,10 +1300,14 @@ async def handle_anpr_event(
     if gate == "entry":
         await _buffer_entry_read(event, plate, event_time)
         return
-    # HikCentral is intentionally entry-only. Exit ANPR remains the legacy
-    # single-read path: dedup, vehicle/session resolution, alerts, and VA
-    # forwarding all operate on the plate reported by the exit camera.
-    exit_snapshot = event.snapshot_path
+    # ── The exit plate is checked by HikCentral HERE, before anything keys off
+    # it. Dedup, the audit row, the session close, the alert and the VA forward
+    # then all agree on one string — `plate` is that string from this line on.
+    # Off/shadow/unreachable/no exit indexCode all return the edge plate, so this
+    # is a no-op wherever the layer is not authoritative.
+    exit_event = await exit_pipeline.from_camera_event(event, plate, event_time, db)
+    plate = exit_event.plate
+    exit_snapshot = exit_event.snapshot_path
     # Build the VA notification before deduplication. If PMS committed the first
     # delivery and then crashed before the post-commit forward could run or spool,
     # the camera's duplicate webhook is the only recovery signal. Returning this
@@ -1320,6 +1329,10 @@ async def handle_anpr_event(
     # cannot acquire/fail a lock that they do not need.
     if settings.ENTRY_V2_MODE == "authoritative":
         acquire_plate_transaction_lock(db, plate)
+    # Keyed on the POST-HikCentral plate. The camera files both readings of a car
+    # it read twice, and an exact-plate dedup on the edge string sees two
+    # different plates and processes both — `AAA-2538` did exactly that on 8/11
+    # and 8/12. Corrected first, the two collapse to one.
     logger.debug(f"[UC1] Checking dedup for plate {plate}...")
     dedup_window = event_time - timedelta(seconds=30)
     dedup_ceiling = event_time + timedelta(seconds=30)
@@ -1392,44 +1405,20 @@ async def handle_anpr_event(
     else:
         logger.warning(f"[UC2] No matching entry found for vehicle {plate}")
 
-    closed = parking_session_service.close_session(
+    # Close the stay — exact plate first, then the matcher for a stay standing
+    # under a misread entry. Same two steps the reconcile sweep now runs.
+    exit_outcome = await exit_pipeline.resolve(
         db,
-        plate_number=plate,
-        event_time=event_time,
-        camera_id=event.camera_id,
-        snapshot_path=exit_snapshot,
+        exit_event,
+        vehicle=vehicle,
+        exit_image_path=event.local_snapshot_path or event.snapshot_path,
     )
-
-    # Nothing closed under this plate. Either the plate is right and the ENTRY was
-    # lost, or the entry read was wrong and the stay is open under another string.
-    # exit_match_service separates those; only the second is ever matched.
-    if closed is None:
-        resolution = await exit_match_service.resolve_with_appearance(
-            db, plate, event_time, vehicle,
-            event.local_snapshot_path or event.snapshot_path,
-        )
-        if resolution.matched:
-            closed = parking_session_service.close_matched_session(
-                db,
-                resolution.session,
-                exit_time=event_time,
-                camera_id=event.camera_id,
-                snapshot_path=exit_snapshot,
-            )
-            logger.warning(
-                "[UC2] Exit %s resolved to session id=%s plate=%s — %s",
-                plate, resolution.session.id, resolution.session.plate_number,
-                resolution.reason,
-            )
-            if log_entry.parking_duration is None and closed is not None:
-                duration = int((event_time - closed.entry_time).total_seconds())
-                log_entry.parking_duration = max(0, duration)
-        else:
-            logger.warning(
-                "[UC2] Exit %s unresolved (%s): %s | %s",
-                plate, resolution.kind, resolution.reason,
-                exit_match_service.describe(resolution),
-            )
+    closed = exit_outcome.session
+    # A stay closed under a DIFFERENT plate has no entry row this exit could
+    # match, so UC2's duration query above found nothing; take it from the stay.
+    if exit_outcome.corrected and log_entry.parking_duration is None:
+        duration = int((event_time - closed.entry_time).total_seconds())
+        log_entry.parking_duration = max(0, duration)
 
     from app.services.occupancy_service import (
         reconcile_zone_counts_from_open_sessions,

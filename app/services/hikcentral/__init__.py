@@ -46,6 +46,7 @@ from app.services.hikcentral.validation import (
     record_hik_validation,
     recover_entry_plate,
     validate_entry_plate,
+    validate_exit_plate,
 )
 
 __all__ = [
@@ -72,4 +73,5 @@ __all__ = [
     "recover_entry_plate",
     "start_hikcentral_http_client",
     "validate_entry_plate",
+    "validate_exit_plate",
 ]

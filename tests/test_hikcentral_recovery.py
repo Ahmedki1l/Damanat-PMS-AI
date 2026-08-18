@@ -427,16 +427,28 @@ def exit_cameras(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_exit_does_not_contact_hikcentral_when_mode_is_active(
+async def test_exit_consults_hikcentral_and_keeps_the_edge_plate_with_no_record(
     monkeypatch, db, exit_cameras
 ):
-    monkeypatch.setattr(settings, "HIK_VALIDATION_MODE", "authoritative")
+    """The exit plate IS checked now — it used to be entry-only.
 
-    async def explode(**kwargs):  # pragma: no cover
-        raise AssertionError("HikCentral must not be queried for exit events")
+    Reversed deliberately: the exit read is the only evidence that can correct a
+    wrong ENTRY plate, so it is worth confirming before a session is rewritten
+    from it. What must not change is the degraded path — a platform holding no
+    record for this pass leaves the edge plate standing and writes no validation
+    row, exactly as when the layer was never consulted at all.
+    """
+    monkeypatch.setattr(settings, "HIK_VALIDATION_MODE", "authoritative")
+    monkeypatch.setattr(settings, "HIK_EXIT_RESOURCE_IDS", "510")
+
+    queried = []
+
+    async def no_records(**kwargs):
+        queried.append(kwargs)
+        return []
 
     monkeypatch.setattr(
-        "app.services.hikcentral.client.query_vehicle_logs", explode
+        "app.services.hikcentral.client.query_vehicle_logs", no_records
     )
     db.add(
         ParkingSession(
@@ -453,6 +465,7 @@ async def test_exit_does_not_contact_hikcentral_when_mode_is_active(
     await entry_exit_service.handle_anpr_event(_exit_event(), db)
     db.commit()
 
+    assert queried, "the exit plate must be checked against HikCentral"
     assert db.query(ParkingSession).one().status == "closed"
     assert db.query(EntryExitLog).one().plate_number == "JKA-5625"
     assert db.query(HikValidation).count() == 0

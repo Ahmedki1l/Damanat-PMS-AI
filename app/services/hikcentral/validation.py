@@ -3,7 +3,8 @@
 HikCentral is NOT the normal plate source — the ANPR camera already reports the
 plate. This module does exactly two things:
 
-  * validate a plate the camera reported (`validate_entry_plate`)
+  * validate a plate the camera reported (`validate_entry_plate`,
+    `validate_exit_plate`)
   * recover a plate the camera failed to report (`recover_entry_plate`)
 
 Callers receive one canonical plate and never learn where it came from.
@@ -339,6 +340,32 @@ async def validate_entry_plate(
         event_time,
         settings.hik_entry_resource_ids(),
         DIRECTION_ENTRY,
+        db,
+    )
+
+
+async def validate_exit_plate(
+    reported_plate: str, event_time, db: Optional[Session] = None
+) -> HikOutcome:
+    """Validate the plate the exit ANPR camera reported.
+
+    `_validate_plate` is already direction-agnostic — `plate_corrected` and
+    `plate_completed` need nothing from the entry side — so this is the entry
+    wrapper pointed at the exit camera.
+
+    Worth stating because the exit ANPR is the *reliable* read: this is not here
+    to second-guess it, it is here because the exit plate is the only evidence
+    that can correct a wrong ENTRY plate. A misread exit propagates that error
+    into a session rewrite, so the plate is checked before anything keys off it.
+
+    An unset `HIK_EXIT_RESOURCE_IDS` returns `no_resource_ids_configured` and the
+    edge plate stands — the same silent no-op that hid the fake `453` indexCode.
+    """
+    return await _validate_plate(
+        reported_plate,
+        event_time,
+        settings.hik_exit_resource_ids(),
+        DIRECTION_EXIT,
         db,
     )
 
