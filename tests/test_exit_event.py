@@ -114,6 +114,22 @@ def _hik_returns(monkeypatch, *records):
     )
 
 
+def _reid_picks(monkeypatch, plate, score=0.91):
+    """VA names one candidate decisively.
+
+    Since 2026-08-18 no string rule may close a session - two real cars can
+    differ by one letter or digit - so appearance is the only route from a
+    candidate to a close, and these tests have to go through it.
+    """
+    async def compare(image_path, plates):
+        return {
+            "query_quality_ok": True,
+            "results": [{"plate": plate, "score": score}],
+        }
+
+    monkeypatch.setattr("app.utils.va_reid_client.compare", compare)
+
+
 # ── both ingest paths build the same event ──────────────────────────────────
 
 
@@ -237,10 +253,11 @@ async def test_a_recovered_exit_reaches_the_matcher(monkeypatch, db):
     closes nothing — before this the sweep stopped there and consumed the GUID.
 
     The misread is in the letters, which is what the entry LPR actually gets
-    wrong: the digit group is intact, so `exit_match_service` resolves it
-    deterministically with no appearance evidence needed.
+    wrong. The shared digit group is NOT what resolves it - that rule is gone,
+    because two real cars can share one. Appearance is.
     """
     stay = _open_session(db, "SNP-226")   # entry read the letters wrong
+    _reid_picks(monkeypatch, "SNP-226")
     monkeypatch.setattr(settings, "HIK_RECONCILE_MATCH_SECONDS", 30.0)
     monkeypatch.setattr(entry_exit_service, "facility_now_naive", lambda: EXIT_TIME)
 
@@ -249,7 +266,9 @@ async def test_a_recovered_exit_reaches_the_matcher(monkeypatch, db):
 
     async def fake_images(outcome):
         from app.services.hikcentral.models import HikImages
-        return HikImages()
+        # A crop is now REQUIRED for a recovered exit to close a misread stay:
+        # appearance is the only evidence left that can do it.
+        return HikImages(vehicle_image_path="/snap/recovered.jpg")
 
     monkeypatch.setattr(hikcentral, "list_unconsumed_records", fake_list)
     monkeypatch.setattr(hikcentral, "download_hik_images", fake_images)
@@ -313,6 +332,7 @@ async def test_a_refused_close_is_not_reported_as_resolved(monkeypatch, db, capl
     only trace in the log would be a line claiming the exit resolved.
     """
     _open_session(db, "SNP-226")
+    _reid_picks(monkeypatch, "SNP-226")
     monkeypatch.setattr(
         parking_session_service, "close_matched_session",
         lambda *a, **k: None,
@@ -326,7 +346,9 @@ async def test_a_refused_close_is_not_reported_as_resolved(monkeypatch, db, capl
         source=exit_pipeline.SOURCE_EDGE,
     )
     with caplog.at_level("WARNING"):
-        outcome = await exit_pipeline.resolve(db, event)
+        outcome = await exit_pipeline.resolve(
+            db, event, exit_image_path="/snap/exit.jpg"
+        )
 
     assert outcome.match is not None and outcome.match.matched, (
         "the matcher did find the stay — only the close refused"
@@ -350,6 +372,7 @@ async def test_a_refused_close_leaves_the_stay_open_and_writes_no_duration(
     is untouched, and no duration is invented from a session that never closed."""
     stay = _open_session(db, "SNP-226")
     _hik_returns(monkeypatch, _hik_record("G-6", "226SNA"))
+    _reid_picks(monkeypatch, "SNP-226")
     monkeypatch.setattr(
         parking_session_service, "close_matched_session",
         lambda *a, **k: None,
@@ -388,8 +411,8 @@ async def test_the_sweep_corrects_the_edge_row_instead_of_duplicating_it(
     _hik_returns(monkeypatch)
     await entry_exit_service.handle_anpr_event(_exit_event("AAA-2538"), db)
     db.commit()
-    assert db.query(ParkingSession).one().status == "closed", (
-        "the digit-group rule already closes this one on the misread"
+    assert db.query(ParkingSession).one().status == "open", (
+        "no string rule may close this - AAA and KXR share only their digits"
     )
 
     # 2. Minutes later the sweep finds the pass the platform has now ingested.
@@ -539,8 +562,9 @@ class _NonClosing:
 
 
 @pytest.mark.asyncio
-async def test_a_fuzzy_matched_exit_renames_the_stay(monkeypatch, db):
-    """The stay was opened as `SNP-226`; the exit read says `SNA-226`.
+async def test_an_appearance_matched_exit_renames_the_stay(monkeypatch, db):
+    """The stay was opened as `SNP-226`; the exit read says `SNA-226`, and VA
+    recognises the car.
 
     Before Stage 2 the stay closed but kept the misread, so the dashboard showed
     a car that was not there. The misread is still preserved — in
@@ -551,6 +575,7 @@ async def test_a_fuzzy_matched_exit_renames_the_stay(monkeypatch, db):
 
     monkeypatch.setattr(settings, "EXIT_HIK_RECHECK_SECONDS", 0)
     monkeypatch.setattr(entry_exit_service, "facility_now_naive", lambda: EXIT_TIME)
+    _reid_picks(monkeypatch, "SNP-226")
     sent = []
     monkeypatch.setattr(
         "app.utils.va_reid_client.rename",

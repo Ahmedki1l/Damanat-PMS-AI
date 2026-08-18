@@ -35,6 +35,20 @@ WHAT A WRONG ANSWER COSTS
 Closing the wrong session corrupts TWO stays: the real car stays "inside"
 forever and an innocent one is marked gone, silently. So every rule here is
 unique-or-refuse, and a refusal is a normal outcome rather than a failure.
+
+STRINGS NEVER DECIDE (2026-08-18)
+---------------------------------
+This module used to close a session when the exit plate shared its digit group,
+or was a truncation of, exactly one open stay. That is gone. Two REAL cars can
+differ by a single letter or digit, so a unique string match says only that no
+other such car was parked at that moment — it is a property of the day's plate
+pool, not evidence about this car. The rule was right about KXR-2538 twice and
+had no way to know it.
+
+What is left decides on physical evidence: HikCentral corrects the exit plate at
+the source (so the exact match simply works), slot history eliminates candidates
+that cannot have left, and appearance scores the rest. An exit no evidence can
+place is logged with its candidates and closes nothing.
 """
 
 from dataclasses import dataclass, field
@@ -216,32 +230,25 @@ def resolve_unmatched_exit(
 
     shortlist = tuple(candidates[: settings.EXIT_MATCH_SHORTLIST])
 
-    # Deterministic rules only: each accepts a UNIQUE candidate or declines.
-    # Ambiguity is handed on rather than broken by a tiebreak, because the
-    # tiebreak would be a guess and a wrong close costs two sessions.
-    digit_hits = [c for c in candidates if c.digits_exact]
-    if len(digit_hits) == 1:
-        winner = digit_hits[0]
-        return ExitResolution(
-            MATCHED,
-            f"digit group {_parts(plate)[1]!r} matches only {winner.plate}",
-            session=winner.session,
-            candidates=shortlist,
-        )
-
-    truncation_hits = [c for c in candidates if c.truncated]
-    if len(truncation_hits) == 1 and not digit_hits:
-        winner = truncation_hits[0]
-        return ExitResolution(
-            MATCHED,
-            f"{winner.plate} is the same plate truncated",
-            session=winner.session,
-            candidates=shortlist,
-        )
-
+    # NO STRING RULE MAY CLOSE A SESSION. Two real cars can differ by one letter
+    # or one digit, so "the digit group matches only this candidate" is a
+    # statement about the plate pool that happened to be parked, not evidence
+    # that these are the same car — and being wrong closes a stranger's stay and
+    # then renames it.
+    #
+    # Measured over ai-logs.txt (8/10-8/16, 130 exits): the digit-group rule
+    # fired twice, both times on ONE car (AAA-2538 -> KXR-2538, 8/11 and 8/12),
+    # whose three letters were all wrong and whose digits happened to be unique
+    # that day. The truncation rule never fired at all. That same car is now
+    # corrected at the source by `validate_exit_plate`, so this rule's entire
+    # observed contribution is covered by evidence instead of by coincidence.
+    #
+    # Candidates still carry `distance` / `digits_exact` / `truncated` — they are
+    # printed in the Log X line so an operator can audit the call. They are
+    # DIAGNOSTICS. Nothing here may branch on them again.
     return ExitResolution(
         AMBIGUOUS,
-        f"{len(digit_hits) or len(shortlist)} plausible candidates — needs appearance",
+        f"{len(shortlist)} plausible candidates — needs physical evidence",
         candidates=shortlist,
     )
 

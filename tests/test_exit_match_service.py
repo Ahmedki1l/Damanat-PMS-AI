@@ -90,40 +90,60 @@ def test_a_trusted_plate_is_never_matched(db, veh, why):
 
 def test_a_placeholder_row_does_not_count_as_trust(db):
     """ensure_unregistered_vehicle mints a row for any unknown plate — including
-    during this very exit. The flags are the signal, never the row's existence."""
+    during this very exit. The flags are the signal, never the row's existence.
+
+    A plain placeholder must NOT terminate the match as `entry_lost`: the exit
+    still reaches the candidate pool, where physical evidence decides.
+    """
     open_session(db, "KXR-2538")
 
     out = ems.resolve_unmatched_exit(db, "AAB-2538", EXIT_TIME, vehicle())
 
-    assert out.kind == ems.MATCHED
-    assert out.session.plate_number == "KXR-2538"
+    assert out.kind == ems.AMBIGUOUS
+    assert out.session is None
+    assert [c.plate for c in out.candidates] == ["KXR-2538"]
 
 
 # ── Deterministic matching ───────────────────────────────────────────────────
 
 
-def test_digit_group_resolves_the_production_case(db):
-    """2026-08-05: KXR-2538 entered 11:18, left as AAB-2538 at 15:50."""
+def test_a_unique_digit_group_no_longer_closes_anything(db):
+    """2026-08-05: KXR-2538 entered 11:18, left as AAB-2538 at 15:50 — and this
+    rule used to close it on the strength of the shared digits alone.
+
+    It is a statement about the plate pool parked that day, not about this car.
+    Two REAL cars can share a digit group, and being wrong closes a stranger's
+    stay and then renames it. The candidate survives for slot and appearance
+    evidence to judge; the string does not get a vote.
+    """
     open_session(db, "KXR-2538")
     open_session(db, "HVA-77")
     open_session(db, "GLD-5965")
 
     out = ems.resolve_unmatched_exit(db, "AAB-2538", EXIT_TIME, vehicle())
 
-    assert out.matched
-    assert out.session.plate_number == "KXR-2538"
-    assert "2538" in out.reason
+    assert not out.matched
+    assert out.kind == ems.AMBIGUOUS
+    assert out.session is None
+    assert "KXR-2538" in [c.plate for c in out.candidates], (
+        "removing the RULE must not remove the CANDIDATE — evidence still needs it"
+    )
 
 
-def test_a_truncated_entry_plate_resolves(db):
-    """The other observed shape: entered as KKR-4, leaves as KKR-6294."""
+def test_a_truncated_entry_plate_no_longer_closes_anything(db):
+    """The other observed shape: entered as KKR-4, leaves as KKR-6294.
+
+    A prefix relationship is no safer than a shared digit group: KKR-629 and
+    KKR-6294 can be two cars. Never fired once in the 8/10-8/16 window.
+    """
     open_session(db, "KKR-4")
     open_session(db, "GLD-5965")
 
     out = ems.resolve_unmatched_exit(db, "KKR-6294", EXIT_TIME, vehicle())
 
-    assert out.matched
-    assert out.session.plate_number == "KKR-4"
+    assert not out.matched
+    assert out.session is None
+    assert "KKR-4" in [c.plate for c in out.candidates]
 
 
 def test_two_digit_matches_refuse_rather_than_guess(db):
@@ -317,14 +337,23 @@ async def test_appearance_never_second_guesses_a_trusted_plate(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_decided_plate_rule_is_not_re_opened(db, monkeypatch):
-    """A unique digit match is already decisive; VA is not consulted."""
+async def test_appearance_is_the_only_route_to_a_close(db, monkeypatch):
+    """Appearance is now the ONLY route from a candidate to a close.
+
+    This test used to prove the opposite — that a unique digit match was already
+    decisive and VA was not consulted. There are no plate rules left to be
+    decisive, so VA IS consulted, and its answer is what closes the stay.
+    """
     open_session(db, "KXR-2538")
 
-    async def explode(image_path, plates):  # pragma: no cover
-        raise AssertionError("VA must not be consulted once a plate rule fired")
+    async def compare(image_path, plates):
+        assert "KXR-2538" in plates
+        return {
+            "query_quality_ok": True,
+            "results": [{"plate": "KXR-2538", "score": 0.91}],
+        }
 
-    monkeypatch.setattr("app.utils.va_reid_client.compare", explode)
+    monkeypatch.setattr("app.utils.va_reid_client.compare", compare)
 
     out = await ems.resolve_with_appearance(
         db, "AAB-2538", EXIT_TIME, vehicle(), "exit.jpg"
@@ -332,3 +361,4 @@ async def test_a_decided_plate_rule_is_not_re_opened(db, monkeypatch):
 
     assert out.matched
     assert out.session.plate_number == "KXR-2538"
+    assert out.reason.startswith("appearance:")
