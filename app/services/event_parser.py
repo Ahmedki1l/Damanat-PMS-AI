@@ -1197,6 +1197,22 @@ def plate_digits_lost(partial: Optional[str], full: Optional[str]) -> bool:
     return long.startswith(short) or long.endswith(short)
 
 
+def plate_parts(plate: Optional[str]) -> tuple:
+    """(letters, digits) for a plate, order-independent.
+
+    The DB stores letters-first (`BHD-9990`) while some OCR paths report
+    digits-first (`9990BHD`); splitting by character class compares both
+    spellings without accepting a different car. Lives here rather than in the
+    exit matcher because the session close needs it too — a digits-first exit
+    read must find its letters-first stay.
+    """
+    raw = "".join(c for c in (plate or "").upper() if c.isalnum())
+    return (
+        "".join(c for c in raw if c.isalpha()),
+        "".join(c for c in raw if c.isdigit()),
+    )
+
+
 def same_vehicle_plate(a: Optional[str], b: Optional[str]) -> bool:
     """True when two reads name the same car — identical, or one truncated."""
     if not a or not b:

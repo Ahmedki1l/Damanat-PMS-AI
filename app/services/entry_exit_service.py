@@ -38,6 +38,7 @@ from sqlalchemy.orm import Session
 from app.services.entry_state_lock import acquire_plate_transaction_lock
 from app.models.entry_exit_log import EntryExitLog
 from app.models.hik_validation import HikValidation
+from app.models.parking_session import ParkingSession
 from app.services import exit_pipeline
 from app.services import parking_session_service
 from app.services import plate_correction_service
@@ -872,9 +873,11 @@ async def _reconcile_missed_exits(
         late_row = exit_pipeline.exit_row_for_late_pass(db, pass_local, match_s)
         if late_row is not None:
             exit_pipeline.adopt_late_plate(db, late_row, rec.canonical_plate)
+            _pair_audit_rows(db, late_row, session)
         else:
             _write_reconciled_exit_log(
-                db, rec.canonical_plate, pass_local, images.vehicle_image_path
+                db, rec.canonical_plate, pass_local, images.vehicle_image_path,
+                session=session,
             )
         # Consume the GUID (unique) so a later sweep never redoes this exit.
         hikcentral.record_hik_validation(
@@ -902,11 +905,50 @@ async def _reconcile_missed_exits(
         )
 
 
+def _pair_audit_rows(
+    db: Session, exit_log: EntryExitLog, session: Optional[ParkingSession]
+) -> None:
+    """Link an exit row to the entry row of the stay it actually closed.
+
+    No-op when nothing closed, or when the pairing already happened on the exact
+    plate. Looks the entry row up through the session so a corrected plate finds
+    it — by this point `apply_correction` has already moved both onto the real
+    plate, so they agree.
+    """
+    if session is None or exit_log.matched_entry_id is not None:
+        return
+    entry_log = parking_session_service.entry_log_for(db, session)
+    if entry_log is None or entry_log.id == exit_log.id:
+        return
+    if exit_log.id is None:
+        # The edge path does not add its row until the very end, so flushing
+        # alone would not give it an id — and an id is the whole point: the
+        # pairing is two-way, and the entry row needs this row's key.
+        db.add(exit_log)
+        db.flush()
+    exit_log.matched_entry_id = entry_log.id
+    entry_log.matched_entry_id = exit_log.id
+    if exit_log.parking_duration is None:
+        exit_log.parking_duration = max(
+            0, int((exit_log.event_time - session.entry_time).total_seconds())
+        )
+
+
 def _write_reconciled_exit_log(
-    db: Session, plate: str, when: datetime, snapshot: Optional[str]
+    db: Session,
+    plate: str,
+    when: datetime,
+    snapshot: Optional[str],
+    session: Optional[ParkingSession] = None,
 ) -> None:
     """Write the audit exit row for a reconciled exit, matched to its open entry
-    with a computed duration — the same shape the live exit path produces."""
+    with a computed duration — the same shape the live exit path produces.
+
+    When the pipeline resolved a stay, that stay decides the pairing: its plate
+    may differ from this pass's, and the session is the only thing that knows
+    which entry this exit actually ends. The plate-based query below is the
+    fallback for a recovered exit that closed nothing.
+    """
     vehicle = vehicle_service.ensure_unregistered_vehicle(db, plate)
     log_entry = EntryExitLog(
         plate_number=plate,
@@ -931,6 +973,9 @@ def _write_reconciled_exit_log(
     )
     db.add(log_entry)
     db.flush()
+    if session is not None:
+        _pair_audit_rows(db, log_entry, session)
+        return
     if matching_entry is not None:
         entry_time = matching_entry.event_time
         if entry_time.tzinfo is not None:
@@ -1442,6 +1487,11 @@ async def handle_anpr_event(
     if exit_outcome.corrected and log_entry.parking_duration is None:
         duration = int((event_time - closed.entry_time).total_seconds())
         log_entry.parking_duration = max(0, duration)
+    # Pair the audit rows from the RESOLVED session. UC2 above searched by the
+    # EXIT's plate, which is precisely the string that does not match when the
+    # entry was misread — so every non-exact close left `matched_entry_id` NULL
+    # and the trail could not say which entry a given exit ended.
+    _pair_audit_rows(db, log_entry, closed)
 
     from app.services.occupancy_service import (
         reconcile_zone_counts_from_open_sessions,

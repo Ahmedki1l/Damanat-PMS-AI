@@ -196,14 +196,25 @@ def test_a_car_cannot_leave_before_it_arrived(db):
     assert out.kind == ems.NO_CANDIDATES
 
 
-def test_an_abandoned_phantom_is_not_revived(db, monkeypatch):
-    """A stale session must not be closed by an unrelated car days later."""
-    monkeypatch.setattr(settings, "EXIT_MATCH_MAX_AGE_HOURS", 72.0)
+def test_an_old_session_is_reachable_but_still_not_closed_on_a_string(db):
+    """The 72h bound is gone, and what protects the phantom is no longer age.
+
+    `EXIT_MATCH_MAX_AGE_HOURS=72` used to make a 200h session invisible to the
+    matcher — which also made `ABR-8000` (98h) and `KBD-6795` (120h) unreachable
+    by any exit, so the sessions that most needed resolving were exactly the ones
+    hidden. They are candidates again.
+
+    Being a candidate is not being closed. No string rule can close it; only slot
+    evidence or appearance can, and both are statements about the physical car
+    rather than about how long it has been sitting there.
+    """
     open_session(db, "KXR-2538", hours_ago=200.0)
 
     out = ems.resolve_unmatched_exit(db, "AAB-2538", EXIT_TIME, vehicle())
 
-    assert out.kind == ems.NO_CANDIDATES
+    assert out.kind == ems.AMBIGUOUS
+    assert out.session is None
+    assert [c.plate for c in out.candidates] == ["KXR-2538"]
 
 
 def test_the_feature_can_be_switched_off(db, monkeypatch):

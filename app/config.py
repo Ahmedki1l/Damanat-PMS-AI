@@ -532,7 +532,20 @@ class Settings(BaseSettings):
     EXIT_MATCH_SHORTLIST: int = 5
     # Never match an exit against a session older than this. A long-abandoned
     # phantom must not be revived by an unrelated car days later.
+    # RETIRED 2026-08-18. Bounded the matcher's candidate pool to 72h while
+    # `close_session` had no bound at all, so the two halves of one decision
+    # disagreed about which stays exist — and the sessions that most needed
+    # resolving (ABR-8000 at 98h, KBD-6795 at 120h) were exactly the ones it
+    # hid. Age is now an attribute of a candidate, not a filter on the pool.
+    # Kept as a no-op so a deployed ConfigMap still validates; remove it there.
     EXIT_MATCH_MAX_AGE_HOURS: float = 72.0
+    # Entry time comes from the entry camera's clock, exit time from the exit
+    # camera's. Two Hikvision devices drift by seconds, so "a car cannot leave
+    # before it arrived" needs a tolerance or a car that leaves within the drift
+    # of arriving matches nothing and strands its own stay.
+    EXIT_CLOCK_SKEW_SECONDS: float = Field(
+        default=120.0, ge=0, le=3600.0, allow_inf_nan=False,
+    )
     # Appearance scoring (VA /api/reid/compare) for exits the plate rules cannot
     # settle — the "both letters AND digits misread" case, where no string logic
     # can help. VA scores, PMS-AI decides.

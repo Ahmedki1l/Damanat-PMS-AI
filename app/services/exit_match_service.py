@@ -60,7 +60,8 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.parking_session import ParkingSession
 from app.models.vehicle import Vehicle
-from app.services.event_parser import same_vehicle_plate
+from app.services import parking_session_service
+from app.services.event_parser import plate_parts as _parts, same_vehicle_plate
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -101,20 +102,6 @@ class ExitResolution:
     @property
     def matched(self) -> bool:
         return self.kind == MATCHED
-
-
-def _parts(plate: Optional[str]) -> tuple:
-    """(letters, digits) for a plate, order-independent.
-
-    The DB stores letters-first (`BHD-9990`) while some OCR paths report
-    digits-first (`9990BHD`); splitting by character class compares both
-    spellings without accepting a different car.
-    """
-    raw = "".join(c for c in (plate or "").upper() if c.isalnum())
-    return (
-        "".join(c for c in raw if c.isalpha()),
-        "".join(c for c in raw if c.isdigit()),
-    )
 
 
 def _edit_distance(a: str, b: str) -> int:
@@ -159,20 +146,20 @@ def find_candidates(
 ) -> list:
     """Open sessions this exit could plausibly belong to, best first.
 
-    Bounded by `EXIT_MATCH_MAX_AGE_HOURS` so a long-abandoned phantom cannot be
-    revived by an unrelated car days later, and by `entry_time <= exit_time`
-    because a car cannot leave before it arrived.
+    UNBOUNDED by age since 2026-08-18. `EXIT_MATCH_MAX_AGE_HOURS=72` was meant to
+    stop a long-abandoned phantom being revived by an unrelated car days later,
+    but it also hid the sessions that need resolving MOST: `ABR-8000` (98h) and
+    `KBD-6795` (120h) could not appear as a candidate for any exit, so they could
+    never self-heal. And `close_session` never had the bound, so the two halves
+    of one decision disagreed about what "open" means.
+
+    Age is not lost, only demoted from a filter to an attribute — it is on the
+    session and printed with the candidate. Nothing here is closed on a string
+    anyway, so a stale candidate costs one more line in a Log X, not a wrong
+    close. The pool is the same one `close_session` uses: at 35 slots it is tens
+    of rows.
     """
-    oldest = exit_time - timedelta(hours=settings.EXIT_MATCH_MAX_AGE_HOURS)
-    rows = (
-        db.query(ParkingSession)
-        .filter(
-            ParkingSession.status == "open",
-            ParkingSession.entry_time <= exit_time,
-            ParkingSession.entry_time >= oldest,
-        )
-        .all()
-    )
+    rows = parking_session_service.open_stays(db, exit_time)
 
     exit_letters, exit_digits = _parts(plate)
     min_digits = settings.EXIT_MATCH_MIN_DIGITS
