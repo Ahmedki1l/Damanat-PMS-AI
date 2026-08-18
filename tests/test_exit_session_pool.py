@@ -142,14 +142,32 @@ def test_a_stay_that_starts_after_this_exit_is_not_in_the_pool(db):
 
 def test_clock_skew_between_the_two_cameras_is_tolerated(db):
     """Entry time comes from the entry camera's clock and exit time from the
-    exit camera's. Two Hikvision devices drift by seconds, so a car that leaves
-    within the drift of arriving must still find its own stay."""
-    _stay(db, "FAST-1", entry_time=EXIT + timedelta(seconds=30))
+    exit camera's, so a car that leaves within the drift of arriving must still
+    find its own stay.
+
+    The tolerance is deliberately tight — 20s, because each camera sits within
+    10s of HikCentral so two are within 20s of each other. It is NOT a short-stay
+    allowance: the shortest real stay measured over 8/10-8/16 is 248s, and not
+    one of the 124 is under 120s.
+    """
+    _stay(db, "FAST-1", entry_time=EXIT + timedelta(seconds=15))
 
     assert [row.plate_number for row in pss.open_stays(db, EXIT)] == ["FAST-1"]
 
-    # ...but the tolerance is small, not a licence to match tomorrow's car.
-    assert pss.open_stays(db, EXIT - timedelta(hours=2)) == []
+
+def test_a_car_that_re_entered_after_this_exit_is_out_of_the_pool(db):
+    """Why the tolerance stays tight. A car that exits and RE-ENTERS has two
+    stays; the exit belongs to the old one. A late exit reaching the NEW stay
+    would close a car that is sitting in the garage — and its plate matches
+    exactly, so nothing downstream would question it.
+    """
+    _stay(db, "BACK-1", entry_time=EXIT + timedelta(minutes=2))
+
+    assert pss.open_stays(db, EXIT) == []
+    assert pss.close_session(
+        db, plate_number="BACK-1", event_time=EXIT,
+        camera_id="CAM-EXIT", snapshot_path=None,
+    ) is None
 
 
 # ── ambiguity is surfaced, not guessed ──────────────────────────────────────

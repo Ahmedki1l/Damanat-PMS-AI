@@ -540,11 +540,31 @@ class Settings(BaseSettings):
     # Kept as a no-op so a deployed ConfigMap still validates; remove it there.
     EXIT_MATCH_MAX_AGE_HOURS: float = 72.0
     # Entry time comes from the entry camera's clock, exit time from the exit
-    # camera's. Two Hikvision devices drift by seconds, so "a car cannot leave
-    # before it arrived" needs a tolerance or a car that leaves within the drift
-    # of arriving matches nothing and strands its own stay.
+    # camera's, so "a car cannot leave before it arrived" needs a tolerance for
+    # the drift between two Hikvision devices.
+    #
+    # 20s, derived rather than guessed. HIK_MATCH_MAX_SKEW_SECONDS below refuses
+    # to pair a HikCentral record with a gate event more than 10s apart, and all
+    # 129 entry validations in ai-logs.txt (8/10-8/16) passed that gate — so each
+    # camera sits within 10s of the platform, and two cameras within 20s of each
+    # other at worst.
+    #
+    # This is NOT a "shortest stay" allowance and must not be widened into one.
+    # The 124 matched stays in that window run 248s (4.1 min) at the shortest,
+    # p50 6.8h; not one is under 120s. Nothing real lives down here.
+    #
+    # The cost of widening is asymmetric and easy to miss. A car that exits and
+    # RE-ENTERS within the tolerance has two stays: the exit belongs to the old
+    # one, but a reconciled exit arriving late would find the NEW stay inside the
+    # window, match its plate exactly, and close a car that is sitting in the
+    # garage. Every extra second buys nothing measurable and widens that hole.
+    #
+    # To measure it properly now that HIK_EXIT_RESOURCE_IDS is configured: pull
+    # one car's entry and exit passes from HikCentral, compare each against the
+    # gate event this service recorded, and difference the two offsets. The
+    # platform is the shared clock.
     EXIT_CLOCK_SKEW_SECONDS: float = Field(
-        default=120.0, ge=0, le=3600.0, allow_inf_nan=False,
+        default=20.0, ge=0, le=3600.0, allow_inf_nan=False,
     )
     # Appearance scoring (VA /api/reid/compare) for exits the plate rules cannot
     # settle — the "both letters AND digits misread" case, where no string logic
