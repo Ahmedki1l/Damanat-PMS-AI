@@ -196,6 +196,23 @@ async def resolve(
         camera_id=event.camera_id,
         snapshot_path=event.snapshot_path,
     )
+    if session is None:
+        # The matcher named a stay and the close refused it. Unreachable while
+        # `_close_session_record` returns the row unconditionally; it opens the
+        # moment the close is guarded (`UPDATE ... WHERE status='open'`), which
+        # is how a stale read is stopped from double-closing a stay another
+        # writer already ended. Reported as unclosed rather than logged as a
+        # success that did not happen — `ExitOutcome.corrected` is what gates
+        # the caller's duration backfill, and a stay that never closed has no
+        # exit to measure to.
+        logger.warning(
+            "[UC2] Exit %s matched session id=%s plate=%s via %s but the close "
+            "was refused — the stay is left open",
+            event.plate, resolution.session.id, resolution.session.plate_number,
+            event.source,
+        )
+        return ExitOutcome(match=resolution)
+
     logger.warning(
         "[UC2] Exit %s resolved to session id=%s plate=%s via %s — %s",
         event.plate, resolution.session.id, resolution.session.plate_number,

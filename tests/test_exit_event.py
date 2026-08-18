@@ -19,7 +19,12 @@ from app.config import settings
 from app.database import Base
 from app.models.entry_exit_log import EntryExitLog
 from app.models.parking_session import ParkingSession
-from app.services import entry_exit_service, exit_pipeline, hikcentral
+from app.services import (
+    entry_exit_service,
+    exit_pipeline,
+    hikcentral,
+    parking_session_service,
+)
 from app.services.event_parser import ParsedCameraEvent
 from app.services.hikcentral.models import VehicleLogRecord
 
@@ -287,3 +292,73 @@ async def test_a_recovered_exit_closes_nothing_when_the_matcher_declines(
     assert db.query(EntryExitLog).filter(EntryExitLog.gate == "exit").count() == 1, (
         "the exit still gets its audit row even when no stay could be found"
     )
+
+
+# ── the close itself can refuse ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_refused_close_is_not_reported_as_resolved(monkeypatch, db, caplog):
+    """The matcher naming a stay is not the same as the stay being closed.
+
+    `close_matched_session` cannot return None today — `_close_session_record`
+    returns the row unconditionally. It becomes reachable the moment the close is
+    guarded (`UPDATE ... WHERE status='open'`), which is how a stale read is
+    stopped from double-closing a stay another writer already ended.
+
+    The failure that would follow is silent, which is why this is pinned before
+    the guard exists: `ExitOutcome` would carry `session=None` alongside a
+    matched resolution, `.closed` and `.corrected` would both read False, and the
+    only trace in the log would be a line claiming the exit resolved.
+    """
+    _open_session(db, "SNP-226")
+    monkeypatch.setattr(
+        parking_session_service, "close_matched_session",
+        lambda *a, **k: None,
+    )
+
+    event = exit_pipeline.ExitEvent(
+        plate="SNA-226",
+        event_time=EXIT_TIME,
+        camera_id="CAM-EXIT",
+        snapshot_path="/snap/exit.jpg",
+        source=exit_pipeline.SOURCE_EDGE,
+    )
+    with caplog.at_level("WARNING"):
+        outcome = await exit_pipeline.resolve(db, event)
+
+    assert outcome.match is not None and outcome.match.matched, (
+        "the matcher did find the stay — only the close refused"
+    )
+    assert not outcome.closed
+    assert not outcome.corrected, (
+        "corrected gates the caller's duration backfill; a stay that was never "
+        "closed has no entry_time to read"
+    )
+    assert not any("resolved to session" in r.message for r in caplog.records), (
+        "a refused close must never be logged as a resolved exit"
+    )
+    assert any("close was refused" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_close_leaves_the_stay_open_and_writes_no_duration(
+    monkeypatch, db
+):
+    """End to end through the edge path: the audit row is still written, the stay
+    is untouched, and no duration is invented from a session that never closed."""
+    stay = _open_session(db, "SNP-226")
+    _hik_returns(monkeypatch, _hik_record("G-6", "226SNA"))
+    monkeypatch.setattr(
+        parking_session_service, "close_matched_session",
+        lambda *a, **k: None,
+    )
+
+    await entry_exit_service.handle_anpr_event(_exit_event("SNA-226"), db)
+    db.commit()
+
+    db.refresh(stay)
+    assert stay.status == "open"
+    row = db.query(EntryExitLog).filter(EntryExitLog.gate == "exit").one()
+    assert row.plate_number == "SNA-226"
+    assert row.parking_duration is None
