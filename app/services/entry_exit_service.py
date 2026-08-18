@@ -40,6 +40,7 @@ from app.models.entry_exit_log import EntryExitLog
 from app.models.hik_validation import HikValidation
 from app.services import exit_pipeline
 from app.services import parking_session_service
+from app.services import plate_correction_service
 from app.services import vehicle_service
 from app.services.event_parser import ParsedCameraEvent, same_vehicle_plate
 from app.services.alert_service import create_alert
@@ -885,6 +886,7 @@ async def _reconcile_missed_exits(
             entry_exit_log_id=late_row.id if late_row is not None else None,
         )
         db.commit()
+        await plate_correction_service.notify_va(result.correction)
         logger.warning(
             "[Hik][reconcile] %s plate=%s guid=%s at %s",
             "CORRECTED the edge exit row" if late_row is not None
@@ -1432,6 +1434,7 @@ async def handle_anpr_event(
         exit_event,
         vehicle=vehicle,
         exit_image_path=event.local_snapshot_path or event.snapshot_path,
+        exit_log=log_entry,
     )
     closed = exit_outcome.session
     # A stay closed under a DIFFERENT plate has no entry row this exit could
@@ -1486,6 +1489,12 @@ async def handle_anpr_event(
     # passed. Ask once more after it has had time to ingest — detached, so the
     # gate is never made to wait for a second opinion.
     exit_pipeline.schedule_late_plate_recheck(exit_event, log_entry.id)
+
+    # VA is told about a correction only once it is durable. The router commits
+    # immediately after this returns, and the rename is idempotent, so a detached
+    # task is safe — and if it loses the race the exit sweep re-applies it.
+    if exit_outcome.correction is not None:
+        exit_pipeline.schedule_va_correction_notify(exit_outcome.correction)
 
     # Network delivery is intentionally deferred until the router commits.
     # SQL Server transaction-owned application locks are released by that

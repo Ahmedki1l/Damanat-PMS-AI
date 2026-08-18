@@ -35,7 +35,12 @@ from app.models.entry_exit_log import EntryExitLog
 from app.models.hik_validation import HikValidation
 from app.models.parking_session import ParkingSession
 from app.models.vehicle import Vehicle
-from app.services import exit_match_service, parking_session_service, vehicle_service
+from app.services import (
+    exit_match_service,
+    parking_session_service,
+    plate_correction_service,
+    vehicle_service,
+)
 from app.services.hikcentral.models import HikOutcome
 from app.utils.logger import get_logger
 
@@ -105,6 +110,10 @@ class ExitOutcome:
 
     session: Optional[ParkingSession] = None
     match: Optional[exit_match_service.ExitResolution] = None
+    # Set when the closed stay was standing under a misread and this exit
+    # rewrote it. The caller fires `plate_correction_service.notify_va` for it
+    # AFTER committing — VA must only ever be told about a durable correction.
+    correction: Optional[plate_correction_service.Correction] = None
 
     @property
     def closed(self) -> bool:
@@ -176,6 +185,7 @@ async def resolve(
     *,
     vehicle: Optional[Vehicle] = None,
     exit_image_path: Optional[str] = None,
+    exit_log: Optional[EntryExitLog] = None,
 ) -> ExitOutcome:
     """Find and close the stay this exit ends.
 
@@ -191,6 +201,10 @@ async def resolve(
     `event.snapshot_path` — the edge path keeps an unpublished local file for
     exactly this. It stays an argument rather than a field so the frozen event
     describes the car, not the machinery.
+
+    `exit_log` is this exit's audit row, when the caller has already written one,
+    so a correction can carry it along. Nothing commits here: the ledger row, the
+    session rewrite and the caller's own row all land or fail together.
     """
     session = parking_session_service.close_session(
         db,
@@ -242,7 +256,14 @@ async def resolve(
         event.plate, resolution.session.id, resolution.session.plate_number,
         event.source, resolution.reason,
     )
-    return ExitOutcome(session=session, match=resolution)
+    # The stay was opened under a misread and this exit is the first independent
+    # read of the car. Correct it in the SAME transaction as the close: a stay
+    # closed but not renamed leaves the dashboard showing a car that is not here.
+    correction = plate_correction_service.apply_correction(
+        db, session, event.plate, resolution.reason,
+        exit_log=exit_log, hik_guid=event.hik_guid,
+    )
+    return ExitOutcome(session=session, match=resolution, correction=correction)
 
 
 # ── a plate that arrived after we asked ─────────────────────────────────────
@@ -426,3 +447,22 @@ async def _recheck_late_plate(event: ExitEvent, exit_log_id: Optional[int]) -> N
             pass
     finally:
         db.close()
+
+
+def schedule_va_correction_notify(correction) -> None:
+    """Push a committed correction to VA without blocking the caller.
+
+    The edge path's transaction is committed by the ROUTER, after
+    `handle_anpr_event` returns, so there is no point here at which this can be
+    awaited in the right order. Detaching is the honest trade: the rename is
+    idempotent, VA being briefly stale is harmless, and the reconcile sweep
+    re-applies a correction whose notification was lost. The sweep, which owns
+    its own transaction, calls `notify_va` directly after its commit instead.
+    """
+    if correction is None:
+        return
+    from app.services import plate_correction_service
+
+    task = asyncio.create_task(plate_correction_service.notify_va(correction))
+    _late_rechecks.add(task)
+    task.add_done_callback(_late_rechecks.discard)

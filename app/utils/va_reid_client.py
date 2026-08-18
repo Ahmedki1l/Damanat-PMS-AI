@@ -24,6 +24,7 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 COMPARE_PATH = "/api/reid/compare"
+RENAME_PATH = "/api/reid/rename"
 # Guards against handing a multi-megabyte overview frame to the model.
 _MAX_IMAGE_BYTES = 6 * 1024 * 1024
 
@@ -91,3 +92,48 @@ async def compare(image_path: str, plates: list) -> Optional[dict]:
     except ValueError:
         logger.warning("[ReID] compare returned non-JSON")
         return None
+
+
+async def rename(old_plate: str, new_plate: str) -> bool:
+    """Tell VA a car was filed under the wrong plate. Never raises.
+
+    Fire-and-forget by contract: `apply_correction` has already committed by the
+    time this runs, and a VA that is down must not undo a correction PMS-AI has
+    made. Returns whether VA acknowledged, for logging only — no caller branches
+    on it.
+
+    What is lost when this fails is not the correction but its propagation: VA
+    keeps the crops under the misread and rewrites `parking_slots.current_plate`
+    back to it on the next slot update. The exit sweep re-runs corrections, so a
+    missed call is repaired rather than permanent.
+    """
+    if not settings.PMS_API_URL or not old_plate or not new_plate:
+        return False
+    if old_plate == new_plate:
+        return False
+
+    url = settings.PMS_API_URL.rstrip("/") + RENAME_PATH
+    try:
+        async with httpx.AsyncClient(
+            timeout=settings.EXIT_MATCH_REID_TIMEOUT_SECONDS
+        ) as client:
+            response = await client.post(
+                url,
+                json={"from": old_plate, "to": new_plate},
+                headers={"X-Service-Key": settings.ENTRY_V2_SERVICE_KEY},
+            )
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        logger.warning(
+            "[ReID] rename %s -> %s unreachable: %r", old_plate, new_plate, exc
+        )
+        return False
+
+    if response.status_code != 200:
+        logger.warning(
+            "[ReID] rename %s -> %s HTTP %s: %s",
+            old_plate, new_plate, response.status_code, response.text[:200],
+        )
+        return False
+    logger.info("[ReID] renamed %s -> %s in VA: %s",
+                old_plate, new_plate, response.text[:200])
+    return True

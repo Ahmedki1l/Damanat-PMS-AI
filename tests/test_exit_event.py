@@ -533,3 +533,46 @@ class _NonClosing:
         if name == "close":
             return lambda: None
         return getattr(self._session, name)
+
+
+# ── the correction reaches the row the dashboard reads ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_fuzzy_matched_exit_renames_the_stay(monkeypatch, db):
+    """The stay was opened as `SNP-226`; the exit read says `SNA-226`.
+
+    Before Stage 2 the stay closed but kept the misread, so the dashboard showed
+    a car that was not there. The misread is still preserved — in
+    `hik_validations.reported_plate`, not on the row people look at.
+    """
+    from app.models.hik_validation import HikValidation
+    from app.services import plate_correction_service
+
+    monkeypatch.setattr(settings, "EXIT_HIK_RECHECK_SECONDS", 0)
+    monkeypatch.setattr(entry_exit_service, "facility_now_naive", lambda: EXIT_TIME)
+    sent = []
+    monkeypatch.setattr(
+        "app.utils.va_reid_client.rename",
+        lambda old, new: sent.append((old, new)) or _true(),
+    )
+    stay = _open_session(db, "SNP-226")
+    _hik_returns(monkeypatch)
+
+    await entry_exit_service.handle_anpr_event(_exit_event("SNA-226"), db)
+    db.commit()
+    await exit_pipeline.drain_late_rechecks()
+
+    db.refresh(stay)
+    assert stay.status == "closed"
+    assert stay.plate_number == "SNA-226", "the dashboard must show the real car"
+    ledger = db.query(HikValidation).filter(
+        HikValidation.session_id == stay.id
+    ).one()
+    assert ledger.reported_plate == "SNP-226"
+    assert ledger.guid.startswith(plate_correction_service.LOCAL_GUID_PREFIX)
+    assert sent == [("SNP-226", "SNA-226")], "VA must be told, after the commit"
+
+
+async def _true():
+    return True

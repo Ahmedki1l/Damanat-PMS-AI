@@ -256,9 +256,17 @@ def close_matched_session(
     the entry read was wrong. `exit_match_service` resolves the stay by other
     means (digit group, truncation, appearance) and hands the row here.
 
-    The session's plate is deliberately left alone: the misread stays in the
-    audit trail as the only evidence that can later prove the match right or
-    wrong. `exit_camera_id` records which camera closed it.
+    The session's plate is NOT rewritten here. That is `plate_correction_service`
+    — ledger row, entry log, vehicle merge, VA gallery rename — and it is one
+    transactional unit the caller applies alongside this close.
+
+    Until 2026-08-18 the misread was deliberately KEPT on the session, as "the
+    only evidence that can later prove the match right or wrong". It is still
+    the only such evidence and it is still preserved, but in
+    `hik_validations.reported_plate` rather than on the row the dashboard reads.
+    Preserving evidence and displaying it are different jobs; doing both with one
+    field meant every fuzzy-matched exit left a car on screen that was not there.
+    `exit_camera_id` records which camera closed it.
     """
     logger.warning(
         "[ParkingSession] Closing session id=%s plate=%s from an exit read as a "
