@@ -26,6 +26,7 @@ from app.services import (
     parking_session_service,
 )
 from app.services.event_parser import ParsedCameraEvent
+from app.services.hikcentral import validation
 from app.services.hikcentral.models import VehicleLogRecord
 
 FTZ = timezone(timedelta(hours=3))
@@ -362,3 +363,173 @@ async def test_a_refused_close_leaves_the_stay_open_and_writes_no_duration(
     row = db.query(EntryExitLog).filter(EntryExitLog.gate == "exit").one()
     assert row.plate_number == "SNA-226"
     assert row.parking_duration is None
+
+
+# ── a plate that reached HikCentral after we asked ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_corrects_the_edge_row_instead_of_duplicating_it(
+    monkeypatch, db
+):
+    """One car leaving must never produce two exit rows.
+
+    The exit fires at T and HikCentral has not ingested the pass yet, so the
+    misread stands. Minutes later the sweep sees the pass, `same_vehicle_plate`
+    cannot tie `KXR-2538` to `AAA-2538`, and before this it wrote a SECOND exit
+    row for the same car at the same second — a phantom exit in every count.
+    """
+    _open_session(db, "KXR-2538")
+    monkeypatch.setattr(settings, "HIK_RECONCILE_MATCH_SECONDS", 60.0)
+    monkeypatch.setattr(settings, "EXIT_HIK_RECHECK_SECONDS", 0)  # sweep only
+    monkeypatch.setattr(entry_exit_service, "facility_now_naive", lambda: EXIT_TIME)
+
+    # 1. The car leaves. The platform has nothing yet.
+    _hik_returns(monkeypatch)
+    await entry_exit_service.handle_anpr_event(_exit_event("AAA-2538"), db)
+    db.commit()
+    assert db.query(ParkingSession).one().status == "closed", (
+        "the digit-group rule already closes this one on the misread"
+    )
+
+    # 2. Minutes later the sweep finds the pass the platform has now ingested.
+    async def fake_list(resource_ids, begin, end, db):
+        return [_hik_record("LATE-1", "2538KXR", EXIT_TIME)]
+
+    async def fake_images(outcome):
+        from app.services.hikcentral.models import HikImages
+        return HikImages()
+
+    monkeypatch.setattr(hikcentral, "list_unconsumed_records", fake_list)
+    monkeypatch.setattr(hikcentral, "download_hik_images", fake_images)
+    monkeypatch.setattr(
+        entry_exit_service, "facility_now_naive",
+        lambda: EXIT_TIME + timedelta(minutes=5),
+    )
+    await entry_exit_service._reconcile_missed_exits(
+        db, window=(EXIT_TIME - timedelta(hours=1), EXIT_TIME + timedelta(minutes=5))
+    )
+    db.commit()
+
+    rows = db.query(EntryExitLog).filter(EntryExitLog.gate == "exit").all()
+    assert len(rows) == 1, "the late plate must correct the row, not add one"
+    assert rows[0].plate_number == "KXR-2538"
+
+
+@pytest.mark.asyncio
+async def test_two_exits_in_the_window_are_too_ambiguous_to_adopt(monkeypatch, db):
+    """Time alone is only evidence when it names ONE car.
+
+    Two cars queued at the gate inside the match window: nothing says which of
+    them the late pass belongs to, so it falls back to being treated as a missed
+    exit. A duplicate row is cheap; attaching a stranger's plate to an exit is not.
+    """
+    monkeypatch.setattr(settings, "HIK_RECONCILE_MATCH_SECONDS", 60.0)
+    monkeypatch.setattr(settings, "EXIT_HIK_RECHECK_SECONDS", 0)
+    monkeypatch.setattr(entry_exit_service, "facility_now_naive", lambda: EXIT_TIME)
+
+    _hik_returns(monkeypatch)
+    await entry_exit_service.handle_anpr_event(_exit_event("AAA-2538"), db)
+    await entry_exit_service.handle_anpr_event(
+        _exit_event("BBB-7777", at=EXIT_TIME + timedelta(seconds=20)), db
+    )
+    db.commit()
+
+    assert exit_pipeline.exit_row_for_late_pass(
+        db, EXIT_TIME, timedelta(seconds=60)
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_a_row_already_backed_by_a_pass_is_not_adopted_twice(monkeypatch, db):
+    """One HikCentral pass, one exit row. A second pass in the same window must
+    not overwrite a row the first one already claimed."""
+    monkeypatch.setattr(settings, "EXIT_HIK_RECHECK_SECONDS", 0)
+    monkeypatch.setattr(entry_exit_service, "facility_now_naive", lambda: EXIT_TIME)
+    _hik_returns(monkeypatch)
+    await entry_exit_service.handle_anpr_event(_exit_event("AAA-2538"), db)
+    db.commit()
+
+    row = db.query(EntryExitLog).filter(EntryExitLog.gate == "exit").one()
+    hikcentral.record_hik_validation(
+        db,
+        outcome=hikcentral.polled_outcome(_hik_record("CLAIM-1", "2538KXR")),
+        direction=hikcentral.DIRECTION_EXIT,
+        entry_exit_log_id=row.id,
+    )
+    db.commit()
+
+    assert exit_pipeline.exit_row_for_late_pass(
+        db, EXIT_TIME, timedelta(seconds=60)
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_the_deferred_recheck_corrects_the_row_and_consumes_the_guid(
+    monkeypatch, db
+):
+    """The second ask, 15s later — here with the delay collapsed to zero.
+
+    Measured: every successful lookup in ai-logs.txt landed 7-44s after its pass
+    because the entry path waits for a crossing first. The exit path asks at
+    ~2-3s, so an empty answer is "not yet", not "never".
+    """
+    monkeypatch.setattr(settings, "EXIT_HIK_RECHECK_SECONDS", 0.01)
+    monkeypatch.setattr(entry_exit_service, "facility_now_naive", lambda: EXIT_TIME)
+    _open_session(db, "KXR-2538")
+
+    # The exit path's own lookup finds nothing; the recheck finds the pass.
+    answers = [[], [_hik_record("LATE-2", "2538KXR")]]
+
+    async def _query(**kwargs):
+        return answers.pop(0) if answers else []
+
+    monkeypatch.setattr(
+        "app.services.hikcentral.client.query_vehicle_logs", _query
+    )
+    # The detached task opens its own session; point it at this one.
+    monkeypatch.setattr(
+        "app.database.SessionLocal", lambda: _NonClosing(db)
+    )
+
+    await entry_exit_service.handle_anpr_event(_exit_event("AAA-2538"), db)
+    db.commit()
+    await exit_pipeline.drain_late_rechecks()
+
+    row = db.query(EntryExitLog).filter(EntryExitLog.gate == "exit").one()
+    assert row.plate_number == "KXR-2538", "the late plate must reach the audit row"
+    assert validation.guid_already_used(db, "LATE-2"), (
+        "the recheck must consume the pass, or the sweep redoes it as a duplicate"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_recheck_is_scheduled_when_the_platform_already_answered(
+    monkeypatch, db
+):
+    """A pass HikCentral HAS and disagrees about is a settled answer — asking the
+    same question again is load with no possible new information."""
+    monkeypatch.setattr(settings, "EXIT_HIK_RECHECK_SECONDS", 30)
+    _hik_returns(monkeypatch, _hik_record("G-7", "5625JKB"))
+
+    built = await exit_pipeline.from_camera_event(
+        _exit_event(), "JKA-5625", EXIT_TIME, db
+    )
+
+    assert built.hik_reason == "plate_corrected"
+    assert not built.plate_may_still_arrive
+    exit_pipeline.schedule_late_plate_recheck(built, 1)
+    assert not exit_pipeline._late_rechecks
+
+
+class _NonClosing:
+    """A SessionLocal stand-in that hands out the test's session and ignores
+    `close()`, so a detached task can be observed after it finishes."""
+
+    def __init__(self, session):
+        self._session = session
+
+    def __getattr__(self, name):
+        if name == "close":
+            return lambda: None
+        return getattr(self._session, name)

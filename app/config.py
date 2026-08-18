@@ -765,6 +765,21 @@ class Settings(BaseSettings):
     HIK_QUERY_TIME_SHIFT_HOURS: float = Field(
         default=6.0, ge=-24.0, le=24.0, allow_inf_nan=False,
     )
+    # How long after an exit read to ask HikCentral a SECOND time, when the
+    # first lookup found no record for the pass at all.
+    #
+    # Measured on ai-logs.txt (8/10-8/16): 129 entry validations, zero misses —
+    # but the entry path asks LATE. It waits for the ramp crossing and the burst
+    # debounce, so its lookups land 7-44s after the pass (p50 12s). The exit path
+    # has nothing to wait for and asks at ~2-3s, earlier than any measurement in
+    # that set: 129/129 proves the record exists by 7s, and says nothing about 2s.
+    #
+    # Widening HIK_QUERY_LOOKBACK_SECONDS cannot cover this. That window is in
+    # RECORD time — it decides which passes match, not whether the platform has
+    # written one yet. Only asking again does. 0 disables the second ask.
+    EXIT_HIK_RECHECK_SECONDS: float = Field(
+        default=15.0, ge=0, le=300.0, allow_inf_nan=False,
+    )
     # A HikCentral record may only be paired with a gate event this far away.
     HIK_MATCH_MAX_SKEW_SECONDS: float = Field(
         default=10.0, gt=0, le=120.0, allow_inf_nan=False,

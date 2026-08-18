@@ -23,15 +23,19 @@ The caller still owns its own audit row, its own alerts and its own VA forward �
 those genuinely differ between a live exit and a five-day-old recovered one.
 """
 
+import asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from app.config import settings
+from app.models.entry_exit_log import EntryExitLog
+from app.models.hik_validation import HikValidation
 from app.models.parking_session import ParkingSession
 from app.models.vehicle import Vehicle
-from app.services import exit_match_service, parking_session_service
+from app.services import exit_match_service, parking_session_service, vehicle_service
 from app.services.hikcentral.models import HikOutcome
 from app.utils.logger import get_logger
 
@@ -49,6 +53,16 @@ SOURCE_HIK_RECONCILE = "hik_reconcile"
 # in the audit trail.
 RECONCILE_CAMERA_ID = "CAM-EXIT"
 
+# `_validate_plate`'s answer when the platform held NO pass in the window at all
+# — as opposed to holding one that disagreed. The distinction is the whole basis
+# of the second ask: a record that does not exist yet may exist in 15 seconds; a
+# record that exists and disagrees will not change its mind.
+NO_HIK_RECORD = "no_hik_record"
+
+# Detached late-plate rechecks, kept referenced so they cannot be garbage
+# collected mid-sleep. Same discipline as `_background_forwards`.
+_late_rechecks: set = set()
+
 
 @dataclass(frozen=True)
 class ExitEvent:
@@ -65,10 +79,19 @@ class ExitEvent:
     snapshot_path: Optional[str]
     source: str
     hik_guid: Optional[str] = None
+    # Why the plate is what it is. Only one value is acted on — `no_hik_record`
+    # means the platform held nothing for this pass, which is the one case a
+    # second ask can still change (see `schedule_late_plate_recheck`). Everything
+    # else is a settled answer: it looked and disagreed, or it was never asked.
+    hik_reason: Optional[str] = None
 
     @property
     def from_reconcile(self) -> bool:
         return self.source == SOURCE_HIK_RECONCILE
+
+    @property
+    def plate_may_still_arrive(self) -> bool:
+        return self.hik_reason == NO_HIK_RECORD
 
 
 @dataclass(frozen=True)
@@ -125,6 +148,7 @@ async def from_camera_event(
         snapshot_path=event.snapshot_path,
         source=SOURCE_EDGE,
         hik_guid=outcome.guid,
+        hik_reason=outcome.reason,
     )
 
 
@@ -219,3 +243,186 @@ async def resolve(
         event.source, resolution.reason,
     )
     return ExitOutcome(session=session, match=resolution)
+
+
+# ── a plate that arrived after we asked ─────────────────────────────────────
+
+
+def exit_row_for_late_pass(
+    db: Session, pass_time: datetime, window: timedelta
+) -> Optional[EntryExitLog]:
+    """The exit audit row a HikCentral pass belongs to, matched on TIME alone.
+
+    Callers reach this only after a plate match has already failed, so what it
+    answers is: "the platform says a car left at 09:00 and we logged a car
+    leaving at 09:00 under a different string — are they the same car?"
+
+    Usually yes, and the disagreement is the misread this pass exists to correct.
+    Which is exactly why the sweep could not see it: `same_vehicle_plate` ties
+    truncations together, not two genuinely different strings, so a corrected
+    plate looked like a car nobody had logged and earned a SECOND exit row for
+    one car leaving once.
+
+    Requires EXACTLY ONE row in the window, the same discipline
+    `recover_entry_plate` uses: with two cars in the window nothing says which of
+    them this pass belongs to, and attaching a stranger's plate to an exit is
+    worse than the duplicate row. A row already backed by another HikCentral pass
+    is likewise off limits — one pass, one row.
+    """
+    rows = (
+        db.query(EntryExitLog)
+        .filter(
+            EntryExitLog.gate == "exit",
+            EntryExitLog.event_time >= pass_time - window,
+            EntryExitLog.event_time <= pass_time + window,
+        )
+        .all()
+    )
+    if len(rows) != 1:
+        if rows:
+            logger.info(
+                "[Exit] %d exit rows within %s of %s — too ambiguous to adopt a "
+                "late plate; treating the pass as unlogged",
+                len(rows), window, pass_time,
+            )
+        return None
+
+    row = rows[0]
+    already_backed = (
+        db.query(HikValidation.id)
+        .filter(HikValidation.entry_exit_log_id == row.id)
+        .first()
+    )
+    if already_backed:
+        logger.info(
+            "[Exit] exit row id=%s already carries a HikCentral pass — not "
+            "adopting a second one",
+            row.id,
+        )
+        return None
+    return row
+
+
+def adopt_late_plate(db: Session, row: EntryExitLog, plate: str) -> Optional[str]:
+    """Rewrite one exit audit row to the plate HikCentral eventually reported.
+
+    Returns the misread it replaced, or None when there was nothing to change.
+
+    Scope is deliberately ONE row. The stay this exit closed may still stand
+    under the misread, and rewriting that is a different operation — ledger row,
+    vehicle merge, VA gallery rename — which `plate_correction_service` owns.
+    Doing half of it here would leave VA re-minting the wrong plate while the
+    audit trail claimed it was fixed.
+    """
+    misread = row.plate_number
+    if not plate or misread == plate:
+        return None
+
+    vehicle = vehicle_service.ensure_unregistered_vehicle(db, plate)
+    row.plate_number = plate
+    if vehicle is not None:
+        row.vehicle_id = vehicle.id
+        row.vehicle_type = vehicle.vehicle_type
+    logger.warning(
+        "[Exit] late HikCentral plate adopted on exit row id=%s: %s -> %s",
+        row.id, misread, plate,
+    )
+    return misread
+
+
+def schedule_late_plate_recheck(event: ExitEvent, exit_log_id: Optional[int]) -> None:
+    """Ask HikCentral once more, later, when it had nothing the first time.
+
+    The exit path asks at ~2-3s after the pass. Every successful lookup in
+    ai-logs.txt landed 7-44s after its pass (p50 12s) because the entry path
+    waits for a crossing and a debounce first — so an empty answer at 2s is not
+    evidence the platform will never have the record, only that it does not have
+    it yet. Detached rather than awaited: the gate must not wait 15s for a second
+    opinion on a plate the exit camera already read correctly 97% of the time.
+    """
+    if not event.plate_may_still_arrive:
+        return
+    if settings.EXIT_HIK_RECHECK_SECONDS <= 0:
+        return
+    task = asyncio.create_task(_recheck_late_plate(event, exit_log_id))
+    _late_rechecks.add(task)
+    task.add_done_callback(_late_rechecks.discard)
+
+
+async def drain_late_rechecks(cancel: bool = False) -> None:
+    """Wait for detached rechecks. `cancel` at shutdown — a clean stop must not
+    block for the recheck delay, and the reconcile sweep is the durable path for
+    anything dropped here."""
+    if not _late_rechecks:
+        return
+    tasks = list(_late_rechecks)
+    if cancel:
+        for task in tasks:
+            task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _recheck_late_plate(event: ExitEvent, exit_log_id: Optional[int]) -> None:
+    """One deferred lookup, on its own session. Never raises into the loop."""
+    from app.database import SessionLocal
+    from app.services import hikcentral
+
+    await asyncio.sleep(settings.EXIT_HIK_RECHECK_SECONDS)
+
+    db = SessionLocal()
+    try:
+        outcome = await hikcentral.validate_exit_plate(
+            event.plate, event.event_time, db
+        )
+        if not outcome.matched or not outcome.plate or outcome.plate == event.plate:
+            logger.info(
+                "[Exit] late recheck for %s at %s: %s — nothing to correct",
+                event.plate, event.event_time, outcome.reason,
+            )
+            return
+
+        logger.warning(
+            "[Exit] late HikCentral plate for the %s exit: %s -> %s (%s) — the "
+            "platform had no record when the car left",
+            event.event_time, event.plate, outcome.plate, outcome.reason,
+        )
+        corrected = ExitEvent(
+            plate=outcome.plate,
+            event_time=event.event_time,
+            camera_id=event.camera_id,
+            snapshot_path=event.snapshot_path,
+            source=event.source,
+            hik_guid=outcome.guid,
+            hik_reason=outcome.reason,
+        )
+        # The stay may still be open under the correct plate — the edge closed
+        # nothing, or closed the wrong thing. Re-running the resolution is the
+        # whole value of asking again.
+        result = await resolve(db, corrected, exit_image_path=event.snapshot_path)
+
+        row = db.get(EntryExitLog, exit_log_id) if exit_log_id else None
+        if row is not None:
+            adopt_late_plate(db, row, outcome.plate)
+        # Consume the GUID so the reconcile sweep does not redo this pass and
+        # write the duplicate exit row this whole path exists to avoid.
+        hikcentral.record_hik_validation(
+            db,
+            outcome=outcome,
+            direction=hikcentral.DIRECTION_EXIT,
+            session_id=result.session.id if result.session else None,
+            entry_exit_log_id=row.id if row is not None else None,
+        )
+        db.commit()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "[Exit] late plate recheck failed for %s at %s: %r",
+            event.plate, event.event_time, exc,
+        )
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        db.close()

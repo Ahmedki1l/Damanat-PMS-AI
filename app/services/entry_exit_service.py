@@ -863,7 +863,18 @@ async def _reconcile_missed_exits(
             exit_image_path=images.vehicle_image_path,
         )
         session = result.session
-        _write_reconciled_exit_log(db, rec.canonical_plate, pass_local, images.vehicle_image_path)
+        # Before writing an audit row, ask whether the edge already wrote one for
+        # THIS pass under a different plate — the misread this record corrects.
+        # `_gate_event_already_logged` above cannot see that: it ties truncations
+        # together, not two genuinely different strings, so a corrected plate
+        # looked like a car nobody logged and earned one car a second exit row.
+        late_row = exit_pipeline.exit_row_for_late_pass(db, pass_local, match_s)
+        if late_row is not None:
+            exit_pipeline.adopt_late_plate(db, late_row, rec.canonical_plate)
+        else:
+            _write_reconciled_exit_log(
+                db, rec.canonical_plate, pass_local, images.vehicle_image_path
+            )
         # Consume the GUID (unique) so a later sweep never redoes this exit.
         hikcentral.record_hik_validation(
             db,
@@ -871,11 +882,14 @@ async def _reconcile_missed_exits(
             direction=hikcentral.DIRECTION_EXIT,
             images=images,
             session_id=session.id if session else None,
+            entry_exit_log_id=late_row.id if late_row is not None else None,
         )
         db.commit()
         logger.warning(
             "[Hik][reconcile] %s plate=%s guid=%s at %s",
-            "CLOSED missed exit" if session else "logged exit (no open session)",
+            "CORRECTED the edge exit row" if late_row is not None
+            else "CLOSED missed exit" if session
+            else "logged exit (no open session)",
             rec.canonical_plate, rec.guid, pass_local,
         )
     if consumed:
@@ -1219,9 +1233,15 @@ async def drain_background_forwards() -> None:
     """Wait for any detached confirmation forwards to finish.
 
     Called on shutdown so a clean stop doesn't drop an in-flight image, and by
-    tests that need to observe the result of a detached forward."""
+    tests that need to observe the result of a detached forward.
+
+    Late-plate rechecks are CANCELLED rather than awaited: they sit in a
+    multi-second sleep by design, and a clean stop must not block on one. The
+    reconcile sweep re-finds anything dropped here, which is the whole reason it
+    can now adopt a late plate onto an existing exit row."""
     if _background_forwards:
         await asyncio.gather(*list(_background_forwards), return_exceptions=True)
+    await exit_pipeline.drain_late_rechecks(cancel=True)
 
 
 async def _forward_confirm_snapshot(plate: str, source_cam: str,
@@ -1461,6 +1481,11 @@ async def handle_anpr_event(
 
     if log_entry.id is None:
         db.flush()
+
+    # HikCentral held nothing for this pass when we asked, 2-3s after the car
+    # passed. Ask once more after it has had time to ingest — detached, so the
+    # gate is never made to wait for a second opinion.
+    exit_pipeline.schedule_late_plate_recheck(exit_event, log_entry.id)
 
     # Network delivery is intentionally deferred until the router commits.
     # SQL Server transaction-owned application locks are released by that
