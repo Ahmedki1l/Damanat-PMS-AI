@@ -89,6 +89,20 @@ class ExitEvent:
     # second ask can still change (see `schedule_late_plate_recheck`). Everything
     # else is a settled answer: it looked and disagreed, or it was never asked.
     hik_reason: Optional[str] = None
+    # The evidence behind `plate`, kept so the caller can write the ledger row
+    # once its audit row has an id. Without it a HikCentral correction applied on
+    # the live edge path would exist only in a log line — and the misread it
+    # replaced is the whole thing the ledger exists to preserve.
+    hik_outcome: Optional[HikOutcome] = None
+
+    @property
+    def corrected_by_hik(self) -> bool:
+        """The platform disagreed with the camera and its answer was taken."""
+        return (
+            self.hik_outcome is not None
+            and self.hik_outcome.matched
+            and (self.hik_outcome.reported_plate or "") != self.plate
+        )
 
     @property
     def from_reconcile(self) -> bool:
@@ -158,6 +172,7 @@ async def from_camera_event(
         source=SOURCE_EDGE,
         hik_guid=outcome.guid,
         hik_reason=outcome.reason,
+        hik_outcome=outcome,
     )
 
 

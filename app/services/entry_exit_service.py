@@ -1538,6 +1538,19 @@ async def handle_anpr_event(
     # HikCentral held nothing for this pass when we asked, 2-3s after the car
     # passed. Ask once more after it has had time to ingest — detached, so the
     # gate is never made to wait for a second opinion.
+    # The ledger row for a plate HikCentral corrected at the gate. Written here
+    # rather than in `from_camera_event` because it needs the audit row's id, and
+    # that only exists once the row is flushed. Consuming the GUID also stops the
+    # reconcile sweep re-examining a pass the edge already handled.
+    if exit_event.corrected_by_hik:
+        hikcentral.record_hik_validation(
+            db,
+            outcome=exit_event.hik_outcome,
+            direction=hikcentral.DIRECTION_EXIT,
+            session_id=closed.id if closed is not None else None,
+            entry_exit_log_id=log_entry.id,
+        )
+
     exit_pipeline.schedule_late_plate_recheck(exit_event, log_entry.id)
 
     # VA is told about a correction only once it is durable. The router commits

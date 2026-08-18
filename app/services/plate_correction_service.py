@@ -176,13 +176,26 @@ async def notify_va(correction: Optional[Correction]) -> bool:
     correction that is already durable — telling it first and then rolling back
     would leave VA holding a plate PMS-AI never adopted.
 
-    Never raises. VA down does not fail a correction that has already landed.
+    Never raises, and the guard is here rather than only in the client: the
+    client catches httpx's own transport errors, but a refused connection, a TLS
+    failure outside that hierarchy or a bug in the client would otherwise escape.
+    The reconcile sweep AWAITS this directly after its commit, so an escape there
+    would abandon the remaining records of a catch-up chunk — one VA hiccup
+    costing a whole sweep, long after the correction it was reporting is durable.
     """
     if correction is None or not correction.applied:
         return False
     from app.utils import va_reid_client
 
-    return await va_reid_client.rename(correction.misread, correction.plate)
+    try:
+        return await va_reid_client.rename(correction.misread, correction.plate)
+    except Exception as exc:
+        logger.warning(
+            "[Correction] VA was not told about %s -> %s: %r. The correction "
+            "stands; the exit sweep re-applies it.",
+            correction.misread, correction.plate, exc,
+        )
+        return False
 
 
 def _guid_taken(db: Session, guid: str) -> bool:
