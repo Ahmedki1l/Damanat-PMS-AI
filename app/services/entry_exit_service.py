@@ -773,10 +773,16 @@ async def _reconcile_missed_entries(
     # a record mid-way through raises, consuming the NEWEST first would leave
     # the watermark ahead of older unprocessed records in the same chunk — no
     # later sweep looks behind the watermark, so they would be lost silently.
+    consumed = 0
     for rec in sorted(records, key=lambda r: hikcentral.polled_outcome(r).pass_time_local):
         outcome = hikcentral.polled_outcome(rec)
         pass_local = outcome.pass_time_local
         if _gate_event_already_logged(db, rec.canonical_plate, "entry", pass_local, match_s):
+            # Nothing to repair — but consume it, or the watermark never advances
+            # on a healthy day and the next sweep re-walks this same span.
+            if hikcentral.consume_already_logged(db, rec, hikcentral.DIRECTION_ENTRY):
+                db.commit()
+                consumed += 1
             continue
         if not hikcentral.is_authoritative():
             logger.warning(
@@ -797,6 +803,12 @@ async def _reconcile_missed_entries(
         logger.warning(
             "[Hik][reconcile] OPENED missed entry plate=%s guid=%s at %s",
             rec.canonical_plate, rec.guid, pass_local,
+        )
+    if consumed:
+        logger.info(
+            "[Hik][reconcile] entry: %d pass(es) already logged by the edge — "
+            "consumed, watermark advanced to %s",
+            consumed, _catchup_watermark(db, hikcentral.DIRECTION_ENTRY),
         )
 
 
@@ -820,10 +832,16 @@ async def _reconcile_missed_exits(
     # a record mid-way through raises, consuming the NEWEST first would leave
     # the watermark ahead of older unprocessed records in the same chunk — no
     # later sweep looks behind the watermark, so they would be lost silently.
+    consumed = 0
     for rec in sorted(records, key=lambda r: hikcentral.polled_outcome(r).pass_time_local):
         outcome = hikcentral.polled_outcome(rec)
         pass_local = outcome.pass_time_local
         if _gate_event_already_logged(db, rec.canonical_plate, "exit", pass_local, match_s):
+            # Nothing to repair — but consume it, or the watermark never advances
+            # on a healthy day and the next sweep re-walks this same span.
+            if hikcentral.consume_already_logged(db, rec, hikcentral.DIRECTION_EXIT):
+                db.commit()
+                consumed += 1
             continue
         if not hikcentral.is_authoritative():
             logger.warning(
@@ -854,6 +872,12 @@ async def _reconcile_missed_exits(
             "[Hik][reconcile] %s plate=%s guid=%s at %s",
             "CLOSED missed exit" if session else "logged exit (no open session)",
             rec.canonical_plate, rec.guid, pass_local,
+        )
+    if consumed:
+        logger.info(
+            "[Hik][reconcile] exit: %d pass(es) already logged by the edge — "
+            "consumed, watermark advanced to %s",
+            consumed, _catchup_watermark(db, hikcentral.DIRECTION_EXIT),
         )
 
 

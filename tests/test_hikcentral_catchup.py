@@ -7,7 +7,7 @@ only see the tail of it when the service came back. Every stranded session
 surfaced on the dashboard as a 24h+ overstay for a car that had driven home.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -15,6 +15,8 @@ from app.config import settings
 from app.models.hik_validation import HikValidation
 from app.services import entry_exit_service as ees
 from app.services import hikcentral
+
+FTZ = timezone(timedelta(hours=3))
 
 
 @pytest.fixture
@@ -143,6 +145,161 @@ async def test_a_long_gap_is_swept_in_chunks(db_session, monkeypatch):
     # contiguous, no holes
     for earlier, later in zip(windows, windows[1:]):
         assert earlier[1] == later[0]
+
+
+# ── the watermark must advance on a HEALTHY sweep, not only on a repair ─────
+
+
+def _hik_record(guid, plate, cross_time):
+    from app.services.hikcentral.models import VehicleLogRecord
+
+    return VehicleLogRecord.from_openapi_record({
+        "crossRecordSyscode": guid,
+        "cameraIndexCode": "510",
+        "plateNo": plate,
+        "crossTime": cross_time.replace(tzinfo=FTZ).isoformat(),
+        "vehiclePicUri": "Vsm://v",
+    })
+
+
+def _edge_logged(db, plate, when, gate):
+    from app.models.entry_exit_log import EntryExitLog
+
+    db.add(EntryExitLog(
+        plate_number=plate, gate=gate, event_time=when, camera_id="CAM-EXIT",
+    ))
+    db.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_exit_sweep_advances_the_watermark(db_session, monkeypatch):
+    """The 2026-08-11..16 outage: every exit the sweep saw was already logged by
+    the edge, so it consumed nothing, so `MAX(pass_time)` never moved. The
+    watermark froze at the last repair, drifted past HIK_CATCHUP_MAX_HOURS, and
+    every later sweep re-walked the whole cap window and found nothing — while a
+    genuine gap older than the cap became permanently unreachable. Five days of
+    exits were never recovered.
+
+    A sweep that examines a pass and finds nothing to do must still consume it.
+    """
+    now = datetime(2026, 8, 16, 9, 0, 0)
+    monkeypatch.setattr(ees, "facility_now_naive", lambda: now)
+    monkeypatch.setattr(settings, "HIK_VALIDATION_MODE", "authoritative")
+    monkeypatch.setattr(settings, "HIK_RECONCILE_MATCH_SECONDS", 30.0)
+
+    pass_time = now - timedelta(hours=2)
+    # The edge already logged this exit — the sweep has nothing to repair.
+    _edge_logged(db_session, "JKA-5625", pass_time, "exit")
+
+    async def fake_list(resource_ids, begin, end, db):
+        return [_hik_record("G-1", "5625JKA", pass_time)]
+
+    monkeypatch.setattr(hikcentral, "list_unconsumed_records", fake_list)
+
+    assert ees._catchup_watermark(db_session, hikcentral.DIRECTION_EXIT) is None
+
+    await ees._reconcile_missed_exits(db_session, window=(now - timedelta(hours=3), now))
+
+    assert ees._catchup_watermark(db_session, hikcentral.DIRECTION_EXIT) == pass_time, (
+        "an already-logged pass must still be consumed, or the watermark freezes "
+        "and every later sweep re-walks the full cap window for nothing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_consumed_pass_is_not_re_examined_by_the_next_sweep(db_session, monkeypatch):
+    """Consuming is what makes overlapping windows cheap: the same pass must drop
+    out of `list_unconsumed_records` on every later sweep."""
+    from app.services.hikcentral import validation
+
+    now = datetime(2026, 8, 16, 9, 0, 0)
+    monkeypatch.setattr(settings, "HIK_VALIDATION_MODE", "authoritative")
+    pass_time = now - timedelta(hours=2)
+    record = _hik_record("G-1", "5625JKA", pass_time)
+
+    assert validation.consume_already_logged(
+        db_session, record, hikcentral.DIRECTION_EXIT
+    ) == "G-1"
+    db_session.commit()
+
+    assert validation.guid_already_used(db_session, "G-1") is True
+    # Idempotent: a second sweep seeing the same record must not double-write.
+    assert validation.consume_already_logged(
+        db_session, record, hikcentral.DIRECTION_EXIT
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_missed_exit_is_still_repaired_not_just_consumed(
+    db_session, monkeypatch
+):
+    """The consume path must never swallow a pass the sweep should have acted on —
+    that would turn a stranded session into a permanently stranded one."""
+    from app.models.entry_exit_log import EntryExitLog
+
+    now = datetime(2026, 8, 16, 9, 0, 0)
+    monkeypatch.setattr(ees, "facility_now_naive", lambda: now)
+    monkeypatch.setattr(settings, "HIK_VALIDATION_MODE", "authoritative")
+    monkeypatch.setattr(settings, "HIK_RECONCILE_MATCH_SECONDS", 30.0)
+
+    pass_time = now - timedelta(hours=2)
+    # No edge log at all — this car's exit was missed entirely.
+
+    async def fake_list(resource_ids, begin, end, db):
+        return [_hik_record("G-2", "5625JKA", pass_time)]
+
+    async def fake_images(outcome):
+        from app.services.hikcentral.models import HikImages
+        return HikImages()
+
+    monkeypatch.setattr(hikcentral, "list_unconsumed_records", fake_list)
+    monkeypatch.setattr(hikcentral, "download_hik_images", fake_images)
+
+    await ees._reconcile_missed_exits(db_session, window=(now - timedelta(hours=3), now))
+
+    rows = db_session.query(EntryExitLog).filter(EntryExitLog.gate == "exit").all()
+    assert len(rows) == 1 and rows[0].plate_number == "JKA-5625", (
+        "a missed exit must still produce its audit row"
+    )
+    marks = db_session.query(HikValidation).filter(
+        HikValidation.guid == "G-2"
+    ).all()
+    assert len(marks) == 1 and marks[0].match_reason != "edge_already_logged", (
+        "a repaired pass must be recorded as a repair, not as already-logged"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_consumes_already_logged_but_not_missed(
+    db_session, monkeypatch
+):
+    """Shadow suffers the identical freeze, so it must consume already-logged
+    passes too — but a pass it only WOULD have acted on stays unconsumed, so
+    flipping to authoritative can still repair it."""
+    now = datetime(2026, 8, 16, 9, 0, 0)
+    monkeypatch.setattr(ees, "facility_now_naive", lambda: now)
+    monkeypatch.setattr(settings, "HIK_VALIDATION_MODE", "shadow")
+    monkeypatch.setattr(settings, "HIK_RECONCILE_MATCH_SECONDS", 30.0)
+
+    seen = now - timedelta(hours=2)
+    missed = now - timedelta(hours=1)
+    _edge_logged(db_session, "JKA-5625", seen, "exit")
+
+    async def fake_list(resource_ids, begin, end, db):
+        return [
+            _hik_record("G-SEEN", "5625JKA", seen),
+            _hik_record("G-MISSED", "1111ZZT", missed),
+        ]
+
+    monkeypatch.setattr(hikcentral, "list_unconsumed_records", fake_list)
+
+    await ees._reconcile_missed_exits(db_session, window=(now - timedelta(hours=3), now))
+
+    guids = {g for (g,) in db_session.query(HikValidation.guid).all()}
+    assert guids == {"G-SEEN"}, (
+        "shadow must consume the already-logged pass and leave the missed one "
+        f"for authoritative mode to repair; got {guids}"
+    )
 
 
 @pytest.mark.asyncio

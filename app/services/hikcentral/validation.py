@@ -43,6 +43,11 @@ DIRECTION_EXIT = "exit"
 # enter" — the reconciler must only ever act on the first.
 REFUSED_NO_CROSSING = "edge_refused_no_crossing"
 
+# `match_reason` for a pass the reconciler examined and found the edge pipeline
+# had already logged. See `consume_already_logged` — this row exists to move the
+# catch-up watermark, not to record a decision.
+ALREADY_LOGGED = "edge_already_logged"
+
 
 def _enabled() -> bool:
     return settings.HIK_VALIDATION_MODE != "off"
@@ -461,6 +466,66 @@ async def list_unconsumed_records(
         for r in records
         if r.canonical_plate and not guid_already_used(db, r.guid)
     ]
+
+
+def consume_already_logged(
+    db: Optional[Session],
+    record: Optional[VehicleLogRecord],
+    direction: str,
+) -> Optional[str]:
+    """Consume a pass the reconciler examined and found the edge already logged.
+
+    THE WATERMARK ONLY MOVES ON WHAT IT CONSUMES. `_catchup_watermark` reads
+    `MAX(hik_validations.pass_time)` for the direction, and until this existed the
+    sweeps wrote a row only when they REPAIRED something. A healthy day repairs
+    nothing, so the watermark froze at the last failure and then drifted past
+    `HIK_CATCHUP_MAX_HOURS`. From that moment every sweep re-walked the entire cap
+    window in chunks — dozens of platform queries per trigger that could never
+    find anything, each sweep outliving the debounce so the next real trigger was
+    dropped as "already running", while a genuine gap older than the cap sat
+    permanently out of reach. Production ran in exactly that state from
+    2026-08-11 to 2026-08-16 and recovered no exit at all in those five days;
+    SNA-226 left during the 2026-08-14 ingest blackout and was still reported
+    inside 75 hours later.
+
+    Recording `matched=False` is the same mechanism `consume_refused_entry` uses:
+    the GUID is unique, so `list_unconsumed_records` filters this pass out of
+    every later sweep, and the row's `pass_time` carries the watermark forward.
+
+    Deliberately mode-independent, and deliberately ahead of the mode check in
+    both sweeps: "our own gate log already holds this pass" is a fact about this
+    database rather than a decision about a car, and shadow suffers the identical
+    freeze. A record the sweep would have ACTED on is never consumed here — that
+    one stays unconsumed so flipping to authoritative can still repair it.
+
+    Returns the consumed GUID, or None when there was nothing to consume.
+    """
+    if db is None or record is None or not record.guid:
+        return None
+    if guid_already_used(db, record.guid):
+        return None
+
+    db.add(
+        HikValidation(
+            session_id=None,
+            entry_exit_log_id=None,
+            direction=direction,
+            guid=record.guid,
+            plate_license=record.plate_license,
+            canonical_plate=record.canonical_plate,
+            # The edge camera is what reported this plate — HikCentral only
+            # supplies the identity of the pass being marked as seen.
+            reported_plate=None,
+            plate_source=PLATE_SOURCE_EDGE_ANPR,
+            pass_time=to_facility_naive(record.pass_time),
+            resource_id=record.resource_id,
+            resource_name=record.resource_name,
+            matched=False,
+            match_reason=ALREADY_LOGGED,
+            created_at=facility_now_naive(),
+        )
+    )
+    return record.guid
 
 
 async def consume_refused_entry(
