@@ -512,9 +512,12 @@ async def resolve_with_appearance(
     runner_up = scored[1][1] if len(scored) > 1 else 0.0
     margin = best_score - runner_up
 
-    if (
-        best_score >= settings.EXIT_MATCH_REID_MIN_SCORE
-        and margin >= settings.EXIT_MATCH_REID_MIN_MARGIN
+    # The absolute floor is opt-in: <= 0 means the margin alone decides. See
+    # EXIT_MATCH_REID_MIN_SCORE for why 0.50 was dropped (it refused a correct
+    # match at score 0.410 / margin 0.421 on 2026-08-20).
+    score_floor = settings.EXIT_MATCH_REID_MIN_SCORE
+    if margin >= settings.EXIT_MATCH_REID_MIN_MARGIN and (
+        score_floor <= 0.0 or best_score >= score_floor
     ):
         return ExitResolution(
             MATCHED,
@@ -525,10 +528,10 @@ async def resolve_with_appearance(
         )
 
     logger.info(
-        "[UC2] ReID inconclusive for %s — best=%s %.3f margin=%.3f "
-        "(need score>=%.2f margin>=%.2f)",
+        "[UC2] ReID inconclusive for %s — best=%s %.3f margin=%.3f (need %s"
+        "margin>=%.2f)",
         plate, best_plate, best_score, margin,
-        settings.EXIT_MATCH_REID_MIN_SCORE,
+        f"score>={score_floor:.2f} " if score_floor > 0.0 else "",
         settings.EXIT_MATCH_REID_MIN_MARGIN,
     )
     return ExitResolution(

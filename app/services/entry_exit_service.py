@@ -985,6 +985,71 @@ def _write_reconciled_exit_log(
         matching_entry.matched_entry_id = log_entry.id
 
 
+
+def _reconcile_stale_stays_on_reentry(
+    db: Session,
+    plate: str,
+    event_time: datetime,
+) -> None:
+    """Close stays proven obsolete by this confirmed inward crossing.
+
+    The Entry V2 twin of this lives in
+    ``entry_confirmation_service._reconcile_older_open_sessions``, but that path
+    only executes under ``ENTRY_V2_MODE=authoritative`` — shadow rewrites every
+    CONFIRMED decision to ABSTAINED and PMS returns before touching the DB. The
+    legacy burst-flush path is what actually opens stays in production, so the
+    reconciliation has to exist here too.
+
+    Never raises: a stale stay that cannot be closed must not cost the caller
+    its entry. The worst case is the status quo — one stay left open.
+    """
+    if not settings.ENTRY_REENTRY_RECONCILE_ENABLED:
+        return
+
+    # DB columns are naive facility-local (see parking_session_service._naive);
+    # normalize the same way before comparing against session.entry_time.
+    boundary = event_time
+    if boundary.tzinfo is not None:
+        boundary = boundary.astimezone(facility_tz()).replace(tzinfo=None)
+    min_age = timedelta(
+        seconds=float(settings.ENTRY_REENTRY_RECONCILE_MIN_AGE_SECONDS)
+    )
+    try:
+        stale = [
+            session
+            for session in parking_session_service.get_open_sessions(db, plate)
+            if session.entry_time < boundary - min_age
+        ]
+    except Exception:
+        logger.exception(
+            "[UC1] Could not read open stays for plate=%s — entry proceeds", plate
+        )
+        return
+
+    for session in stale:
+        try:
+            parking_session_service.reconcile_open_session_for_reentry(
+                db, session, boundary
+            )
+            logger.warning(
+                "[UC1] Re-entry closed stale stay id=%s plate=%s open since %s "
+                "(%s) — its exit was never read",
+                session.id,
+                plate,
+                session.entry_time,
+                boundary - session.entry_time,
+            )
+        except Exception:
+            logger.exception(
+                "[UC1] Could not reconcile stale stay id=%s plate=%s — leaving "
+                "it open",
+                session.id,
+                plate,
+            )
+    if stale:
+        db.flush()
+
+
 async def _flush_entry_burst(db: Session, buf: dict) -> None:
     """Write ONE entry for a burst, labeled by the LAST read (winning plate).
     Runs dedup, anti-bounce, the PMS-API forward (port 8000) and vehicle
@@ -1154,6 +1219,12 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
             created_at=facility_now_naive(),
         )
         db.add(log_entry)
+        # A confirmed inward crossing PROVES any older open stay for this plate
+        # is obsolete — the car cannot be inside twice — so close it here,
+        # before open_session gets a chance to reuse it. Without this the stay
+        # from the missed exit absorbs the new arrival and the car reads as
+        # having never left (KXR-2538, 2026-08-23 06:12, stay open since 08-20).
+        _reconcile_stale_stays_on_reentry(db, plate, event_time)
         session = parking_session_service.open_session(
             db,
             plate_number=plate,

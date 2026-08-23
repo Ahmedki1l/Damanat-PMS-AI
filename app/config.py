@@ -617,8 +617,59 @@ class Settings(BaseSettings):
     # in VA). It is a starting point for a DIFFERENT geometry — entry camera vs
     # exit camera — and should be re-measured against exits that matched on plate.
     EXIT_MATCH_REID_MIN_MARGIN: float = 0.35
-    # Absolute floor. Without it a margin can be "won" by two equally bad scores.
-    EXIT_MATCH_REID_MIN_SCORE: float = 0.50
+    # Absolute backstop, NOT the primary gate. 0.0 disables it entirely.
+    #
+    # Read MIN_MARGIN above first: 0.35 is already the measured 100%-PRECISION
+    # bar (2026-07-30 leave-one-out, 50 identities / 782 refs, cross-view: 0.10
+    # -> 97.2%, 0.20 -> 98.3%, 0.30 -> 99.5%, 0.35 -> 100%; the worst WRONG
+    # answer observed carried margin 0.317). Anything that clears the margin
+    # gate has already passed the bar the data says is safe, so this floor can
+    # only ever REMOVE true positives -- it cannot raise precision further.
+    #
+    # 0.50 did exactly that and cost a real car. 2026-08-20 16:18, the exit
+    # camera read KXR-2538's plate as the garbage string "172538J": no session
+    # matched it, ReID put the correct car at score 0.410 / margin 0.421 -- past
+    # the margin bar by 0.07 -- and the 0.50 floor refused it anyway. The stay
+    # stayed open, the car re-entered on 08-23 with the stale session still
+    # open, and it sat in a pool of 4 permanently-open sessions that WERE the
+    # entire reported garage occupancy that day.
+    #
+    # 0.30 is deliberately a backstop value, not a calibrated one: there is no
+    # absolute-score precision curve to calibrate against, and there cannot
+    # easily be one -- absolute similarity drifts with light and viewpoint,
+    # which is the whole reason the decision rides on the margin. It sits 0.11
+    # BELOW the lowest correct answer ever observed (0.410) and exists only to
+    # refuse the pathological shape the margin cannot see: one mediocre score
+    # against one terrible one, e.g. best 0.15 / runner-up -0.30 / margin 0.45,
+    # where nothing in the shortlist actually resembles the car.
+    #
+    # If you raise this, raise it from the score distribution of exits that
+    # matched on PLATE (those are known-correct), and never above 0.41.
+    EXIT_MATCH_REID_MIN_SCORE: float = 0.30
+
+    # ── Stale-stay reconciliation on re-entry (UC1, legacy path) ─────────
+    # A car that leaves without a usable exit read keeps its stay open forever;
+    # when it comes back, that stay is PROVEN obsolete -- the car cannot be
+    # inside twice. Closing it at the re-entry instant is the only automatic
+    # answer a missed exit ever gets.
+    #
+    # This duplicates, for the legacy burst-flush path, what
+    # entry_confirmation_service._reconcile_older_open_sessions does for Entry
+    # V2. It has to: V2 downgrades every CONFIRMED decision to ABSTAINED unless
+    # ENTRY_V2_MODE=authoritative, so on a shadow/off deployment -- i.e. every
+    # deployment today -- that reconciliation never runs and open_session
+    # silently REUSES the stale stay instead (see its get_latest_open_session
+    # short-circuit). Measured 2026-08-23: KXR-2538 re-entered at 06:12 with its
+    # 2026-08-20 stay still open and was merged straight back into it.
+    ENTRY_REENTRY_RECONCILE_ENABLED: bool = True
+    # Minimum age of a stay before a re-entry may close it. Guards against
+    # churning a stay that was opened moments ago -- the 30s EntryExitLog dedup
+    # above already absorbs the common double-fire, and this covers the rest
+    # without ever reaching a genuinely stale stay (the real ones in production
+    # are hours to days old). Set to 0 to reconcile any strictly-older stay.
+    ENTRY_REENTRY_RECONCILE_MIN_AGE_SECONDS: float = Field(
+        default=120.0, ge=0, le=86400.0, allow_inf_nan=False,
+    )
 
     # ── ANPR entry burst aggregation (UC1) ───────────────────────────────
     # The entry ANPR camera fires several reads for one car as it approaches

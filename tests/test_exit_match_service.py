@@ -278,8 +278,15 @@ async def test_a_thin_margin_closes_nothing(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_wide_margin_between_two_bad_scores_is_not_enough(db, monkeypatch):
-    """The absolute floor stops a margin being 'won' by two poor matches."""
+async def test_a_wide_margin_carries_a_modest_best_score(db, monkeypatch):
+    """A clear winner matches even when its absolute score is unremarkable.
+
+    These numbers are the real 2026-08-20 16:18 exit: the camera read
+    KXR-2538's plate as "172538J", ReID put the correct car at 0.410 with a
+    0.42 margin, and the old 0.50 absolute floor refused it. The stay stayed
+    open for three days. The margin is the evidence; see
+    EXIT_MATCH_REID_MIN_SCORE.
+    """
     open_session(db, "KXR-2538")
     open_session(db, "ZZT-2538")
 
@@ -289,10 +296,31 @@ async def test_a_wide_margin_between_two_bad_scores_is_not_enough(db, monkeypatc
     monkeypatch.setattr("app.utils.va_reid_client.compare", fake)
 
     out = await ems.resolve_with_appearance(
-        db, "AAB-2538", EXIT_TIME, vehicle(), "exit.jpg"
+        db, "172538J", EXIT_TIME, vehicle(), "exit.jpg"
+    )
+
+    assert out.matched
+    assert out.session.plate_number == "KXR-2538"
+
+
+@pytest.mark.asyncio
+async def test_the_absolute_floor_still_applies_when_configured(db, monkeypatch):
+    """The floor is opt-in, not deleted: setting it restores the old refusal."""
+    open_session(db, "KXR-2538")
+    open_session(db, "ZZT-2538")
+
+    async def fake(image_path, plates):
+        return va_payload(("KXR-2538", 0.41), ("ZZT-2538", 0.02))
+
+    monkeypatch.setattr("app.utils.va_reid_client.compare", fake)
+    monkeypatch.setattr(settings, "EXIT_MATCH_REID_MIN_SCORE", 0.50)
+
+    out = await ems.resolve_with_appearance(
+        db, "172538J", EXIT_TIME, vehicle(), "exit.jpg"
     )
 
     assert out.kind == ems.AMBIGUOUS
+    assert out.session is None
 
 
 @pytest.mark.asyncio
