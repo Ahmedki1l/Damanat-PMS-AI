@@ -26,7 +26,13 @@ Usage:
     python scripts/setup/probe_hik_camera_events.py --list-cameras
 
     # 2. Do those codes actually produce VCA events?
-    python scripts/setup/probe_hik_camera_events.py --codes 510,511 --hours 24
+    python scripts/setup/probe_hik_camera_events.py --codes <a>,<b> --hours 24
+
+NOTE ON THE CODES YOU ALREADY HAVE. 447 is the ANPR-1 ENTRY camera and 510 is
+the ANPR-2 EXIT camera. Neither is a ramp camera. CAM-23 and CAM-03 are
+different devices whose indexCodes have never been recorded anywhere in this
+repository - finding them is what step 1 is for. Do not carry an LPR code over
+into HIK_RAMP_RESOURCE_IDS because it is the one you happen to know.
 """
 from __future__ import annotations
 
