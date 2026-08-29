@@ -126,6 +126,46 @@ def _within_partial_skew(record: VehicleLogRecord, anchor_naive) -> bool:
     return delta <= limit
 
 
+async def list_entry_candidates(
+    anchor_naive,
+    *,
+    resource_ids: str = "",
+) -> list[VehicleLogRecord]:
+    """EVERY HikCentral record in the window around one gate event.
+
+    This is the Entry V2 path, and it exists precisely so that Entry V2 does not
+    use `_closest`. Picking the record with the nearest PassTime is choosing a
+    vehicle by timestamp proximity, and a car can stop, wait, or be delayed on
+    the ramp — proximity is not identity. Every record here is a CANDIDATE, and
+    Re-ID over the returned images is what decides which one (if any) is the car
+    we are looking at.
+
+    Deliberately NOT reusing `validate_entry_plate`. That function is on the
+    legacy authoritative burst-flush path, which is still what runs in
+    production; changing its selection would alter live behaviour behind the
+    shadow gate. It keeps `_closest` and its own semantics untouched.
+
+    Also deliberately consumes NOTHING. No HikValidation row, no GUID spent.
+    `HikValidation.guid` doubles as the reconciliation watermark, so consuming
+    here would advance it and make the legacy reconciler skip real records.
+
+    Time is used ONLY to bound the search. Returns [] on any failure — the
+    client contract is that HikCentral never raises into the event path.
+    """
+    if not _enabled():
+        return []
+    records = await _lookup(anchor_naive, resource_ids or settings.hik_entry_resource_ids())
+    # Ordered by |Δt| so a caller that can only afford a few image downloads
+    # fetches the most plausible ones first. This ORDERS THE WORK; it never
+    # selects the answer.
+    return sorted(
+        records,
+        key=lambda r: abs(
+            (to_facility_naive(r.pass_time) - anchor_naive).total_seconds()
+        ),
+    )
+
+
 async def _validate_plate(
     reported_plate: str,
     event_time,

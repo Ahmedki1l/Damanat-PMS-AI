@@ -483,9 +483,52 @@ async def _entry_v2_shadow_worker() -> None:
                     _shadow_failed_count += 1
                 else:
                     _shadow_completed_count += 1
+                    await _enrich_from_hikcentral(event)
         finally:
             _shadow_inflight_count -= 1
             queue.task_done()
+
+
+async def _enrich_from_hikcentral(event: ParsedCameraEvent) -> None:
+    """Entry V2 stage S2: having forwarded an ANPR read, go and ask HikCentral.
+
+    OUR event triggers OUR query. HikCentral pushes nothing and knows nothing
+    about this pipeline; it is a source we pull from when we have a reason to.
+
+    Runs on the shadow worker rather than the webhook request path on purpose.
+    A HikCentral round trip on every gate event would put a slow platform
+    directly in front of the camera's acknowledgement, and the whole reason
+    this queue exists is to keep that boundary fast.
+
+    Never raises. A failed enrichment is a degraded query, not a lost entry.
+    """
+    if not is_entry_attempt(event):
+        return
+    plate = (event.plate_number or "").strip()
+    if not plate:
+        return
+    try:
+        from app.services.entry_v2_hik_enrichment import (
+            enrich_entry_from_hikcentral,
+        )
+
+        block = await enrich_entry_from_hikcentral(
+            plate=plate,
+            event_time=_aware_trigger_time(event),
+            camera_id=event.camera_id,
+        )
+        logger.info(
+            "[EntryV2][Hik] queried=%s records=%s images=%s forwarded=%s plate=%s",
+            block.get("queried"),
+            block.get("records"),
+            block.get("images"),
+            len(block.get("forwarded") or []),
+            plate,
+        )
+    except Exception:
+        logger.warning(
+            "[EntryV2][Hik] enrichment failed for plate=%s", plate, exc_info=True
+        )
 
 
 async def start_entry_v2_shadow_worker() -> None:
