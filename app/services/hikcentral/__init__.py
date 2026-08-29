@@ -20,6 +20,7 @@ Gated by `HIK_VALIDATION_MODE`:
 
 from app.services.hikcentral.client import (
     close_hikcentral_http_client,
+    list_camera_events,
     start_hikcentral_http_client,
 )
 from app.services.hikcentral.models import (
@@ -28,6 +29,7 @@ from app.services.hikcentral.models import (
     PLATE_SOURCE_HIK_CORRECTED,
     PLATE_SOURCE_HIK_POLLED,
     PLATE_SOURCE_HIK_RECOVERED,
+    EventRecord,
     HikImages,
     HikOutcome,
 )
@@ -71,6 +73,8 @@ __all__ = [
     "list_unconsumed_records",
     "polled_outcome",
     "record_hik_validation",
+    "EventRecord",
+    "list_camera_events",
     "list_entry_candidates",
     "recover_entry_plate",
     "start_hikcentral_http_client",

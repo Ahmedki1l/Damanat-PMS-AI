@@ -645,10 +645,21 @@ async def consume_refused_entry(
         )
         return None
 
-    # Prefer the record agreeing with what the camera read; otherwise the closest
-    # pass in the window — the same one the reconciler would otherwise act on.
+    # Prefer the record agreeing with what the camera read.
     canonical = normalize_plate(reported_plate) or reported_plate
     agreeing = [r for r in usable if r.canonical_plate == canonical]
+    if not agreeing and settings.HIK_TOMBSTONE_REQUIRE_PLATE_MATCH:
+        # Nothing in the window is the pass we refused. Falling back to the
+        # CLOSEST record would consume a different car's pass, and that car
+        # really did enter — so the reconciler could never recover it. A
+        # refusal of plate X is not a licence to suppress plate Y.
+        logger.info(
+            "%s entry refused for plate=%s at %s — no HikCentral record agrees "
+            "with that plate, so nothing is tombstoned (a different car's pass "
+            "must stay recoverable)",
+            _log_tag(), reported_plate, event_time,
+        )
+        return None
     match = _closest(agreeing or usable, event_time)
 
     db.add(

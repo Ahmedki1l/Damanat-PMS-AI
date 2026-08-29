@@ -164,6 +164,59 @@ class VehicleLogRecord:
 
 
 @dataclass(frozen=True)
+class EventRecord:
+    """One VCA event HikCentral holds for a camera — a line crossing, a region
+    entrance, a region exit.
+
+    Distinct from VehicleLogRecord, which is an ANPR PASS record and carries a
+    plate. An event record carries no plate at all: it is the platform saying
+    "something crossed this line here, and here is a picture". That is exactly
+    what makes it useful for a DROPPED gate read, where there is no plate to be
+    had from the edge — and exactly why it can never name a car by itself.
+    """
+
+    event_index_code: str
+    src_index: str
+    start_time: Optional[datetime] = None
+    event_pic_uri: Optional[str] = None
+    event_type: Optional[str] = None
+
+    @property
+    def guid(self) -> str:
+        """The identity used for consumption/dedup, mirroring VehicleLogRecord."""
+        return self.event_index_code
+
+    @property
+    def vehicle_image_url(self) -> Optional[str]:
+        """Named to match VehicleLogRecord so one caller can handle both."""
+        return self.event_pic_uri
+
+    @classmethod
+    def from_openapi_record(cls, raw) -> Optional["EventRecord"]:
+        if not isinstance(raw, dict):
+            return None
+        index_code = raw.get("eventIndexCode") or raw.get("eventId")
+        src_index = raw.get("srcIndex") or raw.get("srcIndexCode") or ""
+        if not index_code:
+            return None
+        started = raw.get("startTime") or raw.get("happenTime")
+        parsed = None
+        if isinstance(started, str) and started:
+            try:
+                parsed = datetime.fromisoformat(started.replace("Z", "+00:00"))
+            except ValueError:
+                parsed = None
+        event_type = raw.get("eventType")
+        return cls(
+            event_index_code=str(index_code),
+            src_index=str(src_index),
+            start_time=parsed,
+            event_pic_uri=raw.get("eventPicUri") or raw.get("picUri") or None,
+            event_type=str(event_type) if event_type is not None else None,
+        )
+
+
+@dataclass(frozen=True)
 class HikImages:
     """Locally persisted HikCentral imagery, as public snapshot URLs."""
 

@@ -28,12 +28,15 @@ from typing import Any, Optional
 import httpx
 
 from app.config import settings
-from app.services.hikcentral.models import VehicleLogRecord
+from app.services.hikcentral.models import EventRecord, VehicleLogRecord
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 CROSS_RECORDS_PATH = "/artemis/api/pms/v1/crossRecords/page"
+EVENT_RECORDS_PATH = "/artemis/api/eventService/v1/eventRecords/page"
+# Line Crossing / Region Entrance / Region Exiting (HCP OpenAPI V3.0.0).
+VCA_CROSSING_EVENT_TYPES = "131585,131586,131587"
 IMAGE_PATH = "/artemis/api/pms/v1/image"
 
 # The OpenAPI reports success/failure in a top-level `code` string ("0" == ok),
@@ -267,6 +270,80 @@ async def query_vehicle_logs(
         # The API already filters by start/end, but enforce the exact window
         # locally too so recovery's "exactly one candidate" rule is precise.
         if begin <= record.pass_time <= end:
+            records.append(record)
+    return records
+
+
+async def list_camera_events(
+    begin: datetime,
+    end: datetime,
+    resource_ids: str,
+    page_size: int,
+    event_types: str = VCA_CROSSING_EVENT_TYPES,
+) -> list[EventRecord]:
+    """VCA events a camera raised in one window. Never raises.
+
+    This is what makes a dropped gate read recoverable: the ANPR camera may
+    have missed the plate, but CAM-23 and CAM-03 still told HikCentral that
+    SOMETHING crossed their lines, and the platform kept a picture of it.
+
+    JUDGE BY CONTENT, NEVER BY ABSENCE OF ERROR. An unknown indexCode returns
+    HTTP 200, code=0 and an empty list — indistinguishable from "the camera was
+    genuinely idle". That is exactly how HIK_EXIT_RESOURCE_IDS=453 pointed at a
+    camera that does not exist and let the exit reconciler sweep for months
+    without ever closing an exit. An empty result here is reported as empty and
+    never as proof of anything.
+
+    Takes a comma list, unlike query_vehicle_logs: the recovery sweep genuinely
+    wants both ramp cameras in one question.
+    """
+    codes = [item.strip() for item in (resource_ids or "").split(",") if item.strip()]
+    if not codes:
+        return []
+
+    body = {
+        "srcType": "camera",
+        "srcIndexs": ",".join(codes),
+        "eventTypes": event_types,
+        # Whole-second ISO-8601 with offset; the platform rejects fractional
+        # seconds exactly as it does on crossRecords.
+        "startTime": begin.replace(microsecond=0).isoformat(),
+        "endTime": end.replace(microsecond=0).isoformat(),
+        "pageNo": 1,
+        "pageSize": page_size,
+    }
+
+    response = await _signed_post(EVENT_RECORDS_PATH, body)
+    if response is None:
+        return []
+    try:
+        payload = response.json()
+    except ValueError:
+        logger.warning(
+            "[Hik] eventRecords returned non-JSON: %s", response.text[:200]
+        )
+        return []
+
+    code = response_code(payload)
+    if code != _CODE_OK:
+        logger.warning(
+            "[Hik] eventRecords refused with code=%s msg=%s (cameras=%s). Check "
+            "the partner's authorized APIs and the srcIndexs values.",
+            code,
+            payload.get("msg") if isinstance(payload, dict) else None,
+            ",".join(codes),
+        )
+        return []
+
+    rows = ((payload.get("data") or {}).get("list")) or []
+    records = []
+    for raw in rows:
+        record = EventRecord.from_openapi_record(raw)
+        if record is None:
+            continue
+        # Enforce the window locally too. The API filters already, but the
+        # recovery path reasons about exactly which events fall inside it.
+        if record.start_time is None or begin <= record.start_time <= end:
             records.append(record)
     return records
 

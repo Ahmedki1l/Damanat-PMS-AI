@@ -867,6 +867,34 @@ class Settings(BaseSettings):
     # had never closed a single missed exit. Verify any change to this value
     # with `backfill_missed_exits.py --list-cameras`, never by eye.
     HIK_EXIT_RESOURCE_IDS: str = ""
+    # OpenAPI indexCodes for the RAMP cameras (CAM-23, CAM-03), used only by the
+    # Entry V2 dropped-ANPR recovery sweep. Comma-separated.
+    #
+    # EMPTY BY DEFAULT, and it must stay empty until the probe confirms real
+    # codes. An unknown indexCode returns HTTP 200 / code=0 / empty list, which
+    # is indistinguishable from a genuinely idle camera — that is precisely how
+    # HIK_EXIT_RESOURCE_IDS=453 pointed at a camera that does not exist and let
+    # the exit reconciler sweep for months without closing a single exit.
+    # A guessed value here would fail the same way, silently.
+    #
+    # Resolve real codes with:
+    #     python scripts/setup/probe_hik_camera_events.py --list-cameras
+    HIK_RAMP_RESOURCE_IDS: str = ""
+    # Scope a refusal tombstone to a record whose plate AGREES with the read the
+    # gate refused.
+    #
+    # Today, when no record in the window matches the refused plate, the
+    # tombstone falls back to the CLOSEST record — consuming a pass that belongs
+    # to a different car. That car really did enter, and consuming its GUID
+    # means the reconciler can never recover it: a lost entry, caused by
+    # suppressing the wrong record.
+    #
+    # Defaults to False, which preserves today's behaviour exactly. This is a
+    # fix to the legacy AUTHORITATIVE path, so it must not switch itself on:
+    # nothing may change production behaviour before the shadow review passes.
+    # Turning it on tombstones strictly less, which is the safe direction for
+    # entries that would otherwise be lost.
+    HIK_TOMBSTONE_REQUIRE_PLATE_MATCH: bool = False
     # Lookup window around the anchor event (the ANPR read for a validation,
     # the ramp crossing for a recovery). Deliberately tiny: HikCentral is asked
     # about ONE car, never for history. Lookback covers the camera->platform
