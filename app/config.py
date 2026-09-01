@@ -990,6 +990,19 @@ class Settings(BaseSettings):
     # Max records pulled per camera per poll (crossRecords pageSize, ≤ 500).
     HIK_RECONCILE_PAGE_SIZE: int = Field(default=100, gt=0, le=500)
 
+    # Refuse to open a recovered entry that carries no vehicle image.
+    #
+    # A session with no appearance evidence cannot be closed by ANY mechanism:
+    # the plate is whatever HikCentral read (often a misread nothing will
+    # present at the exit), and with no image the exit Re-ID fallback has
+    # nothing to match. Measured on 2026-08-30/31: every HIK-RECON entry
+    # carried `pic=None conf=None` and every one of them was still open days
+    # later, accruing stay time and competing in the exit gallery against real
+    # cars. Losing the entry is recoverable; an immortal session is not.
+    #
+    # Set False to restore the old behaviour of opening it regardless.
+    HIK_RECONCILE_REQUIRE_IMAGE: bool = True
+
     # ── Restart catch-up ──────────────────────────────────────────────────
     # The rolling sweep above is near-sighted by design (it runs on every gate
     # event), so it cannot heal downtime: a 4h outage on 2026-08-09 stranded 25

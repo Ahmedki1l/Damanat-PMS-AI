@@ -59,10 +59,12 @@ def hik_authoritative(monkeypatch):
     ees._entry_bursts.clear()
     ees._pending_crossings.clear()
     ees._recent_entries.clear()
+    ees._UNVERIFIED_REFUSALS.clear()
     yield
     ees._entry_bursts.clear()
     ees._pending_crossings.clear()
     ees._recent_entries.clear()
+    ees._UNVERIFIED_REFUSALS.clear()
 
 
 def _record(guid="G1", plate="66565EK", when="2026-07-30T05:30:01+03:00"):
@@ -182,11 +184,36 @@ async def test_disabled_layer_issues_no_lookup(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_lookup_failure_never_breaks_the_flusher(db, monkeypatch):
+async def test_lookup_failure_is_signalled_not_swallowed(db, monkeypatch):
+    """POLICY CHANGE. This used to assert `is None`, i.e. a failed lookup was
+    reported as "nothing to consume".
+
+    Those are different facts and collapsing them fails OPEN: SUZ-975's lookup
+    timed out, the refusal was logged as "nothing for the reconciler to
+    re-open", and the reconciler opened that very record 32 minutes later. The
+    low-level call now says which one happened; keeping the flusher alive is the
+    caller's job, asserted in the flusher tests below.
+    """
+
     async def boom(*a, **k):
         raise RuntimeError("HikCentral unreachable")
 
     monkeypatch.setattr(client, "query_vehicle_logs", boom)
+
+    with pytest.raises(validation.RefusalLookupFailed):
+        await validation.consume_refused_entry(db, "66565EK", READ_TIME)
+    assert db.query(HikValidation).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_verified_empty_lookup_still_reports_nothing_to_consume(db, monkeypatch):
+    """"We asked and there is nothing" must stay distinguishable from "we could
+    not ask" — it is still a plain None, and holds nothing off the reconciler."""
+
+    async def empty(*a, **k):
+        return []
+
+    monkeypatch.setattr(client, "query_vehicle_logs", empty)
 
     assert await validation.consume_refused_entry(db, "66565EK", READ_TIME) is None
     assert db.query(HikValidation).count() == 0
@@ -308,3 +335,176 @@ async def test_reconciler_still_opens_a_genuinely_missed_entry(db, monkeypatch):
     await ees._reconcile_missed_entries(db)
 
     assert opened == ["66565EK"]
+
+
+# ── unverified refusals: the SUZ-975 leak ───────────────────────────────────
+
+
+def _explode_lookup(monkeypatch):
+    async def boom(begin, end, resource_ids, page_size):
+        raise RuntimeError("HikCentral read timeout")
+
+    monkeypatch.setattr(client, "query_vehicle_logs", boom)
+
+
+@pytest.mark.asyncio
+async def test_unverified_refusal_holds_the_reconciler_off(db, monkeypatch):
+    """Reproduces the live SUZ-975 sequence of 2026-08-31.
+
+        07:33:17  burst buffered plate=SUZ-975
+        07:34:23  refused; lookup FAILED, logged "nothing to re-open"
+        08:06:33  [Hik][reconcile] OPENED missed entry     <- the leak
+
+    A refusal we could not prove must not be treated as a refusal with nothing
+    behind it. The sweep must leave the pass alone.
+    """
+    ees._entry_bursts[1] = _burst()
+    monkeypatch.setattr(
+        ees, "facility_now_naive", lambda: READ_TIME + timedelta(seconds=120)
+    )
+
+    _explode_lookup(monkeypatch)
+    await ees.flush_due_entry_bursts(db)        # refuse; tombstone FAILS
+    assert len(ees._UNVERIFIED_REFUSALS) == 1
+
+    # HikCentral comes back, and now returns the record the timeout hid.
+    _patch_lookup(monkeypatch, [_record()])
+    await ees._reconcile_missed_entries(db)
+
+    assert db.query(ParkingSession).count() == 0
+    assert db.query(HikValidation).filter(HikValidation.matched.is_(True)).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_tombstones_the_refusal_once_hikcentral_answers(db, monkeypatch):
+    """The hold is not permanent — the next sweep makes the refusal durable."""
+    ees._entry_bursts[1] = _burst()
+    monkeypatch.setattr(
+        ees, "facility_now_naive", lambda: READ_TIME + timedelta(seconds=120)
+    )
+
+    _explode_lookup(monkeypatch)
+    await ees.flush_due_entry_bursts(db)
+    assert len(ees._UNVERIFIED_REFUSALS) == 1
+
+    _patch_lookup(monkeypatch, [_record()])
+    await ees._reconcile_missed_entries(db)
+
+    # Consumed as a refusal, so the hold is released and the GUID is spent.
+    assert ees._UNVERIFIED_REFUSALS == []
+    row = db.query(HikValidation).filter(HikValidation.guid == "G1").one()
+    assert row.matched is False
+    assert row.match_reason == validation.REFUSED_NO_CROSSING
+
+
+@pytest.mark.asyncio
+async def test_a_verified_empty_refusal_holds_nothing_off(db, monkeypatch):
+    """"We asked, HikCentral has nothing" must NOT hold the reconciler off.
+
+    Otherwise every refusal at a gate HikCentral does not cover would blind the
+    sweep to genuinely missed cars for the life of the process.
+    """
+    ees._entry_bursts[1] = _burst()
+    monkeypatch.setattr(
+        ees, "facility_now_naive", lambda: READ_TIME + timedelta(seconds=120)
+    )
+
+    _patch_lookup(monkeypatch, [])
+    await ees.flush_due_entry_bursts(db)
+
+    assert ees._UNVERIFIED_REFUSALS == []
+
+
+@pytest.mark.asyncio
+async def test_hold_only_covers_the_refused_car(db, monkeypatch):
+    """A different car passing while a refusal is unverified still gets opened."""
+    ees._entry_bursts[1] = _burst()
+    monkeypatch.setattr(
+        ees, "facility_now_naive", lambda: READ_TIME + timedelta(seconds=120)
+    )
+
+    _explode_lookup(monkeypatch)
+    await ees.flush_due_entry_bursts(db)
+    assert len(ees._UNVERIFIED_REFUSALS) == 1
+
+    opened = []
+
+    async def fake_flush(db_, buf):
+        opened.append(buf["reads"][0]["plate"])
+
+    monkeypatch.setattr(ees, "_flush_entry_burst", fake_flush)
+    _patch_lookup(monkeypatch, [_record(guid="G2", plate="9999XYZ")])
+    await ees._reconcile_missed_entries(db)
+
+    assert opened == ["XYZ-9999"]
+
+
+# ── imageless recoveries: the unclosable session ────────────────────────────
+
+
+def _record_without_image(guid="G3", plate="05826LD"):
+    return VehicleLogRecord.from_openapi_record({
+        "crossRecordSyscode": guid,
+        "cameraIndexCode": "447",
+        "plateNo": plate,
+        "crossTime": "2026-07-30T05:30:01+03:00",
+    })
+
+
+@pytest.mark.asyncio
+async def test_reconciler_refuses_to_open_an_imageless_entry(db, monkeypatch):
+    """Reproduces 05826LD of 2026-08-30.
+
+        [UC1] Flushing entry burst winner=05826LD pic=None conf=None
+        [PMS] No snapshot available for plate=05826LD - sending without image
+
+    The plate is a misread no car will present at the exit, and with no image
+    the exit Re-ID fallback has nothing to match — so the session can never
+    close. It was still open, accruing stay time, days later.
+    """
+    _patch_lookup(monkeypatch, [_record_without_image()])
+
+    await ees._reconcile_missed_entries(db)
+
+    assert db.query(ParkingSession).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_an_imageless_guid_is_left_unconsumed_for_a_later_sweep(db, monkeypatch):
+    """Refusing is not the same as tombstoning — the pass may reappear with
+    imagery, and consuming it here would make that unrecoverable."""
+    _patch_lookup(monkeypatch, [_record_without_image()])
+
+    await ees._reconcile_missed_entries(db)
+
+    assert db.query(HikValidation).filter(HikValidation.guid == "G3").count() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_record_with_an_image_still_opens(db, monkeypatch):
+    """The guard must only exclude records that could never be closed."""
+    _patch_lookup(monkeypatch, [_record()])
+    opened = []
+
+    async def fake_flush(db_, buf):
+        opened.append(buf["reads"][0]["plate"])
+
+    monkeypatch.setattr(ees, "_flush_entry_burst", fake_flush)
+    await ees._reconcile_missed_entries(db)
+
+    assert opened == ["66565EK"]
+
+
+@pytest.mark.asyncio
+async def test_the_guard_can_be_switched_off(db, monkeypatch):
+    monkeypatch.setattr(settings, "HIK_RECONCILE_REQUIRE_IMAGE", False)
+    _patch_lookup(monkeypatch, [_record_without_image()])
+    opened = []
+
+    async def fake_flush(db_, buf):
+        opened.append(buf["reads"][0]["plate"])
+
+    monkeypatch.setattr(ees, "_flush_entry_burst", fake_flush)
+    await ees._reconcile_missed_entries(db)
+
+    assert opened == ["05826LD"]

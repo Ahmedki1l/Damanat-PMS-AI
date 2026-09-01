@@ -43,7 +43,11 @@ from app.services import exit_pipeline
 from app.services import parking_session_service
 from app.services import plate_correction_service
 from app.services import vehicle_service
-from app.services.event_parser import ParsedCameraEvent, same_vehicle_plate
+from app.services.event_parser import (
+    ParsedCameraEvent,
+    normalize_plate,
+    same_vehicle_plate,
+)
 from app.services.alert_service import create_alert
 from app.services import hikcentral
 from app.services.hikcentral import HikImages
@@ -461,6 +465,88 @@ def _winning_read(reads: list[dict]) -> dict:
     )
 
 
+# Refusals the gate made but could not tombstone, because HikCentral did not
+# answer. Each entry holds the gate off re-opening that pass until a later sweep
+# consumes the GUID for real.
+#
+# Deliberately in RAM and bounded. The durable alternative is a HikValidation
+# row, and that is not available here: `_catchup_watermark` reads MAX(pass_time)
+# across every row for a direction, so a synthetic tombstone would advance the
+# watermark past records nobody has processed and lose them silently. A restart
+# drops these and the reconciler may re-open one pass — the same behaviour as
+# before this guard existed, so the failure mode is unchanged, never worsened.
+_UNVERIFIED_REFUSALS: list[tuple[str, datetime]] = []
+_UNVERIFIED_REFUSALS_MAX = 256
+
+
+def _remember_unverified_refusal(plate: str, event_time: datetime) -> None:
+    # Store canonical, because the reconciler compares against
+    # `rec.canonical_plate`. The burst carries the camera's raw read.
+    plate = normalize_plate(plate) or plate
+    logger.warning(
+        "[UC1] Refusal for plate=%s at %s is UNVERIFIED (HikCentral did not "
+        "answer) — holding the reconciler off this pass until it can be "
+        "tombstoned",
+        plate, event_time,
+    )
+    _UNVERIFIED_REFUSALS.append((plate, event_time))
+    if len(_UNVERIFIED_REFUSALS) > _UNVERIFIED_REFUSALS_MAX:
+        del _UNVERIFIED_REFUSALS[:-_UNVERIFIED_REFUSALS_MAX]
+
+
+def _matches_unverified_refusal(plate: str, when: datetime, window: timedelta) -> bool:
+    """True when the gate refused this pass but could not prove it to HikCentral.
+
+    Plate comparison is `same_vehicle_plate`, not equality: the refusal is
+    recorded under the burst's winning read, and the HikCentral record may carry
+    a truncation of the same plate.
+    """
+    for refused_plate, refused_at in _UNVERIFIED_REFUSALS:
+        if abs((refused_at - when).total_seconds()) > window.total_seconds():
+            continue
+        if same_vehicle_plate(refused_plate, plate):
+            return True
+    return False
+
+
+async def _retry_unverified_refusals(db: Session) -> None:
+    """Try again to tombstone refusals whose first lookup failed.
+
+    Runs at the head of the reconcile sweep, so every attempt to re-open a
+    refused pass is preceded by one more chance to make the refusal durable.
+    """
+    if not _UNVERIFIED_REFUSALS:
+        return
+    still_pending: list[tuple[str, datetime]] = []
+    for plate, event_time in list(_UNVERIFIED_REFUSALS):
+        try:
+            guid = await hikcentral.consume_refused_entry(
+                db, plate, event_time, require_plate_match=True
+            )
+        except Exception:
+            still_pending.append((plate, event_time))
+            continue
+        if guid is None:
+            # We asked and HikCentral has nothing unconsumed for this pass. The
+            # refusal is now verified: there is nothing for the reconciler to
+            # re-open, so the hold can be released.
+            logger.info(
+                "[UC1] Refusal for plate=%s at %s verified — HikCentral holds "
+                "no unconsumed record; releasing the hold",
+                plate, event_time,
+            )
+            continue
+        # consume_refused_entry only stages the row; the caller commits. Without
+        # this the GUID is still unconsumed when list_unconsumed_records runs
+        # immediately below, and the pass is re-opened anyway.
+        db.commit()
+        logger.info(
+            "[UC1] Refusal for plate=%s at %s tombstoned on retry (guid=%s)",
+            plate, event_time, guid,
+        )
+    _UNVERIFIED_REFUSALS[:] = still_pending
+
+
 async def _tombstone_refused_burst(db: Session, buf: dict) -> bool:
     """Stop the HikCentral reconciler from re-opening a burst the gate refused.
 
@@ -480,10 +566,18 @@ async def _tombstone_refused_burst(db: Session, buf: dict) -> bool:
         return False
     try:
         guid = await hikcentral.consume_refused_entry(db, plate, event_time)
+    except hikcentral.RefusalLookupFailed:
+        # We could not ask HikCentral, so we do NOT know whether a record for
+        # this pass exists. Failing open here is what re-opened SUZ-975. Hold
+        # the reconciler off this pass until a later sweep can tombstone it
+        # properly.
+        _remember_unverified_refusal(plate, event_time)
+        return False
     except Exception as exc:  # never let a tombstone break the flusher
         logger.warning(
             "[UC1] Could not tombstone refused burst plate=%s: %r", plate, exc
         )
+        _remember_unverified_refusal(plate, event_time)
         return False
     return guid is not None
 
@@ -766,6 +860,9 @@ async def _reconcile_missed_entries(
     db: Session, window: Optional[tuple[datetime, datetime]] = None
 ) -> None:
     begin, end = window or _reconcile_window(db, hikcentral.DIRECTION_ENTRY)
+    # One more chance to make any unverified refusal durable BEFORE we consider
+    # re-opening anything — a tombstone written now removes the record below.
+    await _retry_unverified_refusals(db)
     records = await hikcentral.list_unconsumed_records(
         settings.hik_entry_resource_ids(), begin, end, db
     )
@@ -786,10 +883,35 @@ async def _reconcile_missed_entries(
                 db.commit()
                 consumed += 1
             continue
+        if _matches_unverified_refusal(rec.canonical_plate, pass_local, match_s):
+            # The gate refused this pass; we just could not prove it to
+            # HikCentral. Opening it would undo a decision the crossing gate
+            # made on real evidence, which is exactly the overstay-generating
+            # failure the tombstone exists to prevent. Leave the GUID
+            # unconsumed so a later sweep can still tombstone it properly.
+            logger.warning(
+                "[Hik][reconcile] SKIPPING plate=%s guid=%s at %s — the gate "
+                "refused this pass and the tombstone is still unverified",
+                rec.canonical_plate, rec.guid, pass_local,
+            )
+            continue
         if not hikcentral.is_authoritative():
             logger.warning(
                 "[Hik][reconcile] shadow: MISSED entry plate=%s guid=%s at %s "
                 "(would open a session)",
+                rec.canonical_plate, rec.guid, pass_local,
+            )
+            continue
+        if settings.HIK_RECONCILE_REQUIRE_IMAGE and not outcome.vehicle_image_url:
+            # No image means no appearance evidence, and the plate is whatever
+            # HikCentral read. Neither the plate path nor the Re-ID fallback can
+            # ever close the resulting session, so opening it would create a
+            # permanent overstay rather than recover an entry. Left unconsumed
+            # on purpose: a later sweep may find the same pass with imagery.
+            logger.warning(
+                "[Hik][reconcile] NOT opening plate=%s guid=%s at %s — the "
+                "record carries no vehicle image, so the session could never "
+                "be closed. Review it by hand.",
                 rec.canonical_plate, rec.guid, pass_local,
             )
             continue

@@ -39,6 +39,21 @@ logger = get_logger(__name__)
 DIRECTION_ENTRY = "entry"
 DIRECTION_EXIT = "exit"
 
+
+class RefusalLookupFailed(Exception):
+    """The HikCentral lookup behind an entry refusal could not be completed.
+
+    Distinct from "no record to consume" on purpose. A refusal is only durable
+    once the matching HikCentral pass is consumed; if we could not even ask,
+    the refusal is UNVERIFIED and the reconciler must be held off that pass
+    until it is, or it will re-open the entry the gate just refused.
+    """
+
+    def __init__(self, plate: str, event_time):
+        super().__init__(f"refused-entry lookup failed for {plate} at {event_time}")
+        self.plate = plate
+        self.event_time = event_time
+
 # `match_reason` for a pass the crossing gate refused. Stored so the audit trail
 # distinguishes "we never saw this car" from "we saw it and decided it did not
 # enter" — the reconciler must only ever act on the first.
@@ -154,6 +169,16 @@ async def list_entry_candidates(
     """
     if not _enabled():
         return []
+    # Normalise at the boundary, exactly as to_facility_naive's own docstring
+    # requires. The parameter name is a promise the CALLER has to keep, and one
+    # caller does not: the legacy path passes naive, but Entry V2 hands us
+    # `_aware_trigger_time(event)`, which is tz-aware by construction. The sort
+    # below subtracts this value from an always-naive one, so an aware anchor
+    # raised TypeError on every Entry V2 call — AFTER _lookup had already gone
+    # to HikCentral and been answered, so the records were fetched and thrown
+    # away while the caller logged `queried=False records=0`. Converting here is
+    # a no-op for naive input, so the legacy caller is untouched.
+    anchor_naive = to_facility_naive(anchor_naive)
     records = await _lookup(anchor_naive, resource_ids or settings.hik_entry_resource_ids())
     # Ordered by |Δt| so a caller that can only afford a few image downloads
     # fetches the most plausible ones first. This ORDERS THE WORK; it never
@@ -596,7 +621,11 @@ def consume_already_logged(
 
 
 async def consume_refused_entry(
-    db: Optional[Session], reported_plate: str, event_time
+    db: Optional[Session],
+    reported_plate: str,
+    event_time,
+    *,
+    require_plate_match: Optional[bool] = None,
 ) -> Optional[str]:
     """Consume the HikCentral record behind an entry the crossing gate REFUSED.
 
@@ -610,10 +639,23 @@ async def consume_refused_entry(
     `list_unconsumed_records` already filters consumed GUIDs, so the reconciler
     needs no knowledge of refusals and stays a pure "what did we never see?" sweep.
 
-    Returns the consumed GUID, or None when there was nothing to consume — layer
-    off, no HikCentral record in the window, or already consumed. All are safe:
-    if HikCentral holds no record for this pass, the reconciler has nothing to
-    act on either.
+    Returns the consumed GUID, or None when we LOOKED and there was nothing to
+    consume — layer off, no HikCentral record in the window, or already
+    consumed. Those are safe: if HikCentral holds no record for this pass, the
+    reconciler has nothing to act on either.
+
+    `require_plate_match` overrides HIK_TOMBSTONE_REQUIRE_PLATE_MATCH for one
+    call. The retry path passes True: falling back to the CLOSEST record is
+    already a gamble at flush time, and after an arbitrary delay it is simply
+    wrong — the window has moved on and the nearest unconsumed pass is far more
+    likely to be a different car that really did enter.
+
+    Raises RefusalLookupFailed when the lookup itself could not be completed.
+    That is NOT the same as "nothing to consume" and must never be treated as
+    such: the record may exist and simply not have reached us. Collapsing the
+    two is what let SUZ-975 through — the query timed out, the refusal was
+    logged as "nothing for the reconciler to re-open", and the reconciler then
+    opened the very record the timeout had hidden, 32 minutes later.
     """
     if not _enabled() or db is None:
         return None
@@ -623,12 +665,12 @@ async def consume_refused_entry(
 
     try:
         records = await _lookup(event_time, resource_ids)
-    except Exception as exc:  # a refusal must never break the flusher
+    except Exception as exc:
         logger.warning(
             "[Hik] refused-entry lookup failed for plate=%s at %s: %r",
             reported_plate, event_time, exc,
         )
-        return None
+        raise RefusalLookupFailed(reported_plate, event_time) from exc
 
     usable = [
         r
@@ -648,7 +690,9 @@ async def consume_refused_entry(
     # Prefer the record agreeing with what the camera read.
     canonical = normalize_plate(reported_plate) or reported_plate
     agreeing = [r for r in usable if r.canonical_plate == canonical]
-    if not agreeing and settings.HIK_TOMBSTONE_REQUIRE_PLATE_MATCH:
+    if require_plate_match is None:
+        require_plate_match = settings.HIK_TOMBSTONE_REQUIRE_PLATE_MATCH
+    if not agreeing and require_plate_match:
         # Nothing in the window is the pass we refused. Falling back to the
         # CLOSEST record would consume a different car's pass, and that car
         # really did enter — so the reconciler could never recover it. A

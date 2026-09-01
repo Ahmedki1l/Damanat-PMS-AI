@@ -557,3 +557,63 @@ async def test_shadow_mode_never_rewrites_an_exit_plate(monkeypatch):
 
     assert outcome.plate == ANPR_PLATE
     assert outcome.plate_source == PLATE_SOURCE_EDGE_ANPR
+
+
+# ── list_entry_candidates: anchor timezone discipline ───────────────────────
+#
+# These call the REAL function. Every other test of the Entry V2 enrichment
+# path mocks `list_entry_candidates` itself, which is precisely why an anchor
+# type mismatch between caller and callee shipped: nothing exercised the sort.
+
+
+@pytest.mark.asyncio
+async def test_entry_candidates_accepts_the_aware_anchor_entry_v2_sends(monkeypatch):
+    """Entry V2 passes `_aware_trigger_time(event)`, which is always tz-aware.
+
+    The sort subtracts the anchor from an always-naive `to_facility_naive(...)`,
+    so an unconverted aware anchor raised TypeError — after the HikCentral call
+    had already succeeded, so the records were fetched and then discarded while
+    the caller reported `queried=False records=0`.
+    """
+    monkeypatch.setattr(settings, "HIK_ENTRY_RESOURCE_IDS", "447")
+    _stub_lookup(monkeypatch, [_record(guid="AWARE-1", offset_seconds=5)])
+
+    aware_anchor = EVENT_TIME.replace(tzinfo=FACILITY_TZ)
+    records = await validation.list_entry_candidates(aware_anchor)
+
+    assert [r.guid for r in records] == ["AWARE-1"]
+
+
+@pytest.mark.asyncio
+async def test_entry_candidates_still_accepts_the_naive_anchor_legacy_sends(monkeypatch):
+    monkeypatch.setattr(settings, "HIK_ENTRY_RESOURCE_IDS", "447")
+    _stub_lookup(monkeypatch, [_record(guid="NAIVE-1", offset_seconds=5)])
+
+    records = await validation.list_entry_candidates(EVENT_TIME)
+
+    assert [r.guid for r in records] == ["NAIVE-1"]
+
+
+@pytest.mark.asyncio
+async def test_entry_candidates_order_is_identical_for_both_anchor_types(monkeypatch):
+    """Normalising must not silently shift the window or the |dt| ordering."""
+    monkeypatch.setattr(settings, "HIK_ENTRY_RESOURCE_IDS", "447")
+    spread = [
+        _record(guid="FAR", offset_seconds=25),
+        _record(guid="NEAR", offset_seconds=2),
+        _record(guid="MID", offset_seconds=-9),
+    ]
+
+    _stub_lookup(monkeypatch, spread)
+    naive_order = [r.guid for r in await validation.list_entry_candidates(EVENT_TIME)]
+
+    _stub_lookup(monkeypatch, spread)
+    aware_order = [
+        r.guid
+        for r in await validation.list_entry_candidates(
+            EVENT_TIME.replace(tzinfo=FACILITY_TZ)
+        )
+    ]
+
+    assert naive_order == ["NEAR", "MID", "FAR"]
+    assert aware_order == naive_order
