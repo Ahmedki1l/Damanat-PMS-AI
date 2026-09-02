@@ -987,6 +987,24 @@ class Settings(BaseSettings):
     HIK_RECONCILE_MATCH_SECONDS: float = Field(
         default=60.0, gt=0, le=600.0, allow_inf_nan=False,
     )
+    # How long a refusal the gate could not tombstone holds the reconciler off
+    # that pass.
+    #
+    # An empty lookup at refusal time does NOT mean HikCentral holds no record —
+    # crossRecords lags, and the record can surface minutes later. Measured on
+    # 2026-09-02: three refusals logged "no unconsumed record to tombstone" and
+    # the sweep then opened all three, 3m52s (TXR-4857), 6m27s (RGR-6666) and
+    # 44m55s (RLR-2714) later, every pass_time PREDATING its own refusal.
+    # RGR-6666 became a duplicate session for a car already admitted as
+    # RGR-6466 and fired a second unregistered-vehicle alert on it.
+    #
+    # Defaults to the lookback window: once the pass falls out of that, the
+    # sweep can no longer reach it and the hold has nothing left to protect.
+    # A genuinely missed entry is delayed by this, never lost — the GUID stays
+    # unconsumed and the next sweep after the hold expires can still open it.
+    HIK_REFUSAL_HOLD_SECONDS: float = Field(
+        default=900.0, ge=0, le=86400.0, allow_inf_nan=False,
+    )
     # Max records pulled per camera per poll (crossRecords pageSize, ≤ 500).
     HIK_RECONCILE_PAGE_SIZE: int = Field(default=100, gt=0, le=500)
 

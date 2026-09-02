@@ -465,9 +465,15 @@ def _winning_read(reads: list[dict]) -> dict:
     )
 
 
-# Refusals the gate made but could not tombstone, because HikCentral did not
-# answer. Each entry holds the gate off re-opening that pass until a later sweep
-# consumes the GUID for real.
+# Refusals the gate made but could not tombstone. Each entry holds the gate off
+# re-opening that pass until a later sweep consumes the GUID for real, or until
+# the hold expires.
+#
+# Two things land here, and they are the same failure wearing different clothes:
+# HikCentral did not answer, and HikCentral answered with nothing. Neither is
+# proof that no record exists, because crossRecords lags behind the pass itself.
+# Treating the empty answer as proof is what produced RGR-6666 — see
+# HIK_REFUSAL_HOLD_SECONDS.
 #
 # Deliberately in RAM and bounded. The durable alternative is a HikValidation
 # row, and that is not available here: `_catchup_watermark` reads MAX(pass_time)
@@ -475,21 +481,27 @@ def _winning_read(reads: list[dict]) -> dict:
 # watermark past records nobody has processed and lose them silently. A restart
 # drops these and the reconciler may re-open one pass — the same behaviour as
 # before this guard existed, so the failure mode is unchanged, never worsened.
-_UNVERIFIED_REFUSALS: list[tuple[str, datetime]] = []
+#
+# (plate, event_time, hold_until)
+_UNVERIFIED_REFUSALS: list[tuple[str, datetime, datetime]] = []
 _UNVERIFIED_REFUSALS_MAX = 256
 
 
-def _remember_unverified_refusal(plate: str, event_time: datetime) -> None:
+def _remember_unverified_refusal(
+    plate: str, event_time: datetime, why: str = "HikCentral did not answer"
+) -> None:
     # Store canonical, because the reconciler compares against
     # `rec.canonical_plate`. The burst carries the camera's raw read.
     plate = normalize_plate(plate) or plate
-    logger.warning(
-        "[UC1] Refusal for plate=%s at %s is UNVERIFIED (HikCentral did not "
-        "answer) — holding the reconciler off this pass until it can be "
-        "tombstoned",
-        plate, event_time,
+    hold_until = facility_now_naive() + timedelta(
+        seconds=settings.HIK_REFUSAL_HOLD_SECONDS
     )
-    _UNVERIFIED_REFUSALS.append((plate, event_time))
+    logger.warning(
+        "[UC1] Refusal for plate=%s at %s is UNVERIFIED (%s) — holding the "
+        "reconciler off this pass until %s or until it can be tombstoned",
+        plate, event_time, why, hold_until,
+    )
+    _UNVERIFIED_REFUSALS.append((plate, event_time, hold_until))
     if len(_UNVERIFIED_REFUSALS) > _UNVERIFIED_REFUSALS_MAX:
         del _UNVERIFIED_REFUSALS[:-_UNVERIFIED_REFUSALS_MAX]
 
@@ -501,7 +513,7 @@ def _matches_unverified_refusal(plate: str, when: datetime, window: timedelta) -
     recorded under the burst's winning read, and the HikCentral record may carry
     a truncation of the same plate.
     """
-    for refused_plate, refused_at in _UNVERIFIED_REFUSALS:
+    for refused_plate, refused_at, _hold_until in _UNVERIFIED_REFUSALS:
         if abs((refused_at - when).total_seconds()) > window.total_seconds():
             continue
         if same_vehicle_plate(refused_plate, plate):
@@ -510,31 +522,41 @@ def _matches_unverified_refusal(plate: str, when: datetime, window: timedelta) -
 
 
 async def _retry_unverified_refusals(db: Session) -> None:
-    """Try again to tombstone refusals whose first lookup failed.
+    """Try again to tombstone refusals we could not prove the first time.
 
     Runs at the head of the reconcile sweep, so every attempt to re-open a
     refused pass is preceded by one more chance to make the refusal durable.
+
+    An empty answer does NOT release the hold. The record we are looking for is
+    precisely the one that has not surfaced yet, so "still nothing" is the
+    expected reading while the lag plays out — releasing on it hands the pass
+    straight back to the sweep below, which is the RGR-6666 sequence. The hold
+    ends on its deadline instead, by which point the pass has aged out of the
+    reconcile window anyway.
     """
     if not _UNVERIFIED_REFUSALS:
         return
-    still_pending: list[tuple[str, datetime]] = []
-    for plate, event_time in list(_UNVERIFIED_REFUSALS):
+    now = facility_now_naive()
+    still_pending: list[tuple[str, datetime, datetime]] = []
+    for plate, event_time, hold_until in list(_UNVERIFIED_REFUSALS):
+        if now >= hold_until:
+            logger.info(
+                "[UC1] Refusal hold for plate=%s at %s EXPIRED — HikCentral "
+                "never produced a record to tombstone; the pass is released",
+                plate, event_time,
+            )
+            continue
         try:
             guid = await hikcentral.consume_refused_entry(
                 db, plate, event_time, require_plate_match=True
             )
         except Exception:
-            still_pending.append((plate, event_time))
+            still_pending.append((plate, event_time, hold_until))
             continue
         if guid is None:
-            # We asked and HikCentral has nothing unconsumed for this pass. The
-            # refusal is now verified: there is nothing for the reconciler to
-            # re-open, so the hold can be released.
-            logger.info(
-                "[UC1] Refusal for plate=%s at %s verified — HikCentral holds "
-                "no unconsumed record; releasing the hold",
-                plate, event_time,
-            )
+            # Still nothing to consume. Keep holding: the record may simply not
+            # have reached us yet, and that is the case this guard exists for.
+            still_pending.append((plate, event_time, hold_until))
             continue
         # consume_refused_entry only stages the row; the caller commits. Without
         # this the GUID is still unconsumed when list_unconsumed_records runs
@@ -579,7 +601,17 @@ async def _tombstone_refused_burst(db: Session, buf: dict) -> bool:
         )
         _remember_unverified_refusal(plate, event_time)
         return False
-    return guid is not None
+    if guid is None:
+        # We asked and HikCentral returned nothing unconsumed for this pass.
+        # That reads like "there is nothing for the reconciler to re-open", and
+        # it was treated that way — but crossRecords lags, and the record can
+        # surface minutes later carrying a pass_time from BEFORE this refusal.
+        # The sweep then opens the very pass the gate just refused. Hold it.
+        _remember_unverified_refusal(
+            plate, event_time, why="HikCentral returned no record yet"
+        )
+        return False
+    return True
 
 
 def _recovered_burst(outcome, crossing: dict) -> dict:

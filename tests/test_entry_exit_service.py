@@ -123,6 +123,9 @@ def configure_settings(mock_settings, *, two_phase: bool):
     mock_settings.ANPR_BURST_MAX_SECONDS = 8.0
     mock_settings.ENTRY_CONFIRM_DIRECTIONS = "CAM-23:ramp-entry,CAM-03:B-entry"
     mock_settings.ENTRY_CONFIRM_MATCH_SECONDS = 30.0
+    # A refused burst whose tombstone lookup comes back empty is held for this
+    # long; without a real number the drop path arithmetic fails on the mock.
+    mock_settings.HIK_REFUSAL_HOLD_SECONDS = 900.0
 
 
 def _force_idle():

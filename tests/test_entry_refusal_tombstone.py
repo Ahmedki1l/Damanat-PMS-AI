@@ -398,11 +398,18 @@ async def test_retry_tombstones_the_refusal_once_hikcentral_answers(db, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_a_verified_empty_refusal_holds_nothing_off(db, monkeypatch):
-    """"We asked, HikCentral has nothing" must NOT hold the reconciler off.
+async def test_an_empty_lookup_holds_the_pass_for_a_bounded_time(db, monkeypatch):
+    """"We asked, HikCentral has nothing" is not proof that nothing exists.
 
-    Otherwise every refusal at a gate HikCentral does not cover would blind the
-    sweep to genuinely missed cars for the life of the process.
+    This used to release immediately, on the reasoning that a refusal at a gate
+    HikCentral does not cover would otherwise blind the sweep for the life of
+    the process. That reasoning was sound; the conclusion was not. crossRecords
+    lags, so at refusal time the record for the pass we just refused is exactly
+    the one most likely to be missing — and it surfaces minutes later carrying a
+    pass_time from BEFORE the refusal. See the RGR-6666 test below.
+
+    The hold answers the original objection with a deadline instead of an
+    immediate release: bounded by HIK_REFUSAL_HOLD_SECONDS, never permanent.
     """
     ees._entry_bursts[1] = _burst()
     monkeypatch.setattr(
@@ -412,7 +419,79 @@ async def test_a_verified_empty_refusal_holds_nothing_off(db, monkeypatch):
     _patch_lookup(monkeypatch, [])
     await ees.flush_due_entry_bursts(db)
 
+    assert len(ees._UNVERIFIED_REFUSALS) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_hold_expires_and_never_blinds_the_sweep_for_good(db, monkeypatch):
+    """The bound is real: once it lapses, a genuinely missed car opens again."""
+    monkeypatch.setattr(settings, "HIK_REFUSAL_HOLD_SECONDS", 900.0)
+    ees._entry_bursts[1] = _burst()
+    monkeypatch.setattr(
+        ees, "facility_now_naive", lambda: READ_TIME + timedelta(seconds=120)
+    )
+    _patch_lookup(monkeypatch, [])
+    await ees.flush_due_entry_bursts(db)
+    assert len(ees._UNVERIFIED_REFUSALS) == 1
+
+    # Well past the hold, and now HikCentral does have the record.
+    monkeypatch.setattr(
+        ees, "facility_now_naive", lambda: READ_TIME + timedelta(seconds=1200)
+    )
+    _patch_lookup(monkeypatch, [_record()])
+    opened = []
+
+    async def fake_flush(db_, buf):
+        opened.append(buf["reads"][0]["plate"])
+
+    monkeypatch.setattr(ees, "_flush_entry_burst", fake_flush)
+    await ees._reconcile_missed_entries(db)
+
     assert ees._UNVERIFIED_REFUSALS == []
+    assert opened == ["66565EK"]
+
+
+@pytest.mark.asyncio
+async def test_a_late_arriving_record_cannot_reopen_a_refused_pass(db, monkeypatch):
+    """Reproduces the live RGR-6666 sequence of 2026-09-02.
+
+        09:14:59  ANPR read #1 buffered            plate=RGR-6666
+        09:15:16  ANPR read #2 buffered            plate=RGR-6466  (same car)
+        09:15:31  ramp crossing -> read #2 wins, RGR-6466 admitted
+        09:15:58  read #1 DROPPED at 59s           <- correct refusal
+        09:16:09  tombstone lookup returns EMPTY   <- "nothing to re-open"
+        09:22:36  [Hik][reconcile] OPENED missed entry RGR-6666   <- the bug
+
+    The opened record's pass_time was 09:14:55 — six minutes BEFORE the refusal
+    that was supposed to suppress it. It became a second session and a second
+    unregistered-vehicle alert for a car already parked as RGR-6466.
+
+    An empty lookup is a lag, not an absence. The sweep must find nothing to
+    open once the record finally surfaces.
+    """
+    monkeypatch.setattr(settings, "HIK_REFUSAL_HOLD_SECONDS", 900.0)
+    ees._entry_bursts[1] = _burst(plate="RGR-6666")
+    monkeypatch.setattr(
+        ees, "facility_now_naive", lambda: READ_TIME + timedelta(seconds=120)
+    )
+
+    # 09:16:09 — the tombstone lookup comes back empty.
+    _patch_lookup(monkeypatch, [])
+    await ees.flush_due_entry_bursts(db)
+    assert len(ees._UNVERIFIED_REFUSALS) == 1
+
+    # 09:22:36 — the record surfaces, stamped BEFORE the refusal, and the sweep
+    # runs. It must be tombstoned on the retry, not opened.
+    monkeypatch.setattr(
+        ees, "facility_now_naive", lambda: READ_TIME + timedelta(seconds=460)
+    )
+    _patch_lookup(monkeypatch, [_record(guid="RGR6666GUID", plate="RGR-6666")])
+    monkeypatch.setattr(ees, "_flush_entry_burst", AsyncMock())
+
+    await ees._reconcile_missed_entries(db)
+
+    ees._flush_entry_burst.assert_not_awaited()
+    assert db.query(ParkingSession).count() == 0
 
 
 @pytest.mark.asyncio
