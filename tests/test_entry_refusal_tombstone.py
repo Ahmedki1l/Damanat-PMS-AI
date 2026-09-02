@@ -423,8 +423,12 @@ async def test_an_empty_lookup_holds_the_pass_for_a_bounded_time(db, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_the_hold_expires_and_never_blinds_the_sweep_for_good(db, monkeypatch):
-    """The bound is real: once it lapses, a genuinely missed car opens again."""
+async def test_the_block_does_not_expire(db, monkeypatch):
+    """An ANPR read with no ramp crossing is not a car, and does not become one.
+
+    HIK_REFUSAL_HOLD_SECONDS bounds the tombstone RETRIES, not the block. Past
+    it we stop asking HikCentral and the pass stays refused.
+    """
     monkeypatch.setattr(settings, "HIK_REFUSAL_HOLD_SECONDS", 900.0)
     ees._entry_bursts[1] = _burst()
     monkeypatch.setattr(
@@ -434,21 +438,18 @@ async def test_the_hold_expires_and_never_blinds_the_sweep_for_good(db, monkeypa
     await ees.flush_due_entry_bursts(db)
     assert len(ees._UNVERIFIED_REFUSALS) == 1
 
-    # Well past the hold, and now HikCentral does have the record.
+    # Long past the retry window, and now HikCentral does have the record.
     monkeypatch.setattr(
-        ees, "facility_now_naive", lambda: READ_TIME + timedelta(seconds=1200)
+        ees, "facility_now_naive", lambda: READ_TIME + timedelta(seconds=12000)
     )
     _patch_lookup(monkeypatch, [_record()])
-    opened = []
+    monkeypatch.setattr(ees, "_flush_entry_burst", AsyncMock())
 
-    async def fake_flush(db_, buf):
-        opened.append(buf["reads"][0]["plate"])
-
-    monkeypatch.setattr(ees, "_flush_entry_burst", fake_flush)
     await ees._reconcile_missed_entries(db)
 
-    assert ees._UNVERIFIED_REFUSALS == []
-    assert opened == ["66565EK"]
+    ees._flush_entry_burst.assert_not_awaited()
+    assert db.query(ParkingSession).count() == 0
+    assert len(ees._UNVERIFIED_REFUSALS) == 1      # still blocking
 
 
 @pytest.mark.asyncio
@@ -486,6 +487,46 @@ async def test_a_late_arriving_record_cannot_reopen_a_refused_pass(db, monkeypat
         ees, "facility_now_naive", lambda: READ_TIME + timedelta(seconds=460)
     )
     _patch_lookup(monkeypatch, [_record(guid="RGR6666GUID", plate="RGR-6666")])
+    monkeypatch.setattr(ees, "_flush_entry_burst", AsyncMock())
+
+    await ees._reconcile_missed_entries(db)
+
+    ees._flush_entry_burst.assert_not_awaited()
+    assert db.query(ParkingSession).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_stale_watermark_outlives_a_short_hold(db, monkeypatch):
+    """Reproduces USB-6662, 2026-09-02 — why the hold is 24h and not 15 minutes.
+
+        12:48:04  Hik pass_time
+        12:49:15  refused; tombstone lookup EMPTY; held 900s -> 13:04:15
+        13:04:15  hold expires; nothing sweeps at that moment
+        16:15:34  sweep runs. Entry watermark still frozen at 12:14:13, so it
+                  logs "3:59:21 gap since the last consumed pass" and re-walks
+                  a span CONTAINING 12:48:04
+        16:15:55  [Hik][reconcile] OPENED missed entry USB-6662   <- the bug
+
+    No timed block can fix this. _reconcile_window returns
+    min(now - lookback, watermark), so a stale watermark re-walks arbitrarily
+    far back — there is no point at which the pass is out of reach. The block
+    has to be unconditional, which is what "no crossing, no entry" means.
+    """
+    monkeypatch.setattr(settings, "HIK_REFUSAL_HOLD_SECONDS", 900.0)
+    ees._entry_bursts[1] = _burst(plate="USB-6662")
+    monkeypatch.setattr(
+        ees, "facility_now_naive", lambda: READ_TIME + timedelta(seconds=120)
+    )
+    _patch_lookup(monkeypatch, [])
+    await ees.flush_due_entry_bursts(db)
+    assert len(ees._UNVERIFIED_REFUSALS) == 1
+
+    # 3h27m later — the gap USB-6662 actually slipped through, off a sweep whose
+    # watermark had not moved since before the refusal.
+    monkeypatch.setattr(
+        ees, "facility_now_naive", lambda: READ_TIME + timedelta(seconds=12540)
+    )
+    _patch_lookup(monkeypatch, [_record(guid="USBGUID", plate="USB-6662")])
     monkeypatch.setattr(ees, "_flush_entry_burst", AsyncMock())
 
     await ees._reconcile_missed_entries(db)

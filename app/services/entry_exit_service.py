@@ -465,15 +465,28 @@ def _winning_read(reads: list[dict]) -> dict:
     )
 
 
-# Refusals the gate made but could not tombstone. Each entry holds the gate off
-# re-opening that pass until a later sweep consumes the GUID for real, or until
-# the hold expires.
+# Refusals the gate made but could not tombstone. Each entry blocks the
+# reconciler from re-opening that pass, permanently.
 #
-# Two things land here, and they are the same failure wearing different clothes:
-# HikCentral did not answer, and HikCentral answered with nothing. Neither is
-# proof that no record exists, because crossRecords lags behind the pass itself.
-# Treating the empty answer as proof is what produced RGR-6666 — see
-# HIK_REFUSAL_HOLD_SECONDS.
+# THE RULE: an ANPR read with no ramp crossing is not a car that entered. Every
+# burst in here was dropped for exactly that reason — the plate was read at the
+# gate and no CAM-23/CAM-03 crossing followed within ANPR_BURST_MAX_SECONDS — so
+# there is no entry to recover and nothing the sweep should ever open. The block
+# does not expire, because the fact it encodes does not expire.
+#
+# Measured 2026-09-02 PM: six gate reads, ZERO ramp crossings in six hours. All
+# six were passing traffic (confidences 62-96 against the morning's uniform 96);
+# one was a car the entry camera read nine seconds AFTER it exited. The single
+# one that got opened, USB-6662, became an imageless session nothing can close.
+#
+# The cost of being wrong here is deliberately asymmetric. Blocking a car that
+# really did enter costs an unmatched exit, which announces itself and closes
+# itself — ERS-7949 and EED-7286 did exactly that on 2026-09-02. Opening one
+# that did not costs a session no mechanism can ever close.
+#
+# HIK_REFUSAL_HOLD_SECONDS bounds how long we keep RETRYING the tombstone, not
+# how long the block lasts. A tombstone is the durable form of the same refusal;
+# failing to write one never weakens it.
 #
 # Deliberately in RAM and bounded. The durable alternative is a HikValidation
 # row, and that is not available here: `_catchup_watermark` reads MAX(pass_time)
@@ -482,7 +495,7 @@ def _winning_read(reads: list[dict]) -> dict:
 # drops these and the reconciler may re-open one pass — the same behaviour as
 # before this guard existed, so the failure mode is unchanged, never worsened.
 #
-# (plate, event_time, hold_until)
+# (plate, event_time, retry_until)
 _UNVERIFIED_REFUSALS: list[tuple[str, datetime, datetime]] = []
 _UNVERIFIED_REFUSALS_MAX = 256
 
@@ -493,15 +506,16 @@ def _remember_unverified_refusal(
     # Store canonical, because the reconciler compares against
     # `rec.canonical_plate`. The burst carries the camera's raw read.
     plate = normalize_plate(plate) or plate
-    hold_until = facility_now_naive() + timedelta(
+    retry_until = facility_now_naive() + timedelta(
         seconds=settings.HIK_REFUSAL_HOLD_SECONDS
     )
     logger.warning(
-        "[UC1] Refusal for plate=%s at %s is UNVERIFIED (%s) — holding the "
-        "reconciler off this pass until %s or until it can be tombstoned",
-        plate, event_time, why, hold_until,
+        "[UC1] Refusal for plate=%s at %s could not be tombstoned (%s) — the "
+        "reconciler is blocked from this pass for good; retrying the tombstone "
+        "until %s",
+        plate, event_time, why, retry_until,
     )
-    _UNVERIFIED_REFUSALS.append((plate, event_time, hold_until))
+    _UNVERIFIED_REFUSALS.append((plate, event_time, retry_until))
     if len(_UNVERIFIED_REFUSALS) > _UNVERIFIED_REFUSALS_MAX:
         del _UNVERIFIED_REFUSALS[:-_UNVERIFIED_REFUSALS_MAX]
 
@@ -527,46 +541,48 @@ async def _retry_unverified_refusals(db: Session) -> None:
     Runs at the head of the reconcile sweep, so every attempt to re-open a
     refused pass is preceded by one more chance to make the refusal durable.
 
-    An empty answer does NOT release the hold. The record we are looking for is
-    precisely the one that has not surfaced yet, so "still nothing" is the
-    expected reading while the lag plays out — releasing on it hands the pass
-    straight back to the sweep below, which is the RGR-6666 sequence. The hold
-    ends on its deadline instead, by which point the pass has aged out of the
-    reconcile window anyway.
+    Nothing here releases a pass. An entry leaves this list in exactly one way:
+    the tombstone is finally written, which is the same refusal made durable.
+    Past `retry_until` we simply stop spending HikCentral calls on it and let
+    the in-memory block stand.
+
+    Sizing the retry window by "how long until the pass ages out of the sweep's
+    reach" would not work even if we wanted it to: there is no such point.
+    `_reconcile_window` anchors on the watermark, so a stale one re-walks
+    arbitrarily far back — USB-6662 on 2026-09-02 was opened 3h27m after its
+    pass, off a 3h59m watermark gap, when the block was still time-bounded.
     """
     if not _UNVERIFIED_REFUSALS:
         return
     now = facility_now_naive()
-    still_pending: list[tuple[str, datetime, datetime]] = []
-    for plate, event_time, hold_until in list(_UNVERIFIED_REFUSALS):
-        if now >= hold_until:
-            logger.info(
-                "[UC1] Refusal hold for plate=%s at %s EXPIRED — HikCentral "
-                "never produced a record to tombstone; the pass is released",
-                plate, event_time,
-            )
+    still_blocked: list[tuple[str, datetime, datetime]] = []
+    for plate, event_time, retry_until in list(_UNVERIFIED_REFUSALS):
+        if now >= retry_until:
+            # Stop asking, keep blocking.
+            still_blocked.append((plate, event_time, retry_until))
             continue
         try:
             guid = await hikcentral.consume_refused_entry(
                 db, plate, event_time, require_plate_match=True
             )
         except Exception:
-            still_pending.append((plate, event_time, hold_until))
+            still_blocked.append((plate, event_time, retry_until))
             continue
         if guid is None:
-            # Still nothing to consume. Keep holding: the record may simply not
-            # have reached us yet, and that is the case this guard exists for.
-            still_pending.append((plate, event_time, hold_until))
+            # Still nothing to consume. The record may simply not have reached
+            # us yet, and that is the case this guard exists for.
+            still_blocked.append((plate, event_time, retry_until))
             continue
         # consume_refused_entry only stages the row; the caller commits. Without
         # this the GUID is still unconsumed when list_unconsumed_records runs
         # immediately below, and the pass is re-opened anyway.
         db.commit()
         logger.info(
-            "[UC1] Refusal for plate=%s at %s tombstoned on retry (guid=%s)",
+            "[UC1] Refusal for plate=%s at %s tombstoned on retry (guid=%s) — "
+            "the block is now durable",
             plate, event_time, guid,
         )
-    _UNVERIFIED_REFUSALS[:] = still_pending
+    _UNVERIFIED_REFUSALS[:] = still_blocked
 
 
 async def _tombstone_refused_burst(db: Session, buf: dict) -> bool:

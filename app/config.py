@@ -998,12 +998,27 @@ class Settings(BaseSettings):
     # RGR-6666 became a duplicate session for a car already admitted as
     # RGR-6466 and fired a second unregistered-vehicle alert on it.
     #
-    # Defaults to the lookback window: once the pass falls out of that, the
-    # sweep can no longer reach it and the hold has nothing left to protect.
-    # A genuinely missed entry is delayed by this, never lost — the GUID stays
-    # unconsumed and the next sweep after the hold expires can still open it.
+    # How long to keep RETRYING the tombstone for a refusal we could not prove.
+    # It does NOT bound the block — see _UNVERIFIED_REFUSALS. A dropped burst is
+    # an ANPR read with no ramp crossing, which is not a car that entered, so
+    # the reconciler is blocked from that pass permanently. This value only
+    # decides how long we keep spending HikCentral calls trying to make the
+    # refusal durable.
+    #
+    # It was briefly used as the block duration, at 900s, on the reasoning that
+    # a pass ages out of the sweep's reach after the lookback. That is wrong
+    # twice over. `_reconcile_window` returns min(now - lookback, watermark), so
+    # HIK_RECONCILE_LOOKBACK_SECONDS is a FLOOR on coverage and never a ceiling
+    # on reach — a stale watermark drags the window back without limit. And
+    # more basically, "the car did not enter" is not a fact that expires.
+    #
+    # USB-6662 on 2026-09-02 is the proof of both. Refused 12:49:15 with an
+    # empty lookup, block released at 13:04:15, opened at 16:15:55 off a
+    # "3:59:21 gap since the last consumed pass" sweep. Zero ramp crossings
+    # existed in the whole six-hour window; no car entered. A timed block turned
+    # a phantom into a slower phantom.
     HIK_REFUSAL_HOLD_SECONDS: float = Field(
-        default=900.0, ge=0, le=86400.0, allow_inf_nan=False,
+        default=900.0, ge=0, le=604800.0, allow_inf_nan=False,
     )
     # Max records pulled per camera per poll (crossRecords pageSize, ≤ 500).
     HIK_RECONCILE_PAGE_SIZE: int = Field(default=100, gt=0, le=500)
