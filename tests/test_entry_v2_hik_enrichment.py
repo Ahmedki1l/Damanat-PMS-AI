@@ -19,16 +19,29 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.services import entry_v2_hik_enrichment as enrichment
+from app.services.hikcentral.models import VehicleLogRecord, normalize_plate
 
 
 NOW = datetime(2026, 8, 29, 12, 0, 0)
 
 
 def _record(guid, seconds_offset, plate="ABC-1234", image="pic://x"):
-    return SimpleNamespace(
+    """A real VehicleLogRecord, which is what list_entry_candidates returns.
+
+    This used to be a SimpleNamespace carrying a `plate` attribute. That is not
+    a field VehicleLogRecord has -- it spells the plate `plate_license` and
+    `canonical_plate` -- so the stub agreed with the producer's
+    `getattr(record, "plate", "")` and both were wrong together. Every candidate
+    went out with an empty reported_plate and VA answered 422, for five days,
+    while this suite stayed green. Constructing the real type is the only thing
+    that makes a field rename or a wrong attribute fail here instead of in
+    production.
+    """
+    return VehicleLogRecord(
         guid=guid,
-        plate=plate,
         pass_time=NOW + timedelta(seconds=seconds_offset),
+        plate_license=plate,
+        canonical_plate=normalize_plate(plate),
         vehicle_image_url=image,
     )
 
@@ -246,3 +259,36 @@ async def test_hikcentral_disabled_short_circuits(monkeypatch):
         )
     assert block["queried"] is False
     assert block["api_error"] == "hikcentral_disabled"
+
+
+@pytest.mark.asyncio
+async def test_the_forwarded_plate_is_the_canonical_letters_first_spelling(enabled):
+    """HikCentral spells plates digits-first; VA keys identities letters-first.
+
+    `plate_key` strips punctuation but does NOT reorder, so "4920HBR" and
+    "HBR4920" are different keys. Forwarding HikCentral's raw licence would
+    attach the candidate to a SECOND identity group instead of the one the gate
+    read already created -- a phantom, which is worse than the 422 that empty
+    plates used to produce.
+    """
+    post = AsyncMock(return_value=_ack())
+    _block, _posted = await _run([_record("g1", 0, plate="4920HBR")], post=post)
+
+    assert post.await_count == 1
+    assert post.await_args.kwargs["data"]["reported_plate"] == "HBR-4920"
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_with_no_canonical_plate_is_dropped_not_forwarded(enabled):
+    """An unnormalisable licence is withheld rather than guessed.
+
+    Sending the raw string would fork the identity; sending "" is the 422 this
+    lane spent five days doing. Neither is evidence, so nothing is sent.
+    """
+    post = AsyncMock(return_value=_ack())
+    block, _posted = await _run([_record("g1", 0, plate="")], post=post)
+
+    assert post.await_count == 0
+    assert block["forwarded"] == []
+    assert block["no_plate"] == ["g1"], "the drop must be countable, not just logged"
+

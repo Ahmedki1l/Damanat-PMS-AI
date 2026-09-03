@@ -88,6 +88,11 @@ async def enrich_entry_from_hikcentral(
         "images": 0,
         "forwarded": [],
         "no_image": [],
+        # Candidates withheld because HikCentral's licence would not normalise.
+        # Counted rather than only logged: "1 image fetched, 0 forwarded" with
+        # no machine-readable reason is the exact shape that let this lane fail
+        # invisibly for five days.
+        "no_plate": [],
         "api_error": None,
     }
     if settings.ENTRY_V2_MODE == "off":
@@ -121,6 +126,13 @@ async def enrich_entry_from_hikcentral(
         content = await _download(image_url)
         if content is None:
             block["no_image"].append(guid)
+            continue
+        if not (getattr(record, "canonical_plate", "") or "").strip():
+            # Checked before the image is counted so the block stays readable:
+            # this candidate was never a forward that failed, it was one we
+            # declined to make. See _forward_candidate for why the raw
+            # digits-first licence is not an acceptable substitute.
+            block["no_plate"].append(guid)
             continue
         block["images"] += 1
         delivered = await _forward_candidate(
@@ -164,7 +176,31 @@ async def _forward_candidate(
     twice is exactly what the consensus rule exists to prevent.
     """
     guid = getattr(record, "guid", "") or ""
-    plate = getattr(record, "plate", "") or ""
+    # `list_entry_candidates` hands back VehicleLogRecord, which spells the plate
+    # `plate_license` (HikCentral's own digits-first "4920HBR") and
+    # `canonical_plate` (normalize_plate of it, letters-first "HBR-4920").
+    # It has NO `.plate` — that attribute belongs to HikOutcome. Reading it
+    # through getattr's default silently produced "" on every candidate, and VA
+    # answers an empty reported_plate with 422 invalid_reported_plate, so this
+    # lane delivered nothing from the day it shipped (hik_sourced was false on
+    # all 158 identities across five days of decision logs).
+    #
+    # It must be the CANONICAL spelling. VA's find-or-create keys the identity
+    # on plate_key(reported_plate), which strips punctuation but does NOT
+    # reorder: "HBR4920" and "4920HBR" are different keys. Sending the raw
+    # digits-first licence would attach this candidate to a SECOND identity
+    # group instead of the one the gate read already created — a phantom, which
+    # is worse than the 422 it replaces. So when normalisation cannot produce a
+    # canonical spelling we forward nothing and say why.
+    plate = (getattr(record, "canonical_plate", "") or "").strip()
+    if not plate:
+        logger.warning(
+            "[EntryV2][Hik] candidate guid=%s dropped: no canonical plate for "
+            "licence %r — forwarding the raw spelling would fork the identity",
+            guid,
+            getattr(record, "plate_license", ""),
+        )
+        return False
     source_event_id = f"hik:{guid}"
     attempt_id = str(uuid5(_ID_NAMESPACE, f"attempt:{source_event_id}"))
     metadata = {
