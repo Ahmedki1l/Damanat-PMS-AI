@@ -210,6 +210,14 @@ async def _forward_candidate(
         "anchor_camera_id": camera_id,
         "anchor_event_time": _iso(event_time),
     }
+    # Did the barrier actually open for this car? Rides the metadata VA already
+    # reads so the verdict lands in entry_decisions_gate_*.jsonl beside the
+    # Re-ID score that made the call. Absent whenever the probe cannot answer —
+    # see entry_v2_barrier_probe for why absence is not a refusal.
+    barrier = await _barrier_verdict(plate, getattr(record, "pass_time", None)
+                                     or event_time)
+    if barrier is not None:
+        metadata["barrier"] = barrier
     data = {
         "attempt_id": attempt_id,
         "source_event_id": source_event_id,
@@ -249,6 +257,25 @@ async def _forward_candidate(
         )
         return False
     return True
+
+
+async def _barrier_verdict(plate: str, when) -> Optional[dict]:
+    """The probe's answer, or None. Never raises and never blocks a forward.
+
+    Imported lazily and wrapped: this is an OPTIONAL observational add-on, and
+    an add-on that cannot answer must be silent rather than fatal. A raising
+    validator for exactly this class of feature crash-looped every pod in this
+    facility once already.
+    """
+    if not isinstance(when, datetime):
+        return None
+    try:
+        from app.services.entry_v2_barrier_probe import lookup_barrier_verdict
+
+        return await lookup_barrier_verdict(plate=plate, event_time=when)
+    except Exception as exc:  # pragma: no cover - defensive by policy
+        logger.debug("[EntryV2][barrier] verdict unavailable: %r", exc)
+        return None
 
 
 def _iso(value) -> str:

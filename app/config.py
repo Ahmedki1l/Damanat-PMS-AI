@@ -852,6 +852,17 @@ class Settings(BaseSettings):
     HIK_APP_KEY: str = ""
     HIK_APP_SECRET: str = ""
     HIK_VERIFY_TLS: bool = True
+    # Parking lot ID for the /artemis/api/vehicle/v1/* namespace, which is the
+    # only place the platform reports whether the BARRIER opened. Discover it
+    # with scripts/setup/probe_hik_barrier_result.py --list-lots. Empty means
+    # the barrier probe stays idle — it is evidence for the shadow review, so
+    # an unset code costs a log field and nothing else.
+    HIK_PARKING_LOT_INDEX_CODE: str = ""
+    # Record allowResult/allowType alongside every Hik-sourced identity in
+    # entry_decisions_gate_*.jsonl. STRICTLY OBSERVATIONAL: nothing branches on
+    # the verdict, because neither the namespace's authorization nor the
+    # fields' population has been confirmed against this deployment yet.
+    ENTRY_V2_BARRIER_PROBE_ENABLED: bool = False
     # OpenAPI camera indexCode for the entry LPR camera (e.g. "447" = ANPR-1
     # Entry, discovered via /artemis/api/resource/v1/cameras). One code per
     # lookup.
