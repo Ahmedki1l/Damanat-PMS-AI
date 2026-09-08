@@ -6,6 +6,7 @@ that it declines whenever the evidence is ambiguous.
 """
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -524,3 +525,240 @@ async def test_recovered_burst_is_not_looked_up_again(monkeypatch, db):
     # The record was already fetched during recovery.
     assert calls == []
     assert db.query(ParkingSession).one().plate_number == "JKA-5625"
+
+
+# ── Seeding the Entry V3 identity ───────────────────────────────────────────
+#
+# The gap these cover: V3 creates identities only from a camera ANPR read, so
+# before this a recovered crossing reached V3 with nothing to score against.
+# On 2026-09-08 that cost V3 two entries (EEB-80, DLB-6690) the legacy path had
+# recovered correctly — neither produced a single decision record.
+
+
+@pytest.mark.asyncio
+async def test_recovery_seeds_a_v3_identity_from_the_recovered_plate(
+    monkeypatch, db
+):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    seeded = []
+    monkeypatch.setattr(
+        entry_exit_service, "enqueue_entry_v2_shadow",
+        lambda event: seeded.append(event) or True,
+    )
+    _stub_lookup(monkeypatch, [_record()])
+    _stub_images(monkeypatch)
+
+    assert await entry_exit_service._recover_silent_entry(db, _crossing()) is True
+
+    assert len(seeded) == 1
+    event = seeded[0]
+    assert event.plate_number == "JKA-5625"
+    # It must look like a gate ANPR read or V3's is_entry_attempt rejects it
+    # and no identity is ever created.
+    assert event.event_type == "ANPR"
+    assert event.camera_id == "CAM-ENTRY"
+    assert event.gate == "entry"
+
+
+@pytest.mark.asyncio
+async def test_the_seeded_read_is_timed_by_hikcentral_not_by_now(
+    monkeypatch, db
+):
+    """Causality is the whole trick.
+
+    V3 discards an identity whose read follows the crossing. The ramp crossing
+    has ALREADY happened by the time recovery runs, so stamping the seeded
+    attempt with the current time would build an identity that can never match
+    anything. HikCentral's PassTime genuinely precedes the ramp.
+    """
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    seeded = []
+    monkeypatch.setattr(
+        entry_exit_service, "enqueue_entry_v2_shadow",
+        lambda event: seeded.append(event) or True,
+    )
+    _stub_lookup(monkeypatch, [_record()])
+    _stub_images(monkeypatch)
+
+    await entry_exit_service._recover_silent_entry(db, _crossing())
+
+    # PassTime is 15s BEFORE the ramp crossing at 15:05:40.
+    assert seeded[0].trigger_time == datetime(2026, 7, 27, 15, 5, 25)
+    assert seeded[0].trigger_time < CROSSING_TIME
+    # Not "pms_receive_*": that prefix drops captured_at from the source-event
+    # digest, and two recoveries of one pass would stop deduplicating.
+    assert not seeded[0].trigger_time_source.startswith("pms_receive_")
+
+
+@pytest.mark.asyncio
+async def test_a_declined_recovery_seeds_nothing(monkeypatch, db):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    seeded = []
+    monkeypatch.setattr(
+        entry_exit_service, "enqueue_entry_v2_shadow",
+        lambda event: seeded.append(event) or True,
+    )
+    _stub_lookup(monkeypatch, [])
+
+    assert await entry_exit_service._recover_silent_entry(db, _crossing()) is False
+    assert seeded == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_seed_never_costs_us_the_recovered_entry(monkeypatch, db):
+    """An optional add-on that raises has crash-looped this facility once."""
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+
+    def explode(event):
+        raise RuntimeError("shadow queue exploded")
+
+    monkeypatch.setattr(entry_exit_service, "enqueue_entry_v2_shadow", explode)
+    _stub_lookup(monkeypatch, [_record()])
+    _stub_images(monkeypatch)
+
+    assert await entry_exit_service._recover_silent_entry(db, _crossing()) is True
+    # The legacy entry survived the seeding failure intact.
+    assert db.query(ParkingSession).one().plate_number == "JKA-5625"
+    assert db.query(EntryExitLog).one().plate_number == "JKA-5625"
+
+
+# ── Ambiguous recovery: let Re-ID choose ────────────────────────────────────
+#
+# A car passes the gate and HikCentral logs it but never enters; another car
+# then enters with no ANPR read. Two candidates land in one window, recovery
+# declines rather than guess, and the real entry is lost. V3 gets every
+# candidate so the ramp crossing can be scored against all of them.
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_recovery_seeds_every_candidate(monkeypatch, db):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    seeded = []
+    monkeypatch.setattr(
+        entry_exit_service, "_seed_one_v2_attempt",
+        lambda plate, event_time: seeded.append((plate, event_time)) or True,
+    )
+    _stub_lookup(monkeypatch, [
+        _record(plate="5625JKA", guid="GUID-1", offset_seconds=-20),
+        _record(plate="7788ABC", guid="GUID-2", offset_seconds=-10),
+    ])
+
+    # Legacy behaviour is unchanged: it still refuses to choose.
+    assert await entry_exit_service._recover_silent_entry(db, _crossing()) is False
+    assert db.query(ParkingSession).count() == 0
+
+    # But V3 now gets both, each timed by its OWN HikCentral PassTime so the
+    # causality filter can judge them independently.
+    assert sorted(plate for plate, _ in seeded) == ["JKA-5625", "ABC-7788"][::-1]
+    assert dict(seeded)["JKA-5625"] == datetime(2026, 7, 27, 15, 5, 20)
+    assert dict(seeded)["ABC-7788"] == datetime(2026, 7, 27, 15, 5, 30)
+
+
+@pytest.mark.asyncio
+async def test_a_single_candidate_is_not_an_ambiguity(monkeypatch, db):
+    """One candidate is recover_entry_plate's job, and it already did it."""
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    ambiguous = []
+    monkeypatch.setattr(
+        entry_exit_service, "_seed_entry_v2_candidates",
+        AsyncMock(side_effect=lambda db, crossing: ambiguous.append(crossing)),
+    )
+    _stub_lookup(monkeypatch, [_record()])
+    _stub_images(monkeypatch)
+
+    assert await entry_exit_service._recover_silent_entry(db, _crossing()) is True
+    assert ambiguous == []
+
+
+@pytest.mark.asyncio
+async def test_no_candidates_seeds_nothing(monkeypatch, db):
+    """A silent gate is stage S7's case, not an ambiguity."""
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    seeded = []
+    monkeypatch.setattr(
+        entry_exit_service, "_seed_one_v2_attempt",
+        lambda plate, event_time: seeded.append(plate) or True,
+    )
+    _stub_lookup(monkeypatch, [])
+
+    assert await entry_exit_service._recover_silent_entry(db, _crossing()) is False
+    assert seeded == []
+
+
+@pytest.mark.asyncio
+async def test_a_consumed_guid_is_not_a_candidate_for_seeding(monkeypatch, db):
+    """A GUID already spent belongs to a car the service has accounted for.
+
+    It must not be reseeded, or one real entry becomes an ambiguity that
+    competes against itself.
+    """
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    seeded = []
+    monkeypatch.setattr(
+        entry_exit_service, "_seed_one_v2_attempt",
+        lambda plate, event_time: seeded.append(plate) or True,
+    )
+    monkeypatch.setattr(
+        "app.services.hikcentral.validation.guid_already_used",
+        lambda db, guid: guid == "GUID-2",
+    )
+    _stub_lookup(monkeypatch, [
+        _record(plate="5625JKA", guid="GUID-1"),
+        _record(plate="7788ABC", guid="GUID-2"),
+    ])
+    _stub_images(monkeypatch)
+
+    # One usable candidate left, so this is a normal recovery, not an ambiguity.
+    assert await entry_exit_service._recover_silent_entry(db, _crossing()) is True
+    assert "ABC-7788" not in seeded
+
+
+@pytest.mark.asyncio
+async def test_a_failed_candidate_lookup_never_breaks_the_alert(monkeypatch, db):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+
+    async def explode(*args, **kwargs):
+        raise RuntimeError("hik unreachable")
+
+    monkeypatch.setattr(
+        "app.services.hikcentral.recoverable_candidates", explode
+    )
+    _stub_lookup(monkeypatch, [])
+
+    # Still a clean decline, so the caller still raises the silent-entry alert.
+    assert await entry_exit_service._recover_silent_entry(db, _crossing()) is False
+
+
+@pytest.mark.asyncio
+async def test_the_seeded_event_is_one_v3_actually_accepts(monkeypatch, db):
+    """The seeded event must satisfy V3's own predicates, not just ours.
+
+    Every other test here mocks the enqueue, so none of them prove the
+    synthesized event survives `is_entry_attempt` — and an event V3 classifies
+    as anything else creates no identity at all, which is the exact failure
+    being fixed.
+    """
+    from app.services import entry_v2_forwarder as fwd
+
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    captured = []
+    monkeypatch.setattr(fwd, "_shadow_accepting", True)
+    monkeypatch.setattr(fwd, "_shadow_queue", SimpleNamespace(
+        put_nowait=captured.append, qsize=lambda: 0, maxsize=64,
+    ))
+    _stub_lookup(monkeypatch, [_record()])
+    _stub_images(monkeypatch)
+
+    assert await entry_exit_service._recover_silent_entry(db, _crossing()) is True
+
+    assert len(captured) == 1
+    event = captured[0]
+    # V3 routes on these three, and all must hold or no identity is built.
+    assert fwd.is_entry_attempt(event) is True
+    assert fwd.is_entry_v2_evidence(event) is True
+    assert fwd.is_unresolved_attempt(event) is False
+    # The id must be stable, so re-recovering one pass deduplicates instead of
+    # creating a second competing identity for the same car.
+    assert fwd._source_event_id(event) == fwd._source_event_id(event)
+    # And it must be timezone-resolvable at the V2 edge.
+    assert fwd._aware_trigger_time(event).utcoffset() is not None

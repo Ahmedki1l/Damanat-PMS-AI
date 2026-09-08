@@ -49,6 +49,7 @@ from app.services.hikcentral.validation import (
     record_hik_validation,
     list_entry_candidates,
     recover_entry_plate,
+    recoverable_candidates,
     validate_entry_plate,
     validate_exit_plate,
 )
@@ -79,6 +80,7 @@ __all__ = [
     "list_camera_events",
     "list_entry_candidates",
     "recover_entry_plate",
+    "recoverable_candidates",
     "start_hikcentral_http_client",
     "validate_entry_plate",
     "validate_exit_plate",

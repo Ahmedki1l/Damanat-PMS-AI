@@ -51,6 +51,8 @@ from app.services.event_parser import (
 from app.services.alert_service import create_alert
 from app.services import hikcentral
 from app.services.hikcentral import HikImages
+from app.services.hikcentral.models import to_facility_naive
+from app.services.entry_v2_forwarder import enqueue_entry_v2_shadow
 from app.config import settings, facility_now_naive, facility_tz
 from app.utils.logger import get_logger
 from app.utils import core_backend_client
@@ -667,6 +669,156 @@ def _recovered_burst(outcome, crossing: dict) -> dict:
     }
 
 
+def _seed_entry_v2_identity(outcome, crossing: dict) -> None:
+    """Give Entry V3 the ANPR read the gate camera never produced.
+
+    WHY THIS EXISTS. V3 builds identities in its `anpr_identity` stage, driven
+    by a camera ANPR event. HikCentral can only *enrich* an identity that
+    already exists — `hik_sourced` appears on `identity_enriched`, never on
+    `created` — so a crossing rescued by `_recover_silent_entry` reached V3 as a
+    ramp observation with nothing to be scored against. On 2026-09-08 that was
+    both of the day's recoveries: EEB-80 and DLB-6690 were confirmed by the
+    legacy path and produced ZERO decision records, so V3 was charged with two
+    misses for entries the service had in fact recovered correctly.
+
+    Synthesising the read rather than teaching V3 a second creation path is the
+    same choice `_recovered_burst` makes one function above: the event enters
+    the ordinary shadow FIFO, so identity creation AND the stage-S2 HikCentral
+    image enrichment that fills the Re-ID gallery both run as they do for a car
+    the camera labelled itself.
+
+    CAUSALITY IS THE WHOLE TRICK. V3 discards any identity whose read follows
+    the crossing (`causal_attempt_embeddings`), and here the ramp crossing has
+    already happened. `pass_time_local` is HikCentral's own gate PassTime, which
+    genuinely precedes the ramp, so the seeded attempt is causally eligible;
+    stamping it `facility_now_naive()` would produce an identity that can never
+    match anything. The observation is still in V3's pool — its TTL outlives the
+    recovery by an order of magnitude — so it is re-evaluated against the new
+    identity on the next pass.
+
+    OBSERVATION-ONLY, AND NEVER RAISES. `enqueue_entry_v2_shadow` no-ops unless
+    ENTRY_V2_MODE is `shadow`, and a full or stopped queue drops the event. A
+    seeding failure must never cost us the legacy entry we just recovered — an
+    optional add-on that raises has crash-looped every pod in this facility once
+    already.
+    """
+    event_time = outcome.pass_time_local or crossing.get("ts")
+    if not outcome.plate or event_time is None:
+        return
+    if _seed_one_v2_attempt(outcome.plate, event_time):
+        logger.info(
+            "[EntryV2][shadow] Seeded V3 identity from HikCentral recovery: "
+            "plate=%s pass_time=%s source=%s",
+            outcome.plate, event_time, crossing.get("source"),
+        )
+
+
+def _seed_one_v2_attempt(plate: str, event_time) -> bool:
+    """Hand V3 one synthetic gate read. Returns whether it was queued."""
+    try:
+        return enqueue_entry_v2_shadow(ParsedCameraEvent(
+            # HikCentral saw this car at the entry LPR resource, so the gate
+            # camera is the honest attribution — matching `_recovered_burst`.
+            # It is also what makes `is_entry_attempt` true: CAMERAS maps
+            # CAM-ENTRY to gate="entry".
+            camera_id="CAM-ENTRY",
+            device_serial="",
+            channel_id=0,
+            event_type="ANPR",
+            detection_target="vehicle",
+            region_id=None,
+            channel_name=None,
+            trigger_time=event_time,
+            raw_xml="<hikRecoveredEntry/>",
+            # Not "camera": no camera reported this. The value must not start
+            # with "pms_receive_", or `_source_event_id` drops captured_at from
+            # the digest and two recoveries of the same pass stop deduplicating.
+            trigger_time_source="hik_recovered",
+            event_state="active",
+            event_description="HikCentral silent-entry recovery",
+            plate_number=plate,
+            gate="entry",
+        ))
+    except Exception:
+        logger.warning(
+            "[EntryV2][shadow] Could not seed identity for plate=%s; V3 will "
+            "score this crossing without it",
+            plate,
+            exc_info=True,
+        )
+        return False
+
+
+async def _seed_entry_v2_candidates(db: Session, crossing: dict) -> None:
+    """Recovery refused to choose between several cars — let Re-ID choose.
+
+    THE CASE. A car passes the gate and HikCentral logs it, but it never
+    actually enters. Another car then enters with no ANPR read at all. Both sit
+    in the same lookup window, so `recover_entry_plate` sees two candidates and
+    declines — correctly, because nothing in a timestamp says which one drove
+    down the ramp, and guessing staples a stranger's plate onto the session.
+    The real entry is then lost as a silent entry and resurfaces days later as a
+    phantom overstay.
+
+    WHAT THIS DOES INSTEAD. It seeds EVERY candidate as a V3 identity and lets
+    the ramp crossing — which is still sitting in V3's observation pool, its TTL
+    an order of magnitude longer than this path — be scored against all of them.
+    The car that actually crossed matches its own image; the one that turned
+    away does not. That is `list_entry_candidates`' stated contract ("every
+    record here is a CANDIDATE, and Re-ID over the returned images is what
+    decides") applied to the case where we have no plate to start from, and it
+    is the only evidence that separates these two cars. The barrier probe will
+    separate SOME of them by `allowResult`, but only when the platform actually
+    refused the car that turned away.
+
+    SHADOW ONLY, AND IT DECIDES NOTHING. `enqueue_entry_v2_shadow` no-ops unless
+    ENTRY_V2_MODE is `shadow`, so this writes decision-log evidence and never a
+    session. Seeding a car that did not enter is exactly the phantom-entry risk
+    that keeps this observational: the wrong candidate is an identity that lives
+    until its TTL and could compete for a later crossing. Reading a day of
+    `entry_decisions_gate_*.jsonl` is how we find out whether Re-ID picks the
+    right one often enough to be trusted with a real session.
+
+    COSTS ONE EXTRA LOOKUP, on a path where the alternative is losing the car.
+    `recover_entry_plate` already queried and threw its candidates away rather
+    than widen its return type; this runs only in the declined branch, which is
+    rare, and `recoverable_candidates` returns [] on any failure.
+    """
+    try:
+        candidates = await hikcentral.recoverable_candidates(
+            crossing.get("ts"), db
+        )
+    except Exception:
+        logger.warning("[EntryV2][shadow] Candidate lookup failed", exc_info=True)
+        return
+    # One candidate is `recover_entry_plate`'s own job and it has already run.
+    # Zero means the gate never named anything, which is stage S7's case, not
+    # an ambiguity — there is nothing here for Re-ID to choose between.
+    if len(candidates) < 2:
+        return
+
+    seeded = []
+    for record in candidates:
+        if record.pass_time is None:
+            continue
+        # Each candidate keeps its OWN PassTime, so V3's causality filter can
+        # judge them independently: a car that passed the gate after this
+        # crossing cannot have been the car that made it.
+        if _seed_one_v2_attempt(
+            record.canonical_plate, to_facility_naive(record.pass_time)
+        ):
+            seeded.append(record.canonical_plate)
+    if seeded:
+        logger.warning(
+            "[EntryV2][shadow] Recovery was ambiguous for the %s crossing at "
+            "%s (%d candidates); seeded %s for Re-ID to choose between",
+            crossing.get("source"),
+            crossing.get("ts"),
+            len(candidates),
+            ", ".join(seeded),
+        )
+
+
 async def _recover_silent_entry(db: Session, crossing: dict) -> bool:
     """Try to rescue a plateless ramp crossing using HikCentral (Case B).
 
@@ -683,6 +835,9 @@ async def _recover_silent_entry(db: Session, crossing: dict) -> bool:
         db,
     )
     if outcome is None or not outcome.plate:
+        # Legacy still declines and the caller still raises the silent-entry
+        # alert. This only gives V3 the candidates it never got to see.
+        await _seed_entry_v2_candidates(db, crossing)
         return False
 
     logger.warning(
@@ -691,6 +846,10 @@ async def _recover_silent_entry(db: Session, crossing: dict) -> bool:
         outcome.plate, outcome.guid, crossing.get("source"),
     )
     await _flush_entry_burst(db, _recovered_burst(outcome, crossing))
+    # Legacy state is committed first, exactly as the router defers its own
+    # shadow enqueue until after commit: the shadow FIFO never sits in front of
+    # an entry we have already decided.
+    _seed_entry_v2_identity(outcome, crossing)
     return True
 
 

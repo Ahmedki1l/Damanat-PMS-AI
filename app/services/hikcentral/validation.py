@@ -435,6 +435,44 @@ async def validate_exit_plate(
     )
 
 
+def filter_recoverable(
+    records, db: Optional[Session] = None
+) -> list[VehicleLogRecord]:
+    """The records that could plausibly BE the car that crossed the ramp.
+
+    Extracted so `recover_entry_plate` and the Entry V3 ambiguity seeding can
+    never disagree about what counts as a candidate. A record with no readable
+    plate cannot recover anything, and a GUID already consumed belongs to a car
+    the service has already accounted for.
+
+    Which candidate (if any) is the car is NOT decided here.
+    `recover_entry_plate` answers that only when there is exactly one; when
+    there are several, only Re-ID over the images can.
+    """
+    return [
+        r
+        for r in records
+        if r.canonical_plate and not guid_already_used(db, r.guid)
+    ]
+
+
+async def recoverable_candidates(
+    crossing_time, db: Optional[Session] = None
+) -> list[VehicleLogRecord]:
+    """`filter_recoverable` over a fresh lookup, for callers outside recovery.
+
+    Returns [] when HikCentral is off or the entry resource is unconfigured —
+    an unknown indexCode answers HTTP 200 / code=0 / empty, so silence here is
+    never allowed to be reported as a confident zero.
+    """
+    if not _enabled():
+        return []
+    resource_ids = settings.hik_entry_resource_ids()
+    if not resource_ids:
+        return []
+    return filter_recoverable(await _lookup(crossing_time, resource_ids), db)
+
+
 async def recover_entry_plate(
     crossing_time, source_cam: str, db: Optional[Session] = None
 ) -> Optional[HikOutcome]:
@@ -456,12 +494,7 @@ async def recover_entry_plate(
         return None
 
     records = await _lookup(crossing_time, resource_ids)
-    # A record with no readable plate cannot recover anything.
-    candidates = [
-        r
-        for r in records
-        if r.canonical_plate and not guid_already_used(db, r.guid)
-    ]
+    candidates = filter_recoverable(records, db)
 
     if len(candidates) != 1:
         logger.info(
