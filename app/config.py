@@ -1047,6 +1047,24 @@ class Settings(BaseSettings):
     # Set False to restore the old behaviour of opening it regardless.
     HIK_RECONCILE_REQUIRE_IMAGE: bool = True
 
+    # Whether the entry sweep may OPEN a session from a HikCentral pass alone.
+    #
+    # Off by default, because the sweep's premise does not hold at this site.
+    # It reads "an entry-LPR pass with no edge trace" as a car the edge missed,
+    # but that camera also sees traffic that drives past the barrier and never
+    # goes down the ramp. The crossing gate's refusal is supposed to cover those,
+    # and it cannot when the edge read was lost, the refusal lived only in RAM
+    # across a restart, or HikCentral spelled the plate differently from the edge.
+    # Measured 2026-09-15: 29 of 31 overstays were HIK-RECON sessions, and every
+    # one of the 29 was confirmed by image review to be a car passing by.
+    #
+    # With this off the sweep still logs every pass it WOULD open (as shadow
+    # does) and the exit sweep is untouched. A crossing with no plate is still
+    # rescued by `_recover_silent_entry`, which starts from a CAM-23/03 crossing.
+    # A genuinely missed entry costs an unmatched exit; a wrong one costs an
+    # overstay nothing can close.
+    HIK_RECONCILE_OPEN_ENTRIES: bool = False
+
     # ── Restart catch-up ──────────────────────────────────────────────────
     # The rolling sweep above is near-sighted by design (it runs on every gate
     # event), so it cannot heal downtime: a 4h outage on 2026-08-09 stranded 25

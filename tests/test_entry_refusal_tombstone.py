@@ -53,6 +53,9 @@ def hik_authoritative(monkeypatch):
     monkeypatch.setattr(settings, "HIK_ENTRY_RESOURCE_IDS", "447")
     monkeypatch.setattr(settings, "ANPR_BURST_MAX_SECONDS", 60.0)
     monkeypatch.setattr(settings, "USE_CAM03_ENTRY_CONFIRMATION", True)
+    # These tests exercise the guards that sit in front of an OPEN, so they need
+    # the sweep allowed to open. The production default is covered separately.
+    monkeypatch.setattr(settings, "HIK_RECONCILE_OPEN_ENTRIES", True)
     monkeypatch.setattr(
         "app.utils.core_backend_client.notify_pms_anpr", AsyncMock()
     )
@@ -628,3 +631,30 @@ async def test_the_guard_can_be_switched_off(db, monkeypatch):
     await ees._reconcile_missed_entries(db)
 
     assert opened == ["05826LD"]
+
+
+# ── HIK_RECONCILE_OPEN_ENTRIES: the 2026-09-15 passing-traffic phantoms ──────
+
+
+@pytest.mark.asyncio
+async def test_by_default_the_sweep_never_opens_an_uncrossed_pass(db, monkeypatch):
+    """29 of 31 overstays on 2026-09-15 were HIK-RECON sessions, and image review
+    showed every one was a car driving past the barrier. With the setting at its
+    default, a HikCentral pass with no edge trace opens nothing and stays
+    unconsumed, so it remains recoverable."""
+    monkeypatch.setattr(
+        settings, "HIK_RECONCILE_OPEN_ENTRIES",
+        type(settings).model_fields["HIK_RECONCILE_OPEN_ENTRIES"].default,
+    )
+    _patch_lookup(monkeypatch, [_record()])
+    opened = []
+
+    async def fake_flush(db_, buf):
+        opened.append(buf["reads"][0]["plate"])
+
+    monkeypatch.setattr(ees, "_flush_entry_burst", fake_flush)
+    await ees._reconcile_missed_entries(db)
+
+    assert opened == []
+    assert db.query(ParkingSession).count() == 0
+    assert db.query(HikValidation).filter(HikValidation.guid == "G1").count() == 0

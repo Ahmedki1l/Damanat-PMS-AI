@@ -857,8 +857,9 @@ async def _recover_silent_entry(db: Session, crossing: dict) -> bool:
 # A gate-area event (CAM-23/03/ENTRY for entries, CAM-08/EXIT for exits) is the
 # heartbeat that sweeps HikCentral for cars the edge pipeline missed ENTIRELY —
 # neither the ANPR read nor the ramp/occupancy crossing reached PMS-AI, so no
-# session exists at all. A missed entry opens a session; a missed exit closes
-# one. Fire-and-forget and debounced per direction, so it never blocks the
+# session exists at all. A missed exit closes a session; a missed entry opens
+# one only when HIK_RECONCILE_OPEN_ENTRIES is on (off by default — at this site
+# an uncrossed entry pass was passing traffic, not a missed car). Fire-and-forget and debounced per direction, so it never blocks the
 # camera webhook and a busy camera cannot fire a HikCentral call per frame. The
 # grace window keeps a sweep from racing a car still in the live pipeline, and
 # the hik_validations GUID makes overlapping sweeps idempotent.
@@ -1106,6 +1107,16 @@ async def _reconcile_missed_entries(
             logger.warning(
                 "[Hik][reconcile] shadow: MISSED entry plate=%s guid=%s at %s "
                 "(would open a session)",
+                rec.canonical_plate, rec.guid, pass_local,
+            )
+            continue
+        if not settings.HIK_RECONCILE_OPEN_ENTRIES:
+            # No CAM-23/03 crossing backs this pass, and at this site a pass with
+            # no edge trace was traffic driving by (29 of 29 on 2026-09-15). Left
+            # unconsumed, exactly like shadow. See HIK_RECONCILE_OPEN_ENTRIES.
+            logger.warning(
+                "[Hik][reconcile] NOT opening plate=%s guid=%s at %s — no ramp "
+                "crossing backs it and HIK_RECONCILE_OPEN_ENTRIES is off",
                 rec.canonical_plate, rec.guid, pass_local,
             )
             continue
