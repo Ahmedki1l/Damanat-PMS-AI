@@ -80,4 +80,8 @@ class HealthResponse(BaseModel):
     database: str
     cameras: list[str]
     entry_v2_shadow: EntryV2ShadowHealthResponse
+    # Loose dict on purpose. Pinning an operational block to a strict schema is
+    # how one unexpected value turns the whole endpoint into a 500 — and health
+    # is the last thing that should fail when something else is already wrong.
+    camera_ingest_spool: dict = {}
 

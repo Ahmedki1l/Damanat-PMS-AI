@@ -19,6 +19,16 @@ router = APIRouter()
 logger = get_logger(__name__)
 
 
+def _camera_ingest_spool_status() -> dict:
+    """Never let a spool problem break the health endpoint itself."""
+    try:
+        from app.services.camera_ingest_spool import spool_stats
+
+        return spool_stats()
+    except Exception as exc:  # noqa: BLE001
+        return {"enabled": None, "error": str(exc)}
+
+
 @router.get("/health", response_model=HealthResponse, summary="System health check")
 def health_check(db: Session = Depends(get_db)):
     """
@@ -35,6 +45,11 @@ def health_check(db: Session = Depends(get_db)):
         "database": "unknown",
         "cameras": list(settings.CAMERAS.keys()),
         "entry_v2_shadow": entry_v2_shadow_status(),
+        # Spool depth, backlog age and whether the spool directory actually
+        # survives a restart. Reported, never allowed to change `status`: a
+        # full or ephemeral spool degrades event delivery, it does not mean
+        # the service is down, and entry-path state must never gate health.
+        "camera_ingest_spool": _camera_ingest_spool_status(),
     }
 
     # Check database

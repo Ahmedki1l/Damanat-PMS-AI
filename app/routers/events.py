@@ -5,8 +5,9 @@ POST /events/camera — receives events from all cameras (XML or JSON).
 GET  /events       — lists raw event log with optional filters.
 """
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from ipaddress import ip_address
+from typing import Optional
 
 from fastapi import APIRouter, Request, Depends
 from fastapi.responses import JSONResponse
@@ -31,11 +32,86 @@ from app.services.entry_exit_service import (
     SourceTimestampUnavailable,
     note_gate_event,
 )
+from app.services.camera_ingest_spool import spool_camera_event
 from app.services.occupancy_service import record_event_in_cache
 from app.utils.logger import get_logger
 
 router = APIRouter()
 logger = get_logger(__name__)
+
+
+@dataclass
+class CameraEventOutcome:
+    """What processing one camera event concluded, independent of HTTP.
+
+    The live webhook turns this into a response; the spool drainer uses it to
+    decide whether a record is drained, retried or quarantined. Keeping the two
+    consumers on one vocabulary is what stops a replay from re-deriving that
+    decision by parsing status codes.
+    """
+
+    status: str  # "ok" | "rejected" | "error" | "retry"
+    detail: str = ""
+    evidence_id: Optional[str] = None
+    retry_after: Optional[str] = None
+    event_type: Optional[str] = None
+
+    @property
+    def retryable(self) -> bool:
+        return self.status == "retry"
+
+
+def _outcome_to_camera_response(
+    outcome: CameraEventOutcome,
+    raw_body: bytes,
+    camera_ip: str,
+    content_type: str,
+):
+    """Answer the camera, spooling anything retryable instead of discarding it.
+
+    A camera-facing 503 is not a deferral. Hikvision push ignores Retry-After and
+    never re-POSTs — 332 of 332 picture IDs in a production week were distinct, so
+    nothing was ever re-delivered. Every 503 therefore deleted the event. When the
+    spool is enabled we persist the request and acknowledge 200; the drainer owns
+    the retry from there. If the spool refuses (full volume, unwritable path) we
+    fall back to the old 503, which is worse but honest.
+    """
+    if not outcome.retryable:
+        payload = {"status": outcome.status}
+        if outcome.detail:
+            payload["detail"] = outcome.detail
+        if outcome.event_type:
+            payload["event_type"] = outcome.event_type
+        return payload
+
+    if settings.CAMERA_INGEST_SPOOL_ENABLED and spool_camera_event(
+        raw_body,
+        camera_ip,
+        content_type,
+        outcome.detail or "retryable",
+        evidence_id=outcome.evidence_id,
+    ):
+        logger.info(
+            "[IngestSpool] acknowledged camera event that would have been a 503 "
+            "(reason=%s evidence=%s) — queued for replay",
+            outcome.detail,
+            outcome.evidence_id,
+        )
+        return {"status": "accepted", "detail": "queued for processing"}
+
+    logger.warning(
+        "[EntryV2] Returning camera-facing 503 for evidence=%s — THIS EVENT IS LOST, "
+        "the camera will not retry it",
+        outcome.evidence_id,
+    )
+    content = {"status": "retry", "detail": outcome.detail or "unavailable"}
+    if outcome.evidence_id:
+        content["evidence_id"] = outcome.evidence_id
+    return JSONResponse(
+        status_code=503,
+        content=content,
+        headers={"Retry-After": outcome.retry_after or "1"},
+    )
 
 
 class CameraBodyTooLarge(Exception):
@@ -120,14 +196,30 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
     logger.debug(f"Received request from {camera_ip} (CT: {content_type}, CL: {content_length})")
 
     try:
-        try:
-            raw_body = await _read_camera_body_limited(request, max_body_bytes)
-        except CameraBodyTooLarge:
-            return _camera_error(413, "camera event payload is too large")
-        if not raw_body:
-            logger.warning(f"Ignoring empty body received from {camera_ip}")
-            return {"status": "ignored", "detail": "empty body"}
+        raw_body = await _read_camera_body_limited(request, max_body_bytes)
+    except CameraBodyTooLarge:
+        return _camera_error(413, "camera event payload is too large")
+    if not raw_body:
+        logger.warning(f"Ignoring empty body received from {camera_ip}")
+        return {"status": "ignored", "detail": "empty body"}
 
+    outcome = await process_camera_event(raw_body, camera_ip, content_type, db)
+    return _outcome_to_camera_response(outcome, raw_body, camera_ip, content_type)
+
+
+async def process_camera_event(
+    raw_body: bytes,
+    camera_ip: str,
+    content_type: str,
+    db: Session,
+) -> CameraEventOutcome:
+    """Process one camera event. Shared by the live webhook and the spool drainer.
+
+    Returns an outcome rather than an HTTP response so the drainer can decide
+    whether a record is drained, retried or quarantined without having to
+    reverse-engineer that decision from a status code.
+    """
+    try:
         # 1. Parse unified event
         event = await run_in_threadpool(
             parse_camera_event,
@@ -165,10 +257,8 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
                 v2_result = await forward_entry_v2_event(event)
             except Exception:
                 logger.error("[EntryV2] Unexpected forwarding failure", exc_info=True)
-                return JSONResponse(
-                    status_code=503,
-                    content={"status": "retry", "detail": "entry validation unavailable"},
-                    headers={"Retry-After": "1"},
+                return CameraEventOutcome(
+                    status="retry", detail="entry validation unavailable"
                 )
 
             if v2_result is not None and v2_result.retryable:
@@ -176,14 +266,11 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
                     "[EntryV2] Returning camera-facing 503 for evidence=%s",
                     v2_result.evidence_id,
                 )
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "status": "retry",
-                        "detail": "entry validation unavailable",
-                        "evidence_id": v2_result.evidence_id,
-                    },
-                    headers={"Retry-After": v2_result.retry_after or "1"},
+                return CameraEventOutcome(
+                    status="retry",
+                    detail="entry validation unavailable",
+                    evidence_id=v2_result.evidence_id,
+                    retry_after=v2_result.retry_after,
                 )
 
         # CAM-04 diagnostic: log every field so we can see exit events and ignored types
@@ -228,7 +315,7 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
         if shadow_v2_event is not None:
             enqueue_entry_v2_shadow(shadow_v2_event)
 
-        return {"status": "ok", "event_type": event.event_type}
+        return CameraEventOutcome(status="ok", event_type=event.event_type)
 
     except CameraPayloadRejected as exc:
         logger.warning(
@@ -236,10 +323,7 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
             camera_ip,
             exc,
         )
-        return {
-            "status": "rejected",
-            "detail": "malformed camera payload",
-        }
+        return CameraEventOutcome(status="rejected", detail="malformed camera payload")
     except EntryStateLockUnavailable:
         db.rollback()
         logger.warning(
@@ -247,35 +331,19 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
             exc_info=True,
         )
         if entry_v2_is_authoritative():
-            return JSONResponse(
-                status_code=503,
-                content={"status": "retry", "detail": "entry state is busy"},
-                headers={"Retry-After": "1"},
-            )
-        return {"status": "error", "detail": "entry state is busy"}
+            return CameraEventOutcome(status="retry", detail="entry state is busy")
+        return CameraEventOutcome(status="error", detail="entry state is busy")
     except SourceTimestampUnavailable:
         db.rollback()
         logger.error("Exit event is missing a trustworthy camera timestamp")
         if entry_v2_is_authoritative():
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "status": "retry",
-                    "detail": "exit source time unavailable",
-                },
-                headers={"Retry-After": "1"},
-            )
-        return {"status": "error", "detail": "exit source time unavailable"}
+            return CameraEventOutcome(status="retry", detail="exit source time unavailable")
+        return CameraEventOutcome(status="error", detail="exit source time unavailable")
     except Exception as e:
         db.rollback()
         logger.error(f"Event processing error: {e}", exc_info=True)
         if entry_v2_is_authoritative():
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "status": "retry",
-                    "detail": "camera event processing unavailable",
-                },
-                headers={"Retry-After": "1"},
+            return CameraEventOutcome(
+                status="retry", detail="camera event processing unavailable"
             )
-        return {"status": "error", "detail": str(e)}
+        return CameraEventOutcome(status="error", detail=str(e))

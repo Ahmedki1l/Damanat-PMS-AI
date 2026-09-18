@@ -6,6 +6,7 @@ Includes security middleware, global error handlers, and all routers.
 # (no-op edit: 2026-05-05 to trigger uvicorn --reload — rev 3 for close_session vehicle clear)
 
 import asyncio
+import os
 import time
 
 from fastapi import FastAPI, Request, status
@@ -176,6 +177,22 @@ async def startup():
     app.state.pms_forward_drainer = asyncio.create_task(_pms_forward_drainer_loop())
     logger.info("📤 PMS/VA forward-spool drainer task started")
 
+    # Stage 1: camera events that cannot be processed on arrival are spooled and
+    # replayed instead of being answered with a 503 the camera will never retry.
+    if settings.CAMERA_INGEST_SPOOL_ENABLED:
+        from app.services.camera_ingest_spool import check_spool_durability
+
+        # Reports whether the spool directory actually survives a restart. Never
+        # raises — a config check that raises on an optional dependency is what
+        # crash-looped this deployment once already.
+        check_spool_durability()
+        app.state.camera_ingest_drainer = asyncio.create_task(
+            _camera_ingest_drainer_loop()
+        )
+        logger.info("📥 Camera ingest-spool drainer task started")
+    else:
+        app.state.camera_ingest_drainer = None
+
     # Heal whatever the gate pipeline missed while this service was down. The
     # event-driven reconcile only looks back 15 minutes, so without this a
     # restart after any real outage leaves those sessions open forever and the
@@ -188,6 +205,67 @@ async def startup():
         logger.info("🔁 HikCentral restart catch-up task started")
     else:
         app.state.hik_catchup = None
+
+
+async def _camera_ingest_drainer_loop():
+    """Replay spooled camera events until they are accepted.
+
+    Records are replayed oldest-first so an entry burst (CAM-23, CAM-03 and the
+    ANPR read for one car, seconds apart) reaches the correlation logic in the
+    order the cameras produced it. Each pass stops at the first record that is
+    still retryable: a blocked downstream blocks the whole queue on purpose,
+    because draining past it would reorder the burst.
+    """
+    from app.database import SessionLocal
+    from app.routers.events import process_camera_event
+    from app.services import camera_ingest_spool as spool
+
+    while True:
+        try:
+            await asyncio.sleep(float(settings.CAMERA_INGEST_DRAIN_INTERVAL_SECONDS))
+            for path in spool.iter_spooled_records():
+                try:
+                    header, raw_body = spool.read_record(path)
+                except spool.SpoolRecordMalformed as exc:
+                    spool.quarantine_record(path, str(exc))
+                    continue
+                except OSError:
+                    break
+
+                db = SessionLocal()
+                try:
+                    outcome = await process_camera_event(
+                        raw_body,
+                        str(header.get("camera_ip") or ""),
+                        str(header.get("content_type") or ""),
+                        db,
+                    )
+                finally:
+                    db.close()
+
+                if outcome.retryable:
+                    attempts = spool.record_attempt(path, header)
+                    if attempts >= settings.CAMERA_INGEST_SPOOL_MAX_ATTEMPTS:
+                        spool.quarantine_record(
+                            path,
+                            f"still retryable after {attempts} attempts: {outcome.detail}",
+                        )
+                        continue
+                    # Preserve ordering: leave this record and everything behind
+                    # it for the next pass rather than replaying out of sequence.
+                    break
+
+                logger.info(
+                    "[IngestSpool] replayed %s -> %s (spooled %s)",
+                    os.path.basename(path),
+                    outcome.status,
+                    header.get("received_at"),
+                )
+                spool.remove_record(path)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[IngestSpool] drain tick failed: {e}", exc_info=True)
 
 
 async def _pms_forward_drainer_loop():
@@ -230,7 +308,7 @@ async def shutdown():
     await stop_entry_v2_shadow_worker()
     from app.services.entry_exit_service import drain_background_forwards
     await drain_background_forwards()
-    for attr in ("entry_burst_flusher", "pms_forward_drainer"):
+    for attr in ("entry_burst_flusher", "pms_forward_drainer", "camera_ingest_drainer"):
         task = getattr(app.state, attr, None)
         if task is not None:
             task.cancel()

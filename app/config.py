@@ -764,6 +764,28 @@ class Settings(BaseSettings):
     # VA acks. The drain interval is the retry cadence — the live forward stays a
     # single attempt so it never adds latency to the exit webhook / burst flusher.
     PMS_FORWARD_SPOOL_DIR: str = "./pms_forward_spool"
+
+    # ── Camera ingest spool (Stage 1) ────────────────────────────────────
+    # Hikvision push is fire-and-forget: it ignores Retry-After and never
+    # re-POSTs, so a camera-facing 503 deletes the event rather than deferring
+    # it. When enabled, undeliverable camera events are written here and the
+    # camera is acknowledged with 200; a drainer replays them.
+    #
+    # PRODUCTION: this MUST point inside the one PersistentVolume that exists
+    # (detection_images), or the spool is wiped on every pod restart:
+    #   CAMERA_INGEST_SPOOL_DIR=/app/detection_images/camera_ingest_spool
+    # check_spool_durability() reports which case you are in at boot.
+    CAMERA_INGEST_SPOOL_ENABLED: bool = False
+    CAMERA_INGEST_SPOOL_DIR: str = "./camera_ingest_spool"
+    # Cap the backlog. ~280 events/day at a 377 KB mean is ~105 MB/day, so 2 GB
+    # is roughly three weeks of total outage before the cap is reached.
+    CAMERA_INGEST_SPOOL_MAX_BYTES: int = Field(default=2 * 1024 * 1024 * 1024, gt=0)
+    # The spool shares its volume with the live snapshot store, so keep a floor
+    # of free space that a backlog may never consume.
+    CAMERA_INGEST_SPOOL_MIN_FREE_BYTES: int = Field(default=512 * 1024 * 1024, ge=0)
+    # Replay attempts before a record is quarantined rather than retried forever.
+    CAMERA_INGEST_SPOOL_MAX_ATTEMPTS: int = Field(default=48, gt=0)
+    CAMERA_INGEST_DRAIN_INTERVAL_SECONDS: float = Field(default=20.0, gt=0)
     PMS_FORWARD_DRAIN_INTERVAL_SECONDS: float = 15.0   # background re-POST cadence
     PMS_FORWARD_SPOOL_MAX_AGE_SECONDS: float = 3600.0  # drop spooled payloads older than this
 
