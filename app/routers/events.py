@@ -61,7 +61,7 @@ class CameraEventOutcome:
         return self.status == "retry"
 
 
-def _outcome_to_camera_response(
+async def _outcome_to_camera_response(
     outcome: CameraEventOutcome,
     raw_body: bytes,
     camera_ip: str,
@@ -84,13 +84,19 @@ def _outcome_to_camera_response(
             payload["event_type"] = outcome.event_type
         return payload
 
-    if settings.CAMERA_INGEST_SPOOL_ENABLED and spool_camera_event(
+    # scandir + a write of up to 1.2 MB + fsync. This runs for EVERY camera event
+    # during a downstream outage, and PMS-AI serves all cameras from one event
+    # loop with a synchronous pyodbc driver, so doing it inline would stall every
+    # concurrent camera handler.
+    spooled = settings.CAMERA_INGEST_SPOOL_ENABLED and await run_in_threadpool(
+        spool_camera_event,
         raw_body,
         camera_ip,
         content_type,
         outcome.detail or "retryable",
         evidence_id=outcome.evidence_id,
-    ):
+    )
+    if spooled:
         logger.info(
             "[IngestSpool] acknowledged camera event that would have been a 503 "
             "(reason=%s evidence=%s) — queued for replay",
@@ -199,12 +205,18 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
         raw_body = await _read_camera_body_limited(request, max_body_bytes)
     except CameraBodyTooLarge:
         return _camera_error(413, "camera event payload is too large")
+    except Exception:
+        # A truncated POST or a client disconnect is the camera's problem, not a
+        # server fault. Before the handler was split this fell into the generic
+        # handler below; letting it escape now would surface as a 500.
+        logger.warning("Camera body read failed for %s", camera_ip, exc_info=True)
+        return {"status": "error", "detail": "camera body read failed"}
     if not raw_body:
         logger.warning(f"Ignoring empty body received from {camera_ip}")
         return {"status": "ignored", "detail": "empty body"}
 
     outcome = await process_camera_event(raw_body, camera_ip, content_type, db)
-    return _outcome_to_camera_response(outcome, raw_body, camera_ip, content_type)
+    return await _outcome_to_camera_response(outcome, raw_body, camera_ip, content_type)
 
 
 async def process_camera_event(

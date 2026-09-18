@@ -9,6 +9,7 @@ degrades to the old 503 only when it genuinely cannot store the event.
 Scenario numbers match CAMERA_EVENT_LOSS_PLAN.md, Stage 1.
 """
 
+import asyncio
 import json
 import os
 
@@ -32,7 +33,9 @@ def spool_dir(tmp_path, monkeypatch):
         settings, "CAMERA_INGEST_SPOOL_MAX_BYTES", 10 * 1024 * 1024, raising=False
     )
     monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_MIN_FREE_BYTES", 0, raising=False)
-    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_MAX_ATTEMPTS", 3, raising=False)
+    monkeypatch.setattr(
+        settings, "CAMERA_INGEST_SPOOL_MAX_AGE_SECONDS", 7 * 24 * 3600, raising=False
+    )
     spool._reported_degradations.clear()
     spool._durability.update({"checked": False, "durable": None, "detail": "not checked"})
     return target
@@ -43,7 +46,9 @@ def _retryable(detail="entry validation unavailable", evidence_id="ev-1"):
 
 
 def _respond(outcome, body=BODY):
-    return _outcome_to_camera_response(outcome, body, GATEWAY, CT)
+    return asyncio.get_event_loop().run_until_complete(
+        _outcome_to_camera_response(outcome, body, GATEWAY, CT)
+    )
 
 
 class TestTheCameraIsNeverToldToRetry:
@@ -257,3 +262,72 @@ class TestHealthExposure:
         assert "camera_ingest_spool" in body, "declare it on HealthResponse or it is filtered out"
         assert "depth" in body["camera_ingest_spool"]
         assert "durability" in body["camera_ingest_spool"]
+
+
+class TestReviewRegressions:
+    """Bugs found by code review of the first Stage 1 commit."""
+
+    def test_listing_never_reads_a_body_off_disk(self, monkeypatch):
+        """spool_stats() runs on every /health probe. Records carry raw image
+        bodies (max 1.2 MB), so listing must parse headers only — otherwise a
+        k8s probe reads the whole backlog and times out during exactly the
+        outage the spool exists to survive."""
+        _respond(_retryable(), body=b"x" * (2 * 1024 * 1024))
+
+        def _fail(*a, **k):
+            raise AssertionError("read_record() reads the full body — listing must not")
+
+        monkeypatch.setattr(spool, "read_record", _fail)
+        stats = spool.spool_stats()          # must not touch a body
+        assert stats["depth"] == 1
+        assert list(spool.iter_spooled_records())
+
+    def test_header_read_is_bounded(self):
+        """A corrupt record must not pull an arbitrary amount into memory."""
+        _respond(_retryable(), body=b"x" * (2 * 1024 * 1024))
+        path = next(iter(spool.iter_spooled_records()))
+        header = spool.read_header(path)
+        assert header["camera_ip"] == GATEWAY
+        assert spool._MAX_HEADER_BYTES < 1024 * 1024
+
+    def test_health_stats_never_quarantine(self, spool_dir):
+        """A GET probe must not move files on disk."""
+        spool_dir.mkdir(parents=True, exist_ok=True)
+        spool_dir.joinpath("cam_corrupt.evt").write_bytes(b"no header terminator")
+        spool.spool_stats()
+        assert spool_dir.joinpath("cam_corrupt.evt").exists(), "stats mutated the spool"
+        assert not spool_dir.joinpath("quarantine").exists()
+
+    def test_stats_do_no_work_when_disabled(self, monkeypatch):
+        monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_ENABLED", False, raising=False)
+        stats = spool.spool_stats()
+        assert stats["enabled"] is False and stats["depth"] == 0
+
+    def test_quarantined_bytes_count_against_the_cap(self, spool_dir):
+        _respond(_retryable())
+        before = spool._spool_bytes()
+        path = next(iter(spool.iter_spooled_records()))
+        spool.quarantine_record(path, "test")
+        assert spool._spool_bytes() == before, (
+            "quarantine shares the snapshot volume and must stay inside the cap"
+        )
+
+    def test_a_long_outage_does_not_quarantine_a_valid_event(self):
+        """The head is the only record ever retried, so attempts track outage
+        length, not poison. A 26-hour outage must not discard the oldest car."""
+        _respond(_retryable())
+        path = next(iter(spool.iter_spooled_records()))
+        header, _ = spool.read_record(path)
+        for _ in range(500):
+            spool.record_attempt(path, header)
+            header, _ = spool.read_record(path)
+        age = spool.record_age_seconds(header)
+        assert age is not None and age < settings.CAMERA_INGEST_SPOOL_MAX_AGE_SECONDS
+        assert header["attempts"] >= 500
+
+    def test_age_bound_is_what_eventually_quarantines(self):
+        _respond(_retryable())
+        header, _ = spool.read_record(next(iter(spool.iter_spooled_records())))
+        header["received_at"] = "2020-01-01T00:00:00+00:00"
+        age = spool.record_age_seconds(header)
+        assert age > settings.CAMERA_INGEST_SPOOL_MAX_AGE_SECONDS

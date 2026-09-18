@@ -102,19 +102,24 @@ def _fsync_directory(directory: str) -> None:
 # ── capacity ────────────────────────────────────────────────────────────────
 
 def _spool_bytes() -> int:
+    """Bytes held by the spool, INCLUDING quarantine.
+
+    Nothing prunes quarantine, and it shares a volume with the live snapshot
+    store, so excluding it would let it grow past the cap unnoticed until the
+    free-space floor trips and events start being refused again.
+    """
     total = 0
-    try:
-        with os.scandir(spool_dir()) as entries:
-            for entry in entries:
-                if entry.is_file() and entry.name.endswith(RECORD_SUFFIX):
-                    try:
-                        total += entry.stat().st_size
-                    except OSError:
-                        continue
-    except FileNotFoundError:
-        return 0
-    except OSError:
-        return 0
+    for directory in (spool_dir(), _quarantine_dir()):
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if entry.is_file() and entry.name.endswith(RECORD_SUFFIX):
+                        try:
+                            total += entry.stat().st_size
+                        except OSError:
+                            continue
+        except (FileNotFoundError, OSError):
+            continue
     return total
 
 
@@ -235,7 +240,7 @@ def spool_camera_event(
 
 # ── reading ─────────────────────────────────────────────────────────────────
 
-def _record_paths() -> list[str]:
+def _record_paths(*, quarantine_unreadable: bool = True) -> list[str]:
     """Spooled record paths, oldest first.
 
     Ordered by the ``received_at`` embedded in each record rather than by mtime
@@ -258,11 +263,14 @@ def _record_paths() -> list[str]:
             continue
         path = os.path.join(directory, name)
         try:
-            header, _ = read_record(path)
-            received_at = str(header.get("received_at") or "")
+            received_at = str(read_header(path).get("received_at") or "")
         except SpoolRecordMalformed:
-            quarantine_record(path, "unreadable header")
-            continue
+            # Only the drainer may move files. `spool_stats()` is called from a
+            # GET /health probe, and a health check must not mutate the spool.
+            if quarantine_unreadable:
+                quarantine_record(path, "unreadable header")
+                continue
+            received_at = ""
         except OSError:
             continue
         # Fall back to the filename, which embeds the same timestamp, so a record
@@ -277,10 +285,13 @@ def iter_spooled_records() -> Iterator[str]:
     yield from _record_paths()
 
 
-def read_record(path: str) -> tuple[dict, bytes]:
-    """Return (header, raw_body) for one spooled record."""
-    with open(path, "rb") as handle:
-        blob = handle.read()
+# A header is one JSON line; anything beyond this is malformed, not a big header.
+# Bounded so a corrupt record cannot make a header read pull an arbitrary amount
+# of a multi-MB file into memory.
+_MAX_HEADER_BYTES = 64 * 1024
+
+
+def _parse_header(blob: bytes, path: str) -> dict:
     newline = blob.find(b"\n")
     if newline < 0:
         raise SpoolRecordMalformed(f"{path} has no header terminator")
@@ -290,7 +301,28 @@ def read_record(path: str) -> tuple[dict, bytes]:
         raise SpoolRecordMalformed(f"{path} has an unreadable header") from exc
     if not isinstance(header, dict):
         raise SpoolRecordMalformed(f"{path} header is not an object")
-    return header, blob[newline + 1:]
+    return header
+
+
+def read_header(path: str) -> dict:
+    """Parse one record's header WITHOUT reading its body off disk.
+
+    Records carry raw image bytes (mean 377 KB, max 1.2 MB). Listing and sorting
+    the spool only needs the header, and `spool_stats()` runs on every /health
+    scrape — reading whole bodies there would make a k8s probe read the entire
+    backlog from disk, time out, and restart the pod during exactly the outage
+    the spool exists to survive.
+    """
+    with open(path, "rb") as handle:
+        return _parse_header(handle.read(_MAX_HEADER_BYTES), path)
+
+
+def read_record(path: str) -> tuple[dict, bytes]:
+    """Return (header, raw_body) for one spooled record."""
+    with open(path, "rb") as handle:
+        blob = handle.read()
+    header = _parse_header(blob, path)
+    return header, blob[blob.find(b"\n") + 1:]
 
 
 def record_attempt(path: str, header: dict) -> int:
@@ -312,6 +344,15 @@ def record_attempt(path: str, header: dict) -> int:
         # Losing it costs extra retries, never a lost event.
         logger.warning("[IngestSpool] could not persist attempt count for %s: %s", path, exc)
     return attempts
+
+
+def record_age_seconds(header: dict) -> Optional[float]:
+    """Seconds since the camera sent this event, or None if unparseable."""
+    try:
+        received = datetime.fromisoformat(str(header["received_at"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return (datetime.now(timezone.utc) - received).total_seconds()
 
 
 def remove_record(path: str) -> None:
@@ -429,11 +470,14 @@ def check_spool_durability() -> dict:
 
 def spool_stats() -> dict:
     """Snapshot for /api/health. Cheap enough to call on every scrape."""
-    paths = _record_paths()
+    if not settings.CAMERA_INGEST_SPOOL_ENABLED:
+        return {"enabled": False, "path": spool_dir(), "depth": 0, "bytes": 0,
+                "oldest_age_seconds": None, "durability": _durability}
+    paths = _record_paths(quarantine_unreadable=False)
     oldest_age: Optional[float] = None
     if paths:
         try:
-            header, _ = read_record(paths[0])
+            header = read_header(paths[0])
             received = datetime.fromisoformat(str(header["received_at"]))
             oldest_age = (datetime.now(timezone.utc) - received).total_seconds()
         except (KeyError, ValueError, OSError, SpoolRecordMalformed):

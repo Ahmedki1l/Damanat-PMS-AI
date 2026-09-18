@@ -207,6 +207,10 @@ async def startup():
         app.state.hik_catchup = None
 
 
+# Roughly every 5 minutes at the default 20s drain interval.
+_STUCK_HEAD_LOG_EVERY = 15
+
+
 async def _camera_ingest_drainer_loop():
     """Replay spooled camera events until they are accepted.
 
@@ -244,13 +248,37 @@ async def _camera_ingest_drainer_loop():
                     db.close()
 
                 if outcome.retryable:
+                    # Count attempts for visibility only. Attempts must NOT decide
+                    # quarantine: ordering means only the head is ever retried, so
+                    # a downstream outage drives the head's counter up at a fixed
+                    # rate and would quarantine a perfectly good event purely for
+                    # having been first. At a 20s interval a 48-attempt cap
+                    # discarded the oldest car after 16 minutes, and another every
+                    # 16 minutes after that — roughly 97 cars across the 26-hour
+                    # database outage this spool exists to survive.
+                    #
+                    # A genuinely poisonous record fails deterministically, which
+                    # is a "rejected" outcome, not a retryable one, and is drained
+                    # below. So the only bound needed here is age.
                     attempts = spool.record_attempt(path, header)
-                    if attempts >= settings.CAMERA_INGEST_SPOOL_MAX_ATTEMPTS:
+                    age = spool.record_age_seconds(header)
+                    if age is not None and age >= settings.CAMERA_INGEST_SPOOL_MAX_AGE_SECONDS:
                         spool.quarantine_record(
                             path,
-                            f"still retryable after {attempts} attempts: {outcome.detail}",
+                            f"still retryable after {age / 3600:.1f}h and "
+                            f"{attempts} attempts: {outcome.detail}",
                         )
                         continue
+                    if attempts % _STUCK_HEAD_LOG_EVERY == 0:
+                        logger.warning(
+                            "[IngestSpool] head of queue blocked for %s attempts "
+                            "(%.1f min, %d records waiting) — downstream still "
+                            "failing: %s",
+                            attempts,
+                            (age or 0) / 60,
+                            len(spool._record_paths(quarantine_unreadable=False)),
+                            outcome.detail,
+                        )
                     # Preserve ordering: leave this record and everything behind
                     # it for the next pass rather than replaying out of sequence.
                     break

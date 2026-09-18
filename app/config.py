@@ -783,8 +783,12 @@ class Settings(BaseSettings):
     # The spool shares its volume with the live snapshot store, so keep a floor
     # of free space that a backlog may never consume.
     CAMERA_INGEST_SPOOL_MIN_FREE_BYTES: int = Field(default=512 * 1024 * 1024, ge=0)
-    # Replay attempts before a record is quarantined rather than retried forever.
-    CAMERA_INGEST_SPOOL_MAX_ATTEMPTS: int = Field(default=48, gt=0)
+    # Quarantine is bounded by AGE, not by attempt count. Only the head of the
+    # queue is ever retried (ordering is preserved), so an attempt cap would
+    # discard the oldest event purely for being first whenever a downstream
+    # outage outlasts cap x interval. 7 days comfortably outlives the 26-hour
+    # database outage this spool was written for.
+    CAMERA_INGEST_SPOOL_MAX_AGE_SECONDS: float = Field(default=7 * 24 * 3600, gt=0)
     CAMERA_INGEST_DRAIN_INTERVAL_SECONDS: float = Field(default=20.0, gt=0)
     PMS_FORWARD_DRAIN_INTERVAL_SECONDS: float = 15.0   # background re-POST cadence
     PMS_FORWARD_SPOOL_MAX_AGE_SECONDS: float = 3600.0  # drop spooled payloads older than this
