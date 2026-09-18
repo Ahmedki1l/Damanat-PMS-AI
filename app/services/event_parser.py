@@ -858,6 +858,138 @@ def parse_camera_event(raw_body: bytes, camera_ip: str, content_type: str = "") 
     return event
 
 
+# Every camera reaches PMS-AI through the same NAT boundary, so the HTTP client
+# IP is the gateway for all of them and can never identify a camera. Identity has
+# to come out of the body — and when it does not, the old fallback labelled the
+# event `UNKNOWN-<gateway-ip>`, discarding the two values that would explain why.
+# That is how 207/207 entry ANPR events could read UNKNOWN for a week without the
+# log ever saying whether the body was silent or merely unmapped.
+_reported_unresolved_identities: set[tuple[str, str]] = set()
+_reported_loose_serial_matches: set[str] = set()
+
+
+def _normalize_serial(value: object) -> str:
+    """Collapse a serial to comparable form: lowercase, alphanumerics only."""
+    return re.sub(r"[^0-9a-z]", "", str(value or "").lower())
+
+
+def _serial_variants(configured_key: str) -> set[str]:
+    """Normalized forms a camera might actually send for one configured serial.
+
+    `CAM_ENTRY_SERIAL` is written as "<model> <serial>" (e.g.
+    "DS-TCG406-E 20250221AIFW6259223"), but a camera reports either the whole
+    string without the space or the bare serial token. Index both so a cosmetic
+    formatting difference does not cost us the camera's identity.
+    """
+    variants = {_normalize_serial(configured_key)}
+    tokens = str(configured_key).split()
+    if len(tokens) > 1:
+        # Only the LONGEST token may stand alone. In "<model> <serial>" the serial
+        # is the longer half, and indexing the model would let any camera of the
+        # same model claim this identity — both gate cameras here are DS-TCG406-E.
+        variants.add(_normalize_serial(max(tokens, key=len)))
+    return {v for v in variants if v}
+
+
+def _match_configured_serial(device_serial: object) -> tuple[Optional[str], str]:
+    """Resolve a reported serial to a camera id. Returns (camera_id, strategy).
+
+    Read from ``settings.CAMERA_SERIAL_MAP`` on every call so tests (and a live
+    config reload) that replace the map are honoured. Every non-exact strategy is
+    guarded on the match being unambiguous.
+    """
+    serial_map = settings.CAMERA_SERIAL_MAP or {}
+    if not serial_map:
+        return None, "none"
+
+    exact = serial_map.get(device_serial)
+    if exact:
+        return exact, "exact"
+
+    reported = _normalize_serial(device_serial)
+    if not reported or reported == "unknown":
+        return None, "none"
+
+    index: dict[str, set[str]] = {}
+    for configured_key, camera_id in serial_map.items():
+        for variant in _serial_variants(configured_key):
+            index.setdefault(variant, set()).add(camera_id)
+
+    candidates = index.get(reported)
+    if candidates and len(candidates) == 1:
+        return next(iter(candidates)), "normalized"
+
+    # Last resort: one side contains the other (model prefix, channel suffix).
+    # Length-guarded and uniqueness-guarded so a short token cannot alias two
+    # cameras onto each other.
+    if len(reported) >= 10:
+        contained = {
+            camera_id
+            for variant, camera_ids in index.items()
+            if len(variant) >= 10 and (variant in reported or reported in variant)
+            for camera_id in camera_ids
+        }
+        if len(contained) == 1:
+            return next(iter(contained)), "contains"
+
+    return None, "none"
+
+
+def resolve_camera_identity(
+    device_serial: object,
+    declared_ip: Optional[str],
+    client_ip: str,
+) -> str:
+    """Resolve a camera id from body-declared identity, falling back to the gateway.
+
+    `declared_ip` is the address the payload claims for itself; `client_ip` is the
+    NAT gateway PMS-AI actually received the request from. On failure the returned
+    placeholder names the DECLARED address when there is one, so the log shows the
+    value that failed to match rather than the gateway every camera shares.
+    """
+    camera_id, strategy = _match_configured_serial(device_serial)
+    if camera_id:
+        if strategy != "exact" and camera_id not in _reported_loose_serial_matches:
+            _reported_loose_serial_matches.add(camera_id)
+            logger.warning(
+                "[Identity] %s matched by %s serial comparison — camera reports %r, "
+                "config has %r. Update CAMERA_SERIAL_MAP so the match is exact.",
+                camera_id,
+                strategy,
+                str(device_serial),
+                next(
+                    (k for k, v in (settings.CAMERA_SERIAL_MAP or {}).items() if v == camera_id),
+                    "",
+                ),
+            )
+        return camera_id
+
+    ip_map = settings.CAMERA_IP_MAP or {}
+    if declared_ip and ip_map.get(declared_ip):
+        return ip_map[declared_ip]
+    if ip_map.get(client_ip):
+        return ip_map[client_ip]
+
+    # Unresolved. Report each distinct (serial, declared-ip) pair once so a single
+    # vehicle is enough to tell whether the body is silent or simply unmapped,
+    # without turning a busy gate into a log flood.
+    signature = (str(device_serial or ""), str(declared_ip or ""))
+    if signature not in _reported_unresolved_identities:
+        _reported_unresolved_identities.add(signature)
+        logger.warning(
+            "[Identity] unresolved camera via gateway %s — body declared "
+            "deviceSerial=%r ipAddress=%r. Neither is in CAMERA_SERIAL_MAP (%d "
+            "entries) or CAMERA_IP_MAP (%d entries).",
+            client_ip,
+            str(device_serial or "") or "<absent>",
+            declared_ip or "<absent>",
+            len(settings.CAMERA_SERIAL_MAP or {}),
+            len(ip_map),
+        )
+
+    return f"UNKNOWN-{declared_ip or client_ip}"
+
+
 def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
     """Parse Phase 1 XML events using ElementTree with full Namespace support."""
     xml_str = raw_body.decode("utf-8", errors="replace")
@@ -923,12 +1055,9 @@ def _parse_xml_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
 
     # Prefer the <ipAddress> from XML body over the HTTP request's client IP.
     # This allows manual testing from localhost while still correctly identifying the camera.
-    xml_ip = find_text("ipAddress") or camera_ip
+    declared_ip = find_text("ipAddress")
     device_serial = find_text("deviceSerial") or "unknown"
-    resolved_camera_id = settings.CAMERA_SERIAL_MAP.get(device_serial) \
-        or settings.CAMERA_IP_MAP.get(xml_ip) \
-        or settings.CAMERA_IP_MAP.get(camera_ip) \
-        or f"UNKNOWN-{camera_ip}"
+    resolved_camera_id = resolve_camera_identity(device_serial, declared_ip, camera_ip)
 
     # Resolve ANPR Plate (UC1, UC2, UC4)
     plate_number = find_text("licensePlateNumber") or find_text("plateNumber")
@@ -1260,14 +1389,9 @@ def _parse_json_event(raw_body: bytes, camera_ip: str) -> ParsedCameraEvent:
 
     # Prefer the ipAddress declared inside the JSON body over the HTTP source IP.
     # This handles NAT/proxy scenarios where the HTTP client IP differs from the camera IP.
-    json_ip = data.get("ipAddress") or camera_ip
+    declared_ip = data.get("ipAddress")
     device_serial = data.get("deviceSerial", data.get("deviceID", "unknown"))
-    camera_id = (
-        settings.CAMERA_SERIAL_MAP.get(device_serial)
-        or settings.CAMERA_IP_MAP.get(json_ip)
-        or settings.CAMERA_IP_MAP.get(camera_ip)
-        or f"UNKNOWN-{camera_ip}"
-    )
+    camera_id = resolve_camera_identity(device_serial, declared_ip, camera_ip)
 
     # Determine gate direction from camera config in settings
     cam_config = settings.CAMERAS.get(camera_id, {})
