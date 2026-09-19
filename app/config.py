@@ -744,6 +744,44 @@ class Settings(BaseSettings):
     # How long after an entry is written a late confirmation crossing (CAM-03,
     # deep in the garage) may still attach its image to that entry.
     ENTRY_CONFIRM_MATCH_SECONDS: float = 30.0
+    # Let CAM-03 rescue a car CAM-23 missed.
+    #
+    # CAM-03 historically could only ATTACH an image to an entry that already
+    # existed: when the ramp cam missed the crossing the burst was dropped and
+    # CAM-03's own sighting of the same car did nothing. Nothing else covered
+    # that gap either — HIK_RECONCILE_OPEN_ENTRIES is off — so the car was lost.
+    #
+    # With this on, EVERY CAM-03 entry-direction crossing that finds no open
+    # burst is held as a pending crossing — including one whose image was just
+    # attached to a recently written entry. Attaching an image is routing, not
+    # proof the car was entered, and nothing at a plateless crossing carries
+    # identity, so the question is answered at expiry against HikCentral's GUID
+    # rather than guessed from recency. A redundant hold is then dropped in
+    # silence.
+    #
+    # COST: one HikCentral VehicleLogs lookup per CAM-03 entry confirmation,
+    # roughly one extra platform query per car, fired
+    # ENTRY_PENDING_CROSSING_SECONDS after the crossing. Weigh that against
+    # HikCentral's observed latency before enabling on a busy gate.
+    #
+    # Unlike a CAM-23 crossing, a CAM-03 hold is adjudication-only: a later
+    # burst can NOT claim it as its ramp confirmation. It was created because no
+    # burst existed, so letting the next car's burst consume it would confirm a
+    # different car on this car's sighting.
+    #
+    # The duplicate guard is NOT this flag and NOT a time window. One vehicle
+    # pass has one HikCentral GUID however many cameras saw it, so a second
+    # crossing of the same car resolves to an already-consumed pass and is
+    # dropped silently (`RecoveryAttempt.pass_already_accounted`). `open_session`
+    # independently refuses a second open stay per plate.
+    #
+    # REQUIRES HIK_VALIDATION_MODE=authoritative to take effect. The hold exists
+    # so HikCentral can adjudicate it; with the layer off or in shadow that
+    # answer never comes, and every ordinary CAM-03 confirmation would queue a
+    # crossing that can only expire. A held crossing is also rescue-only: it may
+    # create an entry, but never raises a silent-entry alert, because an
+    # unanswered hold means we failed to ASK, not that a car slipped in.
+    ENTRY_CAM03_CAN_RESCUE: bool = True
 
     # ── Anti-bounce on entry events (UC1) ────────────────────────────────
     # Suppress an entry-camera ANPR firing if the same plate had an exit

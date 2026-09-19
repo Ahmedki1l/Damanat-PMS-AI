@@ -123,6 +123,7 @@ def configure_settings(mock_settings, *, two_phase: bool):
     mock_settings.ANPR_BURST_MAX_SECONDS = 8.0
     mock_settings.ENTRY_CONFIRM_DIRECTIONS = "CAM-23:ramp-entry,CAM-03:B-entry"
     mock_settings.ENTRY_CONFIRM_MATCH_SECONDS = 30.0
+    mock_settings.ENTRY_CAM03_CAN_RESCUE = True
     # A refused burst whose tombstone lookup comes back empty is held for this
     # long; without a real number the drop path arithmetic fails on the mock.
     mock_settings.HIK_REFUSAL_HOLD_SECONDS = 900.0
@@ -780,16 +781,23 @@ class TestEntryExitService:
     @pytest.mark.asyncio
     @patch("app.services.entry_exit_service.settings")
     @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
-    async def test_cam03_no_burst_is_noop_not_silent(self, mock_alert, mock_settings):
-        """CAM-03 fires deep in the garage, usually after the burst already
-        flushed — finding no open burst is normal, NOT a silent entry."""
+    async def test_cam03_does_not_hold_when_hikcentral_is_off(self, mock_alert, mock_settings):
+        """CAM-03 must not queue a crossing nothing can adjudicate.
+
+        The hold exists so HikCentral can say whether the car is already
+        entered. With the layer off — the DEFAULT — that answer never comes, and
+        an unanswered hold can only expire. Queueing here would turn every
+        ordinary CAM-03 confirmation into a delayed silent-entry alert, one per
+        car. This module runs with HIK_VALIDATION_MODE unset (off).
+        """
         configure_settings(mock_settings, two_phase=True)
         db = make_db()
 
         await confirm_pending_entry(db, cam03_snapshot="cam03.jpg")
-        assert len(_pending_crossings) == 0  # CAM-03 never queues a silent crossing
-        await flush_due_entry_bursts(db)
+        assert _pending_crossings == []
 
+        _age_pending_crossings()
+        await flush_due_entry_bursts(db)
         mock_alert.assert_not_called()
 
     # ── Guard: no plate ───────────────────────────────────────────────────

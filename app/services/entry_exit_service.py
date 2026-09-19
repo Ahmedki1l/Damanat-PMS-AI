@@ -287,6 +287,12 @@ async def confirm_entry_crossing(db: Session, snapshot: str | None = None,
         Its image is then attached to the just-written entry instead.
         (allow_silent_entry=False)
 
+        It is no longer a dead end, though. When there is no open burst AND no
+        recent entry to attach to, nothing accounts for the car CAM-03 just
+        saw — CAM-23 missed the crossing and the burst was dropped — so the
+        sighting is held as a pending crossing too, and can be rescued exactly
+        like a CAM-23 one. Gated by ENTRY_CAM03_CAN_RESCUE.
+
     Both confirming cameras' snapshots are kept (one per source) and each is
     forwarded to the PMS under its own direction marker — so the PMS receives a
     ramp-top (CAM-23) AND an in-garage (CAM-03) image per car.
@@ -320,7 +326,7 @@ async def confirm_entry_crossing(db: Session, snapshot: str | None = None,
             )
         elif allow_silent_entry:
             _pending_crossings.append({
-                "ts": facility_now_naive(),
+                "ts": now,
                 "expires_at_monotonic": (
                     monotonic() + settings.ENTRY_PENDING_CROSSING_SECONDS
                 ),
@@ -328,14 +334,48 @@ async def confirm_entry_crossing(db: Session, snapshot: str | None = None,
                 "source": source_cam,
             })
             logger.info(
-                f"[UC1] Ramp crossing from {source_cam} with no buffered ANPR "
-                "read — held as pending (burst may still arrive)"
+                f"[UC1] Crossing from {source_cam} with no buffered ANPR read "
+                "— held as pending (burst may still arrive)"
             )
         else:
             # No open burst — the entry was likely already flushed (the normal
             # CAM-03 ordering). Attach this image to that just-written entry.
+            # The image still goes to a just-written entry when there is one —
+            # that is image ROUTING, not a claim about whether the car was
+            # already entered, and it never decides the rescue below.
             to_forward = _claim_recent_entry_image(source_cam, snapshot, now)
-            if to_forward is None:
+            # Holding is worth doing only if something can later ADJUDICATE the
+            # hold. The identity answer comes from HikCentral, and only an
+            # authoritative layer may act on it, so with the layer off,
+            # unconfigured or in shadow every held crossing would expire
+            # unanswered — and the only thing an unanswered hold can produce is
+            # noise. This is a capability check, not a guess about the car.
+            if settings.ENTRY_CAM03_CAN_RESCUE and hikcentral.is_authoritative():
+                # Held unconditionally. Whether this car is already accounted
+                # for is NOT guessed here from how recently something else
+                # happened — nothing at a plateless crossing carries identity.
+                # It is answered at expiry, against HikCentral's GUID for the
+                # pass, by `_recover_silent_entry`.
+                logger.info(
+                    f"[UC1] {source_cam} crossing with no open burst — held as "
+                    "pending; HikCentral decides whether it is already entered"
+                )
+                _pending_crossings.append({
+                    "ts": now,
+                    "expires_at_monotonic": (
+                        monotonic() + settings.ENTRY_PENDING_CROSSING_SECONDS
+                    ),
+                    "snapshot": snapshot,
+                    "source": source_cam,
+                    # This crossing may RESCUE a car but must never ACCUSE one.
+                    # CAM-03 has never been a silent-entry source, and the ways
+                    # a hold goes unanswered — HikCentral unreachable mid-flight,
+                    # the record not published yet — are all failures to ask,
+                    # not evidence that a car slipped in. Alerting on them would
+                    # turn every platform hiccup into one alert per car.
+                    "may_alert": False,
+                })
+            elif to_forward is None:
                 logger.debug(
                     f"[UC1] {source_cam} crossing with no open burst and no "
                     "recent entry to attach to — no action"
@@ -372,8 +412,23 @@ def _claim_recent_entry_image(source_cam: str, snapshot: str | None, now) -> tup
 
 async def confirm_pending_entry(db: Session, cam03_snapshot: str | None = None) -> None:
     """Backward-compatible entry point used by occupancy_service when CAM-03
-    fires in the entry direction. CAM-03 is a deep/secondary confirmation, so it
-    never raises a silent-entry alert."""
+    fires in the entry direction.
+
+    CAM-03 is a deep/secondary confirmation, so it never raises a silent-entry
+    alert (`allow_silent_entry=False`).
+
+    When ENTRY_CAM03_CAN_RESCUE is on and HikCentral is authoritative it holds a
+    rescue-only pending crossing UNCONDITIONALLY — including when the image was
+    just attached to a recently written entry. That is deliberate: nothing at a
+    plateless crossing carries identity, so "was this car already entered" is
+    not guessed from how recently something else happened; it is answered at
+    expiry against HikCentral's GUID, and a redundant hold is then dropped in
+    silence by `RecoveryAttempt.pass_already_accounted`.
+
+    The cost of that choice is one HikCentral VehicleLogs lookup per CAM-03
+    entry confirmation, roughly one extra platform query per car, fired
+    ENTRY_PENDING_CROSSING_SECONDS after the crossing.
+    """
     await confirm_entry_crossing(
         db, snapshot=cam03_snapshot, source_cam="CAM-03", allow_silent_entry=False,
     )
@@ -435,6 +490,17 @@ async def flush_due_entry_bursts(db: Session) -> None:
         # failed to name the car. Recovery is attempted first, never after.
         if await _recover_silent_entry(db, c):
             changed = True
+            continue
+        if not c.get("may_alert", True):
+            # A rescue-only crossing (see `confirm_entry_crossing`): nothing was
+            # created, but silence here is deliberate — this source is not
+            # trusted to accuse, only to save.
+            logger.info(
+                "[UC1] %s crossing at %s went unrecovered; no alert (rescue-only "
+                "source)",
+                c.get("source"),
+                c.get("ts"),
+            )
             continue
         await _raise_silent_entry_alert(db, c.get("source"), c.get("snapshot"))
         changed = True
@@ -660,9 +726,14 @@ def _recovered_burst(outcome, crossing: dict) -> dict:
         "first_event_time": event_time,
         "last_read_at": facility_now_naive(),
         "confirmed": True,
-        "confirm_snapshots": (
-            {source_cam: crossing_snapshot} if crossing_snapshot else {}
-        ),
+        # One crossing carries one camera's image. Crossings are appended
+        # independently by `confirm_entry_crossing` and nothing merges two
+        # sightings of the same car into a single crossing, so there is never
+        # more than one image to forward here. (An earlier revision read a
+        # `crossing["sources"]` map for a multi-camera merge; nothing ever wrote
+        # that key, so the branch was dead and the multi-image behaviour it
+        # advertised never happened. Reinstate it only alongside a real merge.)
+        "confirm_snapshots": {source_cam: crossing_snapshot} if crossing_snapshot else {},
         "confirm_source": source_cam,
         "force_flush": True,
         "hik_outcome": outcome,
@@ -822,18 +893,36 @@ async def _seed_entry_v2_candidates(db: Session, crossing: dict) -> None:
 async def _recover_silent_entry(db: Session, crossing: dict) -> bool:
     """Try to rescue a plateless ramp crossing using HikCentral (Case B).
 
-    Returns True when the crossing became a real entry. False restores the
-    previous behaviour exactly: the caller raises the silent-entry alert.
+    Returns True when the crossing is HANDLED — it became a real entry, or
+    HikCentral identified it as a pass already entered. False means nobody can
+    account for the car and the caller raises the silent-entry alert.
 
     Recovery needs exactly one HikCentral candidate in the window — with two
     cars in flight nothing says which one crossed, and guessing would staple a
     stranger's plate onto the session.
     """
-    outcome = await hikcentral.recover_entry_plate(
+    attempt = await hikcentral.recover_entry_pass(
         crossing.get("ts"),
         crossing.get("source") or "CAM-23",
         db,
     )
+    if attempt.pass_already_accounted:
+        # IDENTITY, NOT PROXIMITY. Every pass around this crossing already backs
+        # a gate event, so this is a second camera's view of a car that is
+        # already inside — one vehicle pass, one GUID, however many cameras saw
+        # it. Nothing to create and nothing to report: alerting here would
+        # invent a silent entry for a car that was entered correctly.
+        logger.info(
+            "[UC1] %s crossing at %s is an already-entered pass (%d/%d records "
+            "consumed) — no second entry, no alert",
+            crossing.get("source"),
+            crossing.get("ts"),
+            attempt.already_consumed,
+            attempt.records_found,
+        )
+        return True
+
+    outcome = attempt.outcome
     if outcome is None or not outcome.plate:
         # Legacy still declines and the caller still raises the silent-entry
         # alert. This only gives V3 the candidates it never got to see.

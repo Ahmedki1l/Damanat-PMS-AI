@@ -10,6 +10,7 @@ plate. This module does exactly two things:
 Callers receive one canonical plate and never learn where it came from.
 """
 
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
 
@@ -473,39 +474,83 @@ async def recoverable_candidates(
     return filter_recoverable(await _lookup(crossing_time, resource_ids), db)
 
 
-async def recover_entry_plate(
+@dataclass(frozen=True)
+class RecoveryAttempt:
+    """One recovery lookup, and enough of its shape to act on a refusal.
+
+    `recover_entry_plate` collapses every refusal to None, which is right for
+    "should this crossing become an entry" and useless for "was this car
+    already entered". Those need opposite responses — one raises a silent-entry
+    alert, the other must stay quiet — so the counts come back with the answer
+    rather than costing a second lookup to recompute.
+    """
+
+    outcome: Optional[HikOutcome]
+    # Both counts are over PLATE-BEARING records only, and must stay that way:
+    # `pass_already_accounted` compares them directly, so a record that can
+    # never be consumed (no readable plate) must not sit in the denominator.
+    records_found: int
+    already_consumed: int
+
+    @property
+    def pass_already_accounted(self) -> bool:
+        """Every pass around this crossing already backs a gate event.
+
+        This is the IDENTITY answer to "have we already entered this car",
+        keyed on HikCentral's GUID for one vehicle pass — not on how long ago
+        something happened. A second camera seeing the same car produces the
+        same pass, so its crossing lands here and is dropped in silence.
+
+        `records_found == 0` is deliberately NOT this case: the platform naming
+        nothing is a car we cannot account for, which is a real silent entry.
+        """
+        return self.records_found > 0 and self.already_consumed == self.records_found
+
+
+async def recover_entry_pass(
     crossing_time, source_cam: str, db: Optional[Session] = None
-) -> Optional[HikOutcome]:
+) -> RecoveryAttempt:
     """Recover a plate for a crossing the ANPR camera never labelled.
 
     Returns an outcome ONLY when a session should be created from it, so the
-    caller stays a plain `if outcome: ... else: silent_entry`. Ambiguity, an
-    unreachable platform, and shadow mode all return None.
+    caller stays a plain `if attempt.outcome: ... else: ...`. Ambiguity, an
+    unreachable platform, and shadow mode all leave it None.
 
     Recovery deliberately requires *exactly one* candidate in the window: with
     two cars in flight there is no evidence saying which one crossed, and
     guessing would attach a stranger's plate to the session.
     """
     if not _enabled():
-        return None
+        return RecoveryAttempt(None, 0, 0)
 
     resource_ids = settings.hik_entry_resource_ids()
     if not resource_ids:
-        return None
+        return RecoveryAttempt(None, 0, 0)
 
     records = await _lookup(crossing_time, resource_ids)
     candidates = filter_recoverable(records, db)
+    # Both sides of `pass_already_accounted` must count the SAME records. A
+    # plateless record can never back a gate event, so it can never be
+    # "consumed" — counting it in the denominator only made an accounted-for
+    # pass look unaccounted. One unreadable plate anywhere in the +/-30s window
+    # was enough to drop consumed(1) == found(2) to false, decline recovery, and
+    # raise a silent-entry alert for a car that had entered correctly.
+    plate_records = [r for r in records if r.canonical_plate]
+    consumed = sum(1 for r in plate_records if guid_already_used(db, r.guid))
+    attempt = lambda outcome: RecoveryAttempt(outcome, len(plate_records), consumed)
 
     if len(candidates) != 1:
         logger.info(
             "%s recovery declined for %s crossing at %s: %d candidate(s) "
-            "in window (need exactly 1)",
+            "in window (need exactly 1, %d of %d record(s) already consumed)",
             _log_tag(),
             source_cam,
             crossing_time,
             len(candidates),
+            consumed,
+            len(records),
         )
-        return None
+        return attempt(None)
 
     match = candidates[0]
     if not _authoritative():
@@ -518,7 +563,7 @@ async def recover_entry_plate(
             source_cam,
             crossing_time,
         )
-        return None
+        return attempt(None)
 
     logger.warning(
         "[Hik] recovered plate=%s guid=%s for %s crossing at %s "
@@ -528,15 +573,24 @@ async def recover_entry_plate(
         source_cam,
         crossing_time,
     )
-    return HikOutcome(
-        plate=match.canonical_plate,
-        plate_source=PLATE_SOURCE_HIK_RECOVERED,
-        matched=True,
-        reason="plate_recovered",
-        record=match,
-        reported_plate=None,
-        candidates_considered=len(records),
+    return attempt(
+        HikOutcome(
+            plate=match.canonical_plate,
+            plate_source=PLATE_SOURCE_HIK_RECOVERED,
+            matched=True,
+            reason="plate_recovered",
+            record=match,
+            reported_plate=None,
+            candidates_considered=len(records),
+        )
     )
+
+
+async def recover_entry_plate(
+    crossing_time, source_cam: str, db: Optional[Session] = None
+) -> Optional[HikOutcome]:
+    """`recover_entry_pass` for callers that only need the answer."""
+    return (await recover_entry_pass(crossing_time, source_cam, db)).outcome
 
 
 def is_enabled() -> bool:
