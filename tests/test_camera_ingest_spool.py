@@ -329,8 +329,9 @@ class TestReviewRegressions:
         before = spool._spool_bytes()
         path = next(iter(spool.iter_spooled_records()))
         spool.quarantine_record(path, "test")
-        assert spool._spool_bytes() == before, (
-            "quarantine shares the snapshot volume and must stay inside the cap"
+        reason_path = spool_dir / "quarantine" / (os.path.basename(path) + ".reason.json")
+        assert spool._spool_bytes() == before + reason_path.stat().st_size, (
+            "quarantine shares the snapshot volume and must count its inspection sidecar"
         )
 
     def test_a_long_outage_does_not_quarantine_a_valid_event(self):

@@ -4,7 +4,9 @@ import asyncio
 from datetime import datetime, timezone
 from io import BytesIO
 import json
+import multiprocessing
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,8 +15,17 @@ import httpx
 from PIL import Image
 
 from app.config import settings
-from app.routers.events import process_camera_event, receive_camera_event
+from app.services.camera_ingest_worker import (
+    CameraIngestWorker,
+    drain_camera_ingest_records_once,
+)
+from app.routers.events import (
+    CameraEventOutcome,
+    process_camera_event,
+    receive_camera_event,
+)
 from app.services import camera_ingest_spool as ingest_spool
+from app.services.camera_ingest_spool import ReplayOwnerLease, ReplayOwnerUnavailable
 import app.services.event_dispatcher as dispatcher
 from app.services.event_dispatcher import dispatch_event
 from app.services.entry_v2_forwarder import (
@@ -61,6 +72,47 @@ class _Request:
     async def stream(self):
         self.stream_started = True
         yield self._body
+
+
+def _blocked_replay_worker(_stop_event, _wake_event, started, release) -> None:
+    """Spawn-picklable worker used to prove API receipt loop isolation."""
+    started.set()
+    release.wait()
+
+
+def _exit_replay_worker(*_args) -> None:
+    """Spawn target that simulates an unexpected replay-child exit."""
+
+
+def _publish_child_bus_payload(notification_queue, started) -> None:
+    """Spawn target that uses the same child EventBus forwarding hook as replay."""
+    import json
+
+    from app.services.camera_ingest_notifications import install_child_notification_forwarder
+    from app.utils.event_bus import event_bus
+
+    install_child_notification_forwarder(notification_queue)
+    started.set()
+    event_bus.publish(json.dumps({"is_alert": True, "event_type": "replayed-alert"}))
+
+
+def _hold_consumer_lease(spool_dir, started, release) -> None:
+    settings.CAMERA_INGEST_SPOOL_DIR = spool_dir
+    with ingest_spool.exclusive_consumer_lock() as owns:
+        if owns:
+            started.set()
+            release.wait()
+
+
+def _try_replay_owner(spool_dir, result_queue) -> None:
+    settings.CAMERA_INGEST_SPOOL_DIR = spool_dir
+    try:
+        owner = ReplayOwnerLease.acquire()
+    except ReplayOwnerUnavailable:
+        result_queue.put("blocked")
+    else:
+        owner.release()
+        result_queue.put("acquired")
 
 
 def _event():
@@ -182,13 +234,8 @@ def _configure_authoritative_entry_parser(monkeypatch, tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failure",
-    [httpx.ReadTimeout(""), httpx.ReadError("peer disconnected")],
-    ids=("timeout", "disconnect"),
-)
-async def test_retryable_transport_failure_replays_the_same_directly_identified_entry(
-    monkeypatch, tmp_path, failure
+async def test_durable_intake_replays_the_same_directly_identified_entry(
+    monkeypatch, tmp_path
 ):
     """The spool re-enters the real parser after receipt time and VMR state move on."""
     _configure_authoritative_entry_parser(monkeypatch, tmp_path)
@@ -204,20 +251,13 @@ async def test_retryable_transport_failure_replays_the_same_directly_identified_
     )
     content_type = "multipart/form-data; boundary=entry-test"
 
-    async def retryable_failure_post(*_args, **_kwargs):
-        raise failure
-
     initial_db = MagicMock()
     with (
-        patch(
-            "app.services.entry_v2_forwarder._post_entry_v2",
-            retryable_failure_post,
-        ),
         patch(
             "app.routers.events.dispatch_event",
             new_callable=AsyncMock,
             return_value={},
-        ),
+        ) as dispatch,
     ):
         response = await receive_camera_event(
             _Request(body=body, content_type=content_type, client_host="10.0.0.10"),
@@ -226,9 +266,11 @@ async def test_retryable_transport_failure_replays_the_same_directly_identified_
 
     assert response == {"status": "accepted", "detail": "queued for processing"}
     initial_db.commit.assert_not_called()
+    dispatch.assert_not_awaited()
     path = next(iter(ingest_spool.iter_spooled_records()))
     header, replay_body = ingest_spool.read_record(path)
     assert replay_body == body
+    assert header["reason"] == "durable_intake"
 
     # The drainer has no request-scoped state. It runs after the original receipt
     # time, and transient VMR identity hints may already have expired, so this
@@ -252,6 +294,7 @@ async def test_retryable_transport_failure_replays_the_same_directly_identified_
 
     replay_db = MagicMock()
     with (
+        patch("app.services.camera_ingest_worker.SessionLocal", return_value=replay_db),
         patch("app.services.entry_v2_forwarder._post_entry_v2", accept_post),
         patch(
             "app.routers.events.dispatch_event",
@@ -259,16 +302,431 @@ async def test_retryable_transport_failure_replays_the_same_directly_identified_
             return_value={},
         ),
     ):
-        outcome = await process_camera_event(
-            replay_body,
-            header["camera_ip"],
-            header["content_type"],
-            replay_db,
+        await drain_camera_ingest_records_once()
+
+    replay_event = parse_camera_event(
+        replay_body,
+        header["camera_ip"],
+        header["content_type"],
+    )
+    _, expected_data, _ = _request_parts(replay_event)
+    assert delivered_ids == [expected_data["attempt_id"]]
+    replay_db.commit.assert_called_once()
+    replay_db.close.assert_called_once()
+    assert list(ingest_spool.iter_spooled_records()) == []
+
+
+@pytest.mark.asyncio
+async def test_authoritative_durable_intake_responds_before_blocked_processing(
+    monkeypatch, tmp_path
+):
+    _configure_authoritative_entry_parser(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "CAMERA_EVENT_ALLOWED_SOURCE_CIDRS", "10.0.0.0/24")
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_ENABLED", True)
+    monkeypatch.setattr(
+        settings, "CAMERA_INGEST_SPOOL_DIR", str(tmp_path / "camera_ingest_spool")
+    )
+
+    with patch(
+        "app.routers.events.process_camera_event", new_callable=AsyncMock
+    ) as process:
+        response = await receive_camera_event(
+            _Request(body=b"trusted-entry", client_host="10.0.0.10"),
+            MagicMock(),
         )
 
-    assert outcome.status == "ok"
-    assert delivered_ids == [header["evidence_id"]]
-    replay_db.commit.assert_called_once()
+    assert response == {"status": "accepted", "detail": "queued for processing"}
+    process.assert_not_awaited()
+    path = next(iter(ingest_spool.iter_spooled_records()))
+    assert ingest_spool.read_record(path)[1] == b"trusted-entry"
+
+
+@pytest.mark.asyncio
+async def test_durable_receipt_stays_responsive_while_replay_process_is_blocked(
+    monkeypatch, tmp_path
+):
+    _configure_authoritative_entry_parser(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "CAMERA_EVENT_ALLOWED_SOURCE_CIDRS", "10.0.0.0/24")
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_ENABLED", True)
+    monkeypatch.setattr(
+        settings, "CAMERA_INGEST_SPOOL_DIR", str(tmp_path / "camera_ingest_spool")
+    )
+    context = multiprocessing.get_context("spawn")
+    started, release = context.Event(), context.Event()
+    worker = CameraIngestWorker(
+        worker_target=_blocked_replay_worker,
+        worker_args=(started, release),
+    )
+    worker.start()
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        response = await asyncio.wait_for(
+            receive_camera_event(
+                _Request(body=b"trusted-entry", client_host="10.0.0.10"),
+                MagicMock(),
+            ),
+            timeout=0.5,
+        )
+        assert response == {"status": "accepted", "detail": "queued for processing"}
+        assert list(ingest_spool.iter_spooled_records())
+    finally:
+        release.set()
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_durable_ingest_retains_unknown_camera_until_inventory_recovers(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_ENABLED", True)
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setattr(settings, "CAMERAS", {})
+    assert ingest_spool.spool_camera_event(b"unknown-camera", "10.0.0.10", "application/xml", "durable_intake")
+    persisted_path = next(iter(ingest_spool.iter_spooled_records()))
+
+    with (
+        patch(
+            "app.services.camera_ingest_worker.parse_camera_event",
+            return_value=SimpleNamespace(camera_id="UNKNOWN-10.0.0.10"),
+        ),
+        patch("app.services.camera_loader.load_cameras_from_db") as refresh,
+        patch(
+            "app.services.camera_ingest_worker.process_camera_event",
+            new_callable=AsyncMock,
+        ) as process,
+    ):
+        blocked = await drain_camera_ingest_records_once()
+
+    assert blocked is True
+    refresh.assert_called_once()
+    process.assert_not_awaited()
+    header, body = ingest_spool.read_record(persisted_path)
+    assert body == b"unknown-camera"
+    assert header["attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_durable_ingest_waits_for_another_process_consumer_lease(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_ENABLED", True)
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_DIR", str(tmp_path / "spool"))
+    assert ingest_spool.spool_camera_event(b"leased", "10.0.0.10", "application/xml", "durable_intake")
+    path = next(iter(ingest_spool.iter_spooled_records()))
+    context = multiprocessing.get_context("spawn")
+    started, release = context.Event(), context.Event()
+    holder = context.Process(
+        target=_hold_consumer_lease,
+        args=(settings.CAMERA_INGEST_SPOOL_DIR, started, release),
+    )
+    holder.start()
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        assert await drain_camera_ingest_records_once() is True
+        assert ingest_spool.read_record(path)[0]["attempts"] == 0
+    finally:
+        release.set()
+        await asyncio.to_thread(holder.join, 2)
+
+
+@pytest.mark.asyncio
+async def test_authoritative_replay_owner_rejects_second_api_process_then_reopens(
+    monkeypatch, tmp_path
+):
+    spool_dir = str(tmp_path / "spool")
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_DIR", spool_dir)
+    owner = ReplayOwnerLease.acquire()
+    context = multiprocessing.get_context("spawn")
+    first_result = context.Queue(maxsize=1)
+    contender = context.Process(target=_try_replay_owner, args=(spool_dir, first_result))
+    contender.start()
+    try:
+        assert await asyncio.to_thread(first_result.get, True, 2) == "blocked"
+    finally:
+        await asyncio.to_thread(contender.join, 2)
+        owner.release()
+
+    reopened_result = context.Queue(maxsize=1)
+    reopened = context.Process(target=_try_replay_owner, args=(spool_dir, reopened_result))
+    reopened.start()
+    try:
+        assert await asyncio.to_thread(reopened_result.get, True, 2) == "acquired"
+    finally:
+        await asyncio.to_thread(reopened.join, 2)
+        first_result.close()
+        first_result.join_thread()
+        reopened_result.close()
+        reopened_result.join_thread()
+
+
+@pytest.mark.asyncio
+async def test_camera_ingest_worker_restarts_an_exited_child():
+    context = multiprocessing.get_context("spawn")
+    notification_queue = context.Queue(maxsize=1)
+    worker = CameraIngestWorker(
+        worker_target=_exit_replay_worker,
+        worker_args=(notification_queue,),
+    )
+    worker.start()
+    first_pid = worker._process.pid
+    await asyncio.to_thread(worker._process.join, 2)
+    worker.ensure_running()
+    try:
+        assert worker._process.pid != first_pid
+    finally:
+        await worker.stop()
+        notification_queue.close()
+        notification_queue.join_thread()
+
+
+@pytest.mark.asyncio
+async def test_spawned_replay_child_forwards_alert_to_parent_sse_bus():
+    from app.services.camera_ingest_notifications import relay_child_notifications
+    from app.utils.event_bus import event_bus
+
+    context = multiprocessing.get_context("spawn")
+    notification_queue = context.Queue(maxsize=1)
+    stop, started = context.Event(), context.Event()
+    relay = asyncio.create_task(relay_child_notifications(notification_queue, stop))
+    subscription = event_bus.subscribe()
+    received = asyncio.create_task(anext(subscription))
+    child = context.Process(
+        target=_publish_child_bus_payload,
+        args=(notification_queue, started),
+    )
+    child.start()
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        payload = await asyncio.wait_for(received, timeout=2)
+        assert json.loads(payload) == {"is_alert": True, "event_type": "replayed-alert"}
+    finally:
+        stop.set()
+        relay.cancel()
+        try:
+            await relay
+        except asyncio.CancelledError:
+            pass
+        await subscription.aclose()
+        await asyncio.to_thread(child.join, 2)
+        notification_queue.close()
+        notification_queue.join_thread()
+
+
+@pytest.mark.asyncio
+async def test_authoritative_durable_intake_refuses_ack_when_receipt_write_fails(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "authoritative")
+    monkeypatch.setattr(settings, "CAMERA_EVENT_ALLOWED_SOURCE_CIDRS", "10.0.0.0/24")
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_ENABLED", True)
+
+    with (
+        patch("app.routers.events.spool_camera_event", return_value=False),
+        patch(
+            "app.routers.events.process_camera_event", new_callable=AsyncMock
+        ) as process,
+    ):
+        response = await receive_camera_event(
+            _Request(body=b"trusted-entry", client_host="10.0.0.10"),
+            MagicMock(),
+        )
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
+    assert json.loads(response.body) == {
+        "status": "retry",
+        "detail": "camera intake unavailable",
+    }
+    process.assert_not_awaited()
+
+
+def test_concurrent_durable_receipts_reserve_spool_capacity_before_ack(
+    monkeypatch, tmp_path
+):
+    """Two simultaneous receipts cannot both pass a near-capacity scan."""
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_MIN_FREE_BYTES", 0)
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_MAX_BYTES", 650)
+    start = threading.Barrier(2)
+    accepted: list[bool] = []
+
+    def write_receipt(index: int) -> None:
+        start.wait(timeout=2)
+        accepted.append(
+            ingest_spool.spool_camera_event(
+                b"x" * 300,
+                f"10.0.0.{index}",
+                "application/xml",
+                "durable_intake",
+            )
+        )
+
+    writers = [threading.Thread(target=write_receipt, args=(index,)) for index in (1, 2)]
+    for writer in writers:
+        writer.start()
+    for writer in writers:
+        writer.join(timeout=2)
+
+    assert accepted.count(True) == 1
+    assert accepted.count(False) == 1
+    assert ingest_spool._spool_bytes() <= settings.CAMERA_INGEST_SPOOL_MAX_BYTES
+
+
+@pytest.mark.asyncio
+async def test_disabled_durable_intake_keeps_authoritative_processing_synchronous(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "authoritative")
+    monkeypatch.setattr(settings, "CAMERA_EVENT_ALLOWED_SOURCE_CIDRS", "10.0.0.0/24")
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_ENABLED", False)
+
+    with patch(
+        "app.routers.events.process_camera_event",
+        new_callable=AsyncMock,
+        return_value=CameraEventOutcome(status="ok", event_type="ANPR"),
+    ) as process:
+        response = await receive_camera_event(
+            _Request(body=b"trusted-entry", client_host="10.0.0.10"),
+            MagicMock(),
+        )
+
+    assert response == {"status": "ok", "event_type": "ANPR"}
+    process.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_durable_intake_drainer_replays_same_bytes_and_retains_retryable_failure(
+    monkeypatch, tmp_path
+):
+    _configure_authoritative_entry_parser(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "CAMERA_EVENT_ALLOWED_SOURCE_CIDRS", "10.0.0.0/24")
+    monkeypatch.setattr(settings, "PMS_API_URL", "http://va:8000")
+    monkeypatch.setattr(settings, "ENTRY_V2_SERVICE_KEY", "test-key")
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_ENABLED", True)
+    monkeypatch.setattr(
+        settings, "CAMERA_INGEST_SPOOL_DIR", str(tmp_path / "camera_ingest_spool")
+    )
+    body = _anpr_multipart(_jpeg(100, 80))
+    await receive_camera_event(
+        _Request(
+            body=body,
+            content_type="multipart/form-data; boundary=entry-test",
+            client_host="10.0.0.10",
+        ),
+        MagicMock(),
+    )
+    persisted_path = next(iter(ingest_spool.iter_spooled_records()))
+    database = MagicMock()
+    database.commit.side_effect = RuntimeError("SQL unavailable")
+
+    async def accept_post(_url, **kwargs):
+        evidence_id = kwargs["data"]["attempt_id"]
+        return httpx.Response(
+            201,
+            json={
+                "status": "accepted",
+                "id": evidence_id,
+                "duplicate": False,
+                "mode": "authoritative",
+            },
+        )
+
+    with (
+        patch("app.services.camera_ingest_worker.SessionLocal", return_value=database),
+        patch(
+            "app.services.entry_v2_forwarder._post_entry_v2", accept_post
+        ),
+        patch(
+            "app.routers.events.dispatch_event",
+            new_callable=AsyncMock,
+            return_value={},
+        ),
+    ):
+        await drain_camera_ingest_records_once()
+
+    database.close.assert_called_once()
+    database.rollback.assert_called_once()
+    header, replay_body = ingest_spool.read_record(persisted_path)
+    assert replay_body == body
+    assert header["attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_durable_drainer_quarantines_terminal_malformed_payload_and_continues(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_DIR", str(tmp_path / "spool"))
+    assert ingest_spool.spool_camera_event(
+        b"malformed-camera-payload", "10.0.0.10", "application/xml", "durable_intake"
+    )
+    assert ingest_spool.spool_camera_event(
+        b"next-valid-camera-payload", "10.0.0.10", "application/xml", "durable_intake"
+    )
+
+    async def terminal_then_valid(raw_body, *_args):
+        if raw_body == b"malformed-camera-payload":
+            return CameraEventOutcome(
+                status="rejected", detail="malformed camera payload"
+            )
+        return CameraEventOutcome(status="ok")
+
+    with (
+        patch(
+            "app.services.camera_ingest_worker._camera_configuration_available",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch("app.services.camera_ingest_worker.SessionLocal", return_value=MagicMock()),
+        patch(
+            "app.services.camera_ingest_worker.process_camera_event",
+            new_callable=AsyncMock,
+            side_effect=terminal_then_valid,
+        ) as process,
+    ):
+        assert await drain_camera_ingest_records_once() is False
+
+    quarantined = list((tmp_path / "spool" / "quarantine").glob("*.evt"))
+    assert len(quarantined) == 1
+    _, raw_body = ingest_spool.read_record(str(quarantined[0]))
+    assert raw_body == b"malformed-camera-payload"
+    reason = json.loads(Path(str(quarantined[0]) + ".reason.json").read_text())
+    assert reason["reason"] == "terminal rejected: malformed camera payload"
+    assert process.await_count == 2
+    assert list(ingest_spool.iter_spooled_records()) == []
+
+
+@pytest.mark.asyncio
+async def test_duplicate_durable_intakes_pass_each_raw_receipt_to_downstream(
+    monkeypatch, tmp_path
+):
+    _configure_authoritative_entry_parser(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "CAMERA_EVENT_ALLOWED_SOURCE_CIDRS", "10.0.0.0/24")
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_ENABLED", True)
+    monkeypatch.setattr(
+        settings, "CAMERA_INGEST_SPOOL_DIR", str(tmp_path / "camera_ingest_spool")
+    )
+    body = b"same-raw-camera-event"
+    await receive_camera_event(_Request(body=body, client_host="10.0.0.10"), MagicMock())
+    await receive_camera_event(_Request(body=body, client_host="10.0.0.10"), MagicMock())
+
+    downstream_bodies = []
+
+    async def accept(raw_body, *_args):
+        downstream_bodies.append(raw_body)
+        return CameraEventOutcome(status="ok")
+
+    with (
+        patch("app.services.camera_ingest_worker.SessionLocal", return_value=MagicMock()),
+        patch(
+            "app.services.camera_ingest_worker.process_camera_event",
+            new_callable=AsyncMock,
+            side_effect=accept,
+        ),
+    ):
+        await drain_camera_ingest_records_once()
+
+    assert downstream_bodies == [body, body]
+    assert list(ingest_spool.iter_spooled_records()) == []
 
 
 @pytest.mark.asyncio

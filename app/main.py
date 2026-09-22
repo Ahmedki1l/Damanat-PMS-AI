@@ -6,6 +6,7 @@ Includes security middleware, global error handlers, and all routers.
 # (no-op edit: 2026-05-05 to trigger uvicorn --reload — rev 3 for close_session vehicle clear)
 
 import asyncio
+import multiprocessing
 import os
 import time
 
@@ -13,6 +14,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.concurrency import run_in_threadpool
 from app.routers import (
     events, occupancy,
     health, alerts, vehicles, entry_exit, parking_stats, parking_sessions_internal,
@@ -40,6 +42,24 @@ from app.utils.core_backend_client import (
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+async def _initialize_database_and_cameras() -> None:
+    """Best-effort SQL bootstrap, kept off the API event loop."""
+    try:
+        await run_in_threadpool(create_tables)
+        logger.info("✅ Database ready")
+    except Exception as e:
+        if "already an object named" in str(e):
+            logger.info("✅ Database ready (schema already initialized by another worker)")
+        else:
+            logger.error(f"❌ Database initialization failed: {e}")
+
+    # Load the camera inventory from the gateway-owned `cameras` table. Best
+    # effort: on any failure the .env-built inventory (config.py) stays in place.
+    from app.services.camera_loader import load_cameras_from_db
+
+    await run_in_threadpool(load_cameras_from_db)
 
 app = FastAPI(
     title="Damanat Parking Analytics API",
@@ -131,19 +151,19 @@ async def startup():
     # schema initialization block: continuing on another dialect would permit
     # concurrent duplicate/open-session races.
     assert_authoritative_lock_backend(engine.dialect.name)
-    try:
-        create_tables()
-        logger.info("✅ Database ready")
-    except Exception as e:
-        if "already an object named" in str(e):
-            logger.info("✅ Database ready (schema already initialized by another worker)")
-        else:
-            logger.error(f"❌ Database initialization failed: {e}")
-
-    # Load the camera inventory from the gateway-owned `cameras` table. Best
-    # effort: on any failure the .env-built inventory (config.py) stays in place.
-    from app.services.camera_loader import load_cameras_from_db
-    load_cameras_from_db()
+    durable_authoritative_intake = (
+        settings.ENTRY_V2_MODE == "authoritative"
+        and settings.CAMERA_INGEST_SPOOL_ENABLED
+    )
+    if durable_authoritative_intake:
+        # A SQL outage must not keep the trusted write-ahead receipt endpoint
+        # from starting. SQL/bootstrap work continues out of band; the replay
+        # child owns its own DB connection and retries the durable queue.
+        app.state.database_bootstrap = asyncio.create_task(
+            _initialize_database_and_cameras(), name="database-bootstrap"
+        )
+    else:
+        await _initialize_database_and_cameras()
 
     logger.info(f"📡 Cameras configured: {list(settings.CAMERAS.keys())}")
     logger.info(
@@ -177,21 +197,55 @@ async def startup():
     app.state.pms_forward_drainer = asyncio.create_task(_pms_forward_drainer_loop())
     logger.info("📤 PMS/VA forward-spool drainer task started")
 
-    # Stage 1: camera events that cannot be processed on arrival are spooled and
-    # replayed instead of being answered with a 503 the camera will never retry.
+    # Stage 1: durable intake owns authoritative camera input before processing.
+    # Replay runs in a dedicated process so a synchronous pyodbc wait cannot
+    # freeze this API loop and prevent later receipts.
     if settings.CAMERA_INGEST_SPOOL_ENABLED:
         from app.services.camera_ingest_spool import check_spool_durability
+        from app.services.camera_ingest_spool import ReplayOwnerLease
+        from app.services.camera_ingest_worker import CameraIngestWorker
 
-        # Reports whether the spool directory actually survives a restart. Never
-        # raises — a config check that raises on an optional dependency is what
-        # crash-looped this deployment once already.
+        # Probe the configured path and durability syscalls. This does not
+        # establish that deployment storage survives pod replacement.
         check_spool_durability()
-        app.state.camera_ingest_drainer = asyncio.create_task(
-            _camera_ingest_drainer_loop()
-        )
-        logger.info("📥 Camera ingest-spool drainer task started")
+        if durable_authoritative_intake:
+            # A child owns volatile VMR state and forwards replayed SSE payloads
+            # to this parent. Multiple API parents sharing one spool would split
+            # both state channels, so reject the second owner before it accepts
+            # any traffic. One async API process still handles many cameras.
+            app.state.camera_ingest_replay_owner = ReplayOwnerLease.acquire()
+            context = multiprocessing.get_context("spawn")
+            app.state.camera_ingest_notification_stop = context.Event()
+            app.state.camera_ingest_notification_queue = context.Queue(
+                maxsize=settings.CAMERA_INGEST_NOTIFICATION_QUEUE_CAPACITY
+            )
+            app.state.camera_ingest_worker = CameraIngestWorker(
+                worker_args=(app.state.camera_ingest_notification_queue,)
+            )
+            app.state.camera_ingest_worker.start()
+            app.state.camera_ingest_supervisor = asyncio.create_task(
+                _camera_ingest_worker_supervisor_loop()
+            )
+            app.state.camera_ingest_notification_bridge = asyncio.create_task(
+                _camera_ingest_notification_bridge_loop()
+            )
+            logger.info("📥 Camera ingest-spool replay worker started")
+        else:
+            # Off/shadow retain the original in-process dispatcher so its
+            # process-local SSE bus and burst/VMR coordination stay intact.
+            app.state.camera_ingest_drainer = asyncio.create_task(
+                _legacy_camera_ingest_drainer_loop()
+            )
+            app.state.camera_ingest_worker = None
+            app.state.camera_ingest_supervisor = None
+            app.state.camera_ingest_notification_bridge = None
+            app.state.camera_ingest_replay_owner = None
     else:
         app.state.camera_ingest_drainer = None
+        app.state.camera_ingest_worker = None
+        app.state.camera_ingest_supervisor = None
+        app.state.camera_ingest_notification_bridge = None
+        app.state.camera_ingest_replay_owner = None
 
     # Heal whatever the gate pipeline missed while this service was down. The
     # event-driven reconcile only looks back 15 minutes, so without this a
@@ -207,93 +261,42 @@ async def startup():
         app.state.hik_catchup = None
 
 
-# Roughly every 5 minutes at the default 20s drain interval.
-_STUCK_HEAD_LOG_EVERY = 15
+async def _camera_ingest_worker_supervisor_loop() -> None:
+    """Restart the authoritative replay child after an unexpected exit."""
+    while True:
+        try:
+            await asyncio.sleep(1)
+            worker = getattr(app.state, "camera_ingest_worker", None)
+            if worker is not None:
+                worker.ensure_running()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("[IngestSpool] replay worker supervision failed")
 
 
-async def _camera_ingest_drainer_loop():
-    """Replay spooled camera events until they are accepted.
+async def _camera_ingest_notification_bridge_loop() -> None:
+    """Relay replay-child notifications into this API process's SSE bus."""
+    from app.services.camera_ingest_notifications import relay_child_notifications
 
-    Records are replayed oldest-first so an entry burst (CAM-23, CAM-03 and the
-    ANPR read for one car, seconds apart) reaches the correlation logic in the
-    order the cameras produced it. Each pass stops at the first record that is
-    still retryable: a blocked downstream blocks the whole queue on purpose,
-    because draining past it would reorder the burst.
-    """
-    from app.database import SessionLocal
-    from app.routers.events import process_camera_event
-    from app.services import camera_ingest_spool as spool
+    await relay_child_notifications(
+        app.state.camera_ingest_notification_queue,
+        app.state.camera_ingest_notification_stop,
+    )
+
+
+async def _legacy_camera_ingest_drainer_loop() -> None:
+    """Preserve off/shadow replay inside the API process and its local bus."""
+    from app.services.camera_ingest_worker import drain_camera_ingest_records_once
 
     while True:
         try:
             await asyncio.sleep(float(settings.CAMERA_INGEST_DRAIN_INTERVAL_SECONDS))
-            for path in spool.iter_spooled_records():
-                try:
-                    header, raw_body = spool.read_record(path)
-                except spool.SpoolRecordMalformed as exc:
-                    spool.quarantine_record(path, str(exc))
-                    continue
-                except OSError:
-                    break
-
-                db = SessionLocal()
-                try:
-                    outcome = await process_camera_event(
-                        raw_body,
-                        str(header.get("camera_ip") or ""),
-                        str(header.get("content_type") or ""),
-                        db,
-                    )
-                finally:
-                    db.close()
-
-                if outcome.retryable:
-                    # Count attempts for visibility only. Attempts must NOT decide
-                    # quarantine: ordering means only the head is ever retried, so
-                    # a downstream outage drives the head's counter up at a fixed
-                    # rate and would quarantine a perfectly good event purely for
-                    # having been first. At a 20s interval a 48-attempt cap
-                    # discarded the oldest car after 16 minutes, and another every
-                    # 16 minutes after that — roughly 97 cars across the 26-hour
-                    # database outage this spool exists to survive.
-                    #
-                    # A genuinely poisonous record fails deterministically, which
-                    # is a "rejected" outcome, not a retryable one, and is drained
-                    # below. So the only bound needed here is age.
-                    attempts = spool.record_attempt(path, header)
-                    age = spool.record_age_seconds(header)
-                    if age is not None and age >= settings.CAMERA_INGEST_SPOOL_MAX_AGE_SECONDS:
-                        spool.quarantine_record(
-                            path,
-                            f"still retryable after {age / 3600:.1f}h and "
-                            f"{attempts} attempts: {outcome.detail}",
-                        )
-                        continue
-                    if attempts % _STUCK_HEAD_LOG_EVERY == 0:
-                        logger.warning(
-                            "[IngestSpool] head of queue blocked for %s attempts "
-                            "(%.1f min, %d records waiting) — downstream still "
-                            "failing: %s",
-                            attempts,
-                            (age or 0) / 60,
-                            len(spool._record_paths(quarantine_unreadable=False)),
-                            outcome.detail,
-                        )
-                    # Preserve ordering: leave this record and everything behind
-                    # it for the next pass rather than replaying out of sequence.
-                    break
-
-                logger.info(
-                    "[IngestSpool] replayed %s -> %s (spooled %s)",
-                    os.path.basename(path),
-                    outcome.status,
-                    header.get("received_at"),
-                )
-                spool.remove_record(path)
+            await drain_camera_ingest_records_once()
         except asyncio.CancelledError:
             break
-        except Exception as e:
-            logger.error(f"[IngestSpool] drain tick failed: {e}", exc_info=True)
+        except Exception:
+            logger.exception("[IngestSpool] legacy drain tick failed")
 
 
 async def _pms_forward_drainer_loop():
@@ -336,7 +339,10 @@ async def shutdown():
     await stop_entry_v2_shadow_worker()
     from app.services.entry_exit_service import drain_background_forwards
     await drain_background_forwards()
-    for attr in ("entry_burst_flusher", "pms_forward_drainer", "camera_ingest_drainer"):
+    for attr in (
+        "entry_burst_flusher", "pms_forward_drainer", "database_bootstrap",
+        "camera_ingest_drainer", "camera_ingest_supervisor",
+    ):
         task = getattr(app.state, attr, None)
         if task is not None:
             task.cancel()
@@ -344,6 +350,26 @@ async def shutdown():
                 await task
             except asyncio.CancelledError:
                 pass
+    worker = getattr(app.state, "camera_ingest_worker", None)
+    notification_stop = getattr(app.state, "camera_ingest_notification_stop", None)
+    if notification_stop is not None:
+        notification_stop.set()
+    if worker is not None:
+        await worker.stop()
+    owner = getattr(app.state, "camera_ingest_replay_owner", None)
+    if owner is not None:
+        owner.release()
+    bridge = getattr(app.state, "camera_ingest_notification_bridge", None)
+    if bridge is not None:
+        bridge.cancel()
+        try:
+            await bridge
+        except asyncio.CancelledError:
+            pass
+    notification_queue = getattr(app.state, "camera_ingest_notification_queue", None)
+    if notification_queue is not None:
+        notification_queue.close()
+        notification_queue.join_thread()
     await close_entry_v2_http_client()
     await close_core_backend_http_client()
     await close_hikcentral_http_client()

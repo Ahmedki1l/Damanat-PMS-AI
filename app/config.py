@@ -127,6 +127,8 @@ class Settings(BaseSettings):
     # off:           existing burst/FIFO entry flow only (safe default)
     # shadow:        existing flow remains authoritative; evidence is mirrored
     # authoritative: VA confirmations are the only writer of entry log/session
+    # Enable only after the additive confirmation-receipt migration succeeds.
+    ENTRY_V2_CONFIRMATION_RECEIPTS_ENABLED: bool = False
     ENTRY_V2_MODE: Literal["off", "shadow", "authoritative"] = "off"
     ENTRY_V2_SERVICE_KEY: str = ""
     ENTRY_V2_CAMERA_ALIASES: str = ""
@@ -806,8 +808,8 @@ class Settings(BaseSettings):
     # ── Camera ingest spool (Stage 1) ────────────────────────────────────
     # Hikvision push is fire-and-forget: it ignores Retry-After and never
     # re-POSTs, so a camera-facing 503 deletes the event rather than deferring
-    # it. When enabled, undeliverable camera events are written here and the
-    # camera is acknowledged with 200; a drainer replays them.
+    # it. When enabled, authoritative trusted input is written here before
+    # processing and acknowledged with 200; an isolated replay worker drains it.
     #
     # PRODUCTION: this MUST point inside the one PersistentVolume that exists
     # (detection_images), or the spool is wiped on every pod restart:
@@ -827,7 +829,14 @@ class Settings(BaseSettings):
     # outage outlasts cap x interval. 7 days comfortably outlives the 26-hour
     # database outage this spool was written for.
     CAMERA_INGEST_SPOOL_MAX_AGE_SECONDS: float = Field(default=7 * 24 * 3600, gt=0)
+    # Retry backoff for a blocked head. New durable receipts wake the worker
+    # immediately; this value is not normal camera processing latency.
     CAMERA_INGEST_DRAIN_INTERVAL_SECONDS: float = Field(default=20.0, gt=0)
+    CAMERA_INGEST_NOTIFICATION_QUEUE_CAPACITY: int = Field(default=256, gt=0, le=4096)
+    # Authoritative durable intake has one replay owner per shared spool path.
+    # Run one API worker/replica for that path; this does not limit async HTTP
+    # camera receipt concurrency. A shared state/bus design is required first
+    # for multi-worker authoritative replay.
     PMS_FORWARD_DRAIN_INTERVAL_SECONDS: float = 15.0   # background re-POST cadence
     PMS_FORWARD_SPOOL_MAX_AGE_SECONDS: float = 3600.0  # drop spooled payloads older than this
 

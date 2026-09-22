@@ -35,7 +35,9 @@ never leave a half-record that the drainer would read.
 import json
 import os
 import shutil
+import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterator, Optional
 
@@ -56,10 +58,15 @@ _durability: dict = {"checked": False, "durable": None, "detail": "not checked"}
 # One warning per distinct degradation reason, not one per rejected event — a
 # full volume during the morning peak must not turn into a log flood.
 _reported_degradations: set[str] = set()
+_spool_write_lock = threading.Lock()
 
 
 class SpoolRecordMalformed(ValueError):
     """A spool file is readable but cannot be interpreted as a record."""
+
+
+class ReplayOwnerUnavailable(RuntimeError):
+    """Another API process already owns authoritative replay for this spool."""
 
 
 def spool_dir() -> str:
@@ -68,6 +75,79 @@ def spool_dir() -> str:
 
 def _quarantine_dir() -> str:
     return os.path.join(spool_dir(), QUARANTINE_DIRNAME)
+
+
+class ReplayOwnerLease:
+    """One API-process lifetime lease for authoritative replay and its SSE bridge."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd: Optional[int] = fd
+
+    @classmethod
+    def acquire(cls) -> "ReplayOwnerLease":
+        try:
+            import fcntl
+        except ImportError as exc:
+            raise ReplayOwnerUnavailable(
+                "authoritative camera spool requires POSIX file locking"
+            ) from exc
+        os.makedirs(spool_dir(), exist_ok=True)
+        fd = os.open(os.path.join(spool_dir(), ".replay-owner.lock"), os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError) as exc:
+            os.close(fd)
+            raise ReplayOwnerUnavailable(
+                "another API process owns authoritative replay for " + spool_dir()
+            ) from exc
+        return cls(fd)
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        import fcntl
+
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._fd)
+            self._fd = None
+
+
+@contextmanager
+def exclusive_consumer_lock():
+    """Yield whether this process exclusively owns the spool consumer lease.
+
+    Every API worker may receive camera traffic, but only one may drain a shared
+    PersistentVolume at a time. ``flock`` is released by the kernel when a
+    crashed consumer exits, so there is no stale lock file recovery path.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        logger.error("[IngestSpool] no file-lock implementation; replay paused")
+        yield False
+        return
+    fd: Optional[int] = None
+    try:
+        os.makedirs(spool_dir(), exist_ok=True)
+        fd = os.open(os.path.join(spool_dir(), ".consumer.lock"), os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    except OSError as exc:
+        logger.error("[IngestSpool] could not acquire consumer lease: %s", exc)
+        yield False
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
 
 
 def _warn_once(key: str, message: str, *args) -> None:
@@ -116,7 +196,10 @@ def _spool_bytes() -> int:
         try:
             with os.scandir(directory) as entries:
                 for entry in entries:
-                    if entry.is_file() and entry.name.endswith(RECORD_SUFFIX):
+                    if entry.is_file() and (
+                        entry.name.endswith(RECORD_SUFFIX)
+                        or entry.name.endswith(RECORD_SUFFIX + ".reason.json")
+                    ):
                         try:
                             total += entry.stat().st_size
                         except OSError:
@@ -146,7 +229,7 @@ def _free_bytes(path: str) -> Optional[int]:
             candidate = parent
 
 
-def _capacity_refusal() -> Optional[str]:
+def _capacity_refusal(incoming_bytes: int = 0) -> Optional[str]:
     """Return a reason to refuse spooling, or None when there is room.
 
     In production the ingest spool shares a volume with ``detection_images``,
@@ -156,18 +239,41 @@ def _capacity_refusal() -> Optional[str]:
     """
     directory = spool_dir()
     free = _free_bytes(directory)
-    if free is not None and free < settings.CAMERA_INGEST_SPOOL_MIN_FREE_BYTES:
+    if (
+        free is not None
+        and free - incoming_bytes < settings.CAMERA_INGEST_SPOOL_MIN_FREE_BYTES
+    ):
         return (
-            f"only {free // (1024 * 1024)} MB free on the spool volume "
+            f"only {(free - incoming_bytes) // (1024 * 1024)} MB free after receipt "
+            "on the spool volume "
             f"(floor is {settings.CAMERA_INGEST_SPOOL_MIN_FREE_BYTES // (1024 * 1024)} MB)"
         )
     used = _spool_bytes()
-    if used >= settings.CAMERA_INGEST_SPOOL_MAX_BYTES:
+    if used + incoming_bytes > settings.CAMERA_INGEST_SPOOL_MAX_BYTES:
         return (
-            f"spool holds {used // (1024 * 1024)} MB, at its "
+            f"spool would hold {(used + incoming_bytes) // (1024 * 1024)} MB, above its "
             f"{settings.CAMERA_INGEST_SPOOL_MAX_BYTES // (1024 * 1024)} MB cap"
         )
     return None
+
+
+@contextmanager
+def _spool_write_reservation(directory: str) -> Iterator[None]:
+    """Serialize quota check and receipt creation across local API processes."""
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise OSError("camera spool requires POSIX file locking") from exc
+    with _spool_write_lock:
+        fd = os.open(os.path.join(directory, ".write-reservation.lock"), os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 # ── writing ─────────────────────────────────────────────────────────────────
@@ -190,16 +296,6 @@ def spool_camera_event(
     directory = spool_dir()
     temp_path: Optional[str] = None
     try:
-        refusal = _capacity_refusal()
-        if refusal:
-            _warn_once(
-                f"capacity:{refusal}",
-                "[IngestSpool] refusing to spool — %s. Falling back to a "
-                "camera-facing 503; events will be LOST until space is freed.",
-                refusal,
-            )
-            return False
-
         os.makedirs(directory, exist_ok=True)
         received_at = datetime.now(timezone.utc)
         header = {
@@ -210,23 +306,35 @@ def spool_camera_event(
             "evidence_id": evidence_id,
             "attempts": 0,
         }
+        encoded_header = json.dumps(header).encode("utf-8")
         name = (
             f"cam_{received_at.strftime('%Y%m%d_%H%M%S_%f')}_"
             f"{uuid.uuid4().hex[:8]}{RECORD_SUFFIX}"
         )
-        temp_path = os.path.join(directory, name + TEMP_SUFFIX)
-        with open(temp_path, "wb") as handle:
-            handle.write(json.dumps(header).encode("utf-8"))
-            handle.write(b"\n")
-            handle.write(raw_body)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, os.path.join(directory, name))
-        temp_path = None
-        # A file fsync alone does not make the rename durable. Do not tell the
-        # camera the event is safely queued when the directory entry could not
-        # be synced; the existing record is left in place for later recovery.
-        _fsync_directory(directory, required=True)
+        receipt_bytes = len(encoded_header) + 1 + len(raw_body)
+        with _spool_write_reservation(directory):
+            refusal = _capacity_refusal(receipt_bytes)
+            if refusal:
+                _warn_once(
+                    f"capacity:{refusal}",
+                    "[IngestSpool] refusing to spool — %s. Falling back to a "
+                    "camera-facing 503; events will be LOST until space is freed.",
+                    refusal,
+                )
+                return False
+            temp_path = os.path.join(directory, name + TEMP_SUFFIX)
+            with open(temp_path, "wb") as handle:
+                handle.write(encoded_header)
+                handle.write(b"\n")
+                handle.write(raw_body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, os.path.join(directory, name))
+            temp_path = None
+            # A file fsync alone does not make the rename durable. Do not tell the
+            # camera the event is safely queued when the directory entry could not
+            # be synced; the existing record is left in place for later recovery.
+            _fsync_directory(directory, required=True)
         logger.info(
             "[IngestSpool] spooled camera event from %s (%s) — reason=%s",
             camera_ip,
@@ -375,7 +483,21 @@ def quarantine_record(path: str, why: str) -> None:
     try:
         target_dir = _quarantine_dir()
         os.makedirs(target_dir, exist_ok=True)
-        os.replace(path, os.path.join(target_dir, os.path.basename(path)))
+        target = os.path.join(target_dir, os.path.basename(path))
+        reason_path = target + ".reason.json"
+        temp_path = reason_path + TEMP_SUFFIX
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump({"reason": why}, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, reason_path)
+        _fsync_directory(target_dir, required=True)
+        os.replace(path, target)
+        # The sidecar fsync above only persists the inspection reason. The
+        # acknowledged raw receipt becomes durable in quarantine only after
+        # this post-move target-directory sync; then sync its removal at source.
+        _fsync_directory(target_dir, required=True)
+        _fsync_directory(os.path.dirname(path), required=True)
         logger.warning("[IngestSpool] quarantined %s — %s", os.path.basename(path), why)
     except OSError as exc:
         logger.error("[IngestSpool] could not quarantine %s: %s", path, exc)
