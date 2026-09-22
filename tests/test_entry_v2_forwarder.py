@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import json
 import threading
 
+import httpx
 import pytest
 
 from app.config import settings
@@ -489,6 +490,35 @@ async def test_delivery_and_server_failures_are_retryable(monkeypatch, status_co
     assert result.outcome is ForwardOutcome.UNAVAILABLE
     assert result.retryable is True
     assert result.retry_after == "4"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ReadTimeout(""), httpx.ReadError("peer disconnected")],
+    ids=("read-timeout", "disconnect"),
+)
+async def test_timeout_and_disconnect_keep_actionable_retry_diagnostics(
+    monkeypatch, caplog, failure
+):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    monkeypatch.setattr(settings, "PMS_API_URL", "http://va:8000")
+    monkeypatch.setattr(settings, "ENTRY_V2_SERVICE_KEY", "secret")
+    monkeypatch.setattr(forwarder, "_shadow_last_failure_log_at", 0.0)
+
+    async def fail_post(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(forwarder, "_post_entry_v2", fail_post)
+
+    result = await forward_entry_v2_event(_event())
+
+    assert result.outcome is ForwardOutcome.UNAVAILABLE
+    assert result.retryable is True
+    assert result.detail == type(failure).__name__
+    assert type(failure).__name__ in caplog.text
+    if str(failure):
+        assert str(failure) in caplog.text
 
 
 @pytest.mark.asyncio

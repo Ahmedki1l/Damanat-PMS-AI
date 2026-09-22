@@ -12,6 +12,7 @@ Scenario numbers match CAMERA_EVENT_LOSS_PLAN.md, Stage 1.
 import asyncio
 import json
 import os
+import stat
 
 import pytest
 
@@ -131,6 +132,26 @@ class TestDegradation:
         )
         response = _respond(_retryable())
         assert getattr(response, "status_code", None) == 503
+
+    def test_directory_sync_failure_never_acknowledges_an_undurable_record(
+        self, monkeypatch
+    ):
+        real_fsync = spool.os.fsync
+
+        def fail_only_directory_sync(descriptor):
+            if stat.S_ISDIR(spool.os.fstat(descriptor).st_mode):
+                raise OSError("directory sync failed")
+            return real_fsync(descriptor)
+
+        monkeypatch.setattr(spool.os, "fsync", fail_only_directory_sync)
+
+        response = _respond(_retryable())
+
+        assert getattr(response, "status_code", None) == 503
+        # The atomic rename may already have happened. Retaining this best-effort
+        # copy gives the drainer a chance to recover it, but it was never
+        # acknowledged as durable to the camera.
+        assert len(list(spool.iter_spooled_records())) == 1
 
     def test_disabled_flag_preserves_todays_exact_behaviour(self, monkeypatch):
         monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_ENABLED", False, raising=False)
