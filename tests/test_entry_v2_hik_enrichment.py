@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.services import entry_v2_hik_enrichment as enrichment
+from app.services import entry_attempt_snapshot_store as attempt_snapshot_store
 from app.services.hikcentral.models import VehicleLogRecord, normalize_plate
 
 
@@ -145,6 +146,47 @@ async def test_a_forwarded_candidate_is_marked_as_hikcentral_sourced(enabled):
     assert '"evidence_source":"hikcentral"' in metadata
     assert '"hik_guid":"g1"' in metadata
     assert data["reported_plate"] == "ABC-1234"
+
+
+@pytest.mark.asyncio
+async def test_authoritative_hik_candidate_persists_before_forwarding(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(enrichment.settings, "ENTRY_V2_MODE", "authoritative")
+    monkeypatch.setattr(enrichment.settings, "PMS_API_URL", "http://va:8000")
+    monkeypatch.setattr(enrichment.settings, "ENTRY_V2_SERVICE_KEY", "k" * 8)
+    monkeypatch.setattr(
+        "app.services.snapshot_service.SNAPSHOT_DIR",
+        str(tmp_path),
+    )
+
+    async def acknowledge(_url, *, data, **_kwargs):
+        stored_path = attempt_snapshot_store.resolve_entry_attempt_snapshot(
+            data["attempt_id"]
+        )
+        assert stored_path is not None
+        assert (tmp_path / stored_path.rsplit("/", 1)[-1]).read_bytes() == b"hik-image"
+        return SimpleNamespace(
+            status_code=201,
+            text="",
+            json=lambda: {
+                "mode": "authoritative",
+                "id": data["attempt_id"],
+                "status": "accepted",
+                "duplicate": False,
+            },
+        )
+
+    with patch.object(enrichment, "_post_entry_v2", acknowledge):
+        delivered = await enrichment._forward_candidate(
+            record=_record("hik-guid", 0),
+            content=b"hik-image",
+            camera_id="CAM-ENTRY",
+            event_time=NOW,
+        )
+
+    assert delivered is True
 
 
 # --------------------------------------------------------------------------- #
@@ -291,4 +333,3 @@ async def test_a_candidate_with_no_canonical_plate_is_dropped_not_forwarded(enab
     assert post.await_count == 0
     assert block["forwarded"] == []
     assert block["no_plate"] == ["g1"], "the drop must be countable, not just logged"
-

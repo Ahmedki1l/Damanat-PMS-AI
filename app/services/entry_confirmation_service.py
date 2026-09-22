@@ -33,6 +33,7 @@ from app.models.entry_exit_log import EntryExitLog
 from app.models.parking_session import ParkingSession
 from app.schemas.entry_confirmation import EntryConfirmationRequest
 from app.services import parking_session_service, vehicle_service
+from app.services.entry_attempt_snapshot_store import resolve_entry_attempt_snapshot
 from app.services.entry_state_lock import (
     acquire_mssql_application_lock as _acquire_mssql_application_lock,
     plate_lock_resource,
@@ -198,6 +199,20 @@ def _reconcile_older_open_sessions(
         db.flush()
 
 
+def _fill_missing_entry_snapshots(
+    log_entry: EntryExitLog,
+    session: Optional[ParkingSession],
+    snapshot_path: Optional[str],
+) -> None:
+    """Repair an incomplete replay without replacing either accepted image."""
+    if not snapshot_path:
+        return
+    if not log_entry.snapshot_path:
+        log_entry.snapshot_path = snapshot_path
+    if session is not None and not session.entry_snapshot_path:
+        session.entry_snapshot_path = snapshot_path
+
+
 def apply_confirmed_entry(
     db: Session,
     body: EntryConfirmationRequest,
@@ -209,8 +224,11 @@ def apply_confirmed_entry(
             "canonical_plate is not a valid plate identity"
         )
 
+    snapshot_path = resolve_entry_attempt_snapshot(body.attempt_id)
+
     existing_log = _find_existing_log(db, body, canonical_plate)
     if existing_log is not None:
+        snapshot_path = existing_log.snapshot_path or snapshot_path
         session = _find_matching_session(db, existing_log)
         later_exit = _find_later_exit(
             db,
@@ -240,7 +258,7 @@ def apply_confirmed_entry(
                 plate_number=existing_log.plate_number,
                 event_time=existing_log.event_time,
                 camera_id=existing_log.camera_id,
-                snapshot_path=None,
+                snapshot_path=snapshot_path,
                 vehicle=vehicle,
             )
             from app.services.occupancy_service import (
@@ -252,6 +270,7 @@ def apply_confirmed_entry(
                 camera_id=body.entry_camera_id,
             )
             db.flush()
+        _fill_missing_entry_snapshots(existing_log, session, snapshot_path)
         return ConfirmationApplyResult(
             result="duplicate",
             plate_number=existing_log.plate_number,
@@ -278,7 +297,7 @@ def apply_confirmed_entry(
         gate="entry",
         camera_id=body.entry_camera_id,
         event_time=event_time,
-        snapshot_path=None,
+        snapshot_path=snapshot_path,
         plate_confidence=body.plate_confidence,
         created_at=facility_now_naive(),
     )
@@ -289,7 +308,7 @@ def apply_confirmed_entry(
         plate_number=canonical_plate,
         event_time=log_entry.event_time,
         camera_id=body.entry_camera_id,
-        snapshot_path=None,
+        snapshot_path=snapshot_path,
         vehicle=vehicle,
     )
     from app.services.occupancy_service import (
