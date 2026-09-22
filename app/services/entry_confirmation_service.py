@@ -1,35 +1,23 @@
-"""Transactional application of VA entry confirmations to existing tables.
+"""Apply validated VA entry decisions within one SQL transaction.
 
-HikCentral validation is deliberately NOT wired into this path. Two hard
-blockers, both external to this module:
-
-1. VA's callback ACK contract (`src/entry/callback.py:_validate_ack`) requires
-   the `plate_number` we echo to equal VA's own plate key. Returning a
-   HikCentral-corrected plate raises a NON-retryable `callback_plate_mismatch`,
-   which latches VA's fatal-delivery flag and takes its health endpoint down.
-   Correcting a plate here is therefore impossible without a VA-side change.
-2. The confirmation router is a sync endpoint (blocking pyodbc runs in a
-   threadpool, off the event loop) and the writer below runs inside a
-   transaction-owned application lock. There is nowhere in this path to await
-   network I/O without either moving blocking DB calls onto the event loop or
-   holding a DB lock across an await.
-
-Entry V2 is `off` in production, so the legacy path in entry_exit_service.py is
-where HikCentral actually runs. Revisit this once the ACK contract carries a
-`corrected_plate` field.
+This path preserves VA's plate identity and performs no external network I/O.
+Optional decision receipts commit with the entry log and session; legacy
+camera/plate/time reconciliation remains available for older decisions.
 """
 
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import hashlib
+import json
 import threading
 from typing import Iterator, Literal, Optional
 
 from sqlalchemy.orm import Session
 
-from app.config import facility_now_naive, facility_tz
+from app.config import facility_now_naive, facility_tz, settings
 from app.models.entry_exit_log import EntryExitLog
+from app.models.entry_confirmation_receipt import EntryConfirmationReceipt
 from app.models.parking_session import ParkingSession
 from app.schemas.entry_confirmation import EntryConfirmationRequest
 from app.services import parking_session_service, vehicle_service
@@ -50,7 +38,7 @@ _confirmation_lock = threading.Lock()
 
 @dataclass(frozen=True)
 class ConfirmationApplyResult:
-    result: Literal["created", "duplicate"]
+    result: Literal["created", "duplicate", "stale_after_exit"]
     plate_number: str
     entry_log_id: int
     session_id: int
@@ -70,6 +58,10 @@ class SupersededByNewerEntry(Exception):
     def __init__(self, plate_number: str, message: str):
         super().__init__(message)
         self.plate_number = plate_number
+
+
+class DecisionReceiptConflict(ValueError):
+    """A decision ID was reused with different confirmation content."""
 
 
 class InvalidEntryConfirmation(ValueError):
@@ -105,7 +97,10 @@ def confirmation_transaction_guard(
     with _confirmation_lock:
         # Camera scope protects the timestamp-tolerance idempotency predicate;
         # plate scope protects the one-open-stay invariant across entry cameras.
-        for resource in sorted({_lock_resource(body), _plate_lock_resource(body)}):
+        resources = {_lock_resource(body), _plate_lock_resource(body)}
+        if settings.ENTRY_V2_CONFIRMATION_RECEIPTS_ENABLED:
+            resources.add("entry-decision:" + hashlib.sha256(body.decision_id.encode()).hexdigest())
+        for resource in sorted(resources):
             _acquire_mssql_application_lock(db, resource)
         yield
 
@@ -214,6 +209,52 @@ def _fill_missing_entry_snapshots(
 
 
 def apply_confirmed_entry(
+    db: Session,
+    body: EntryConfirmationRequest,
+) -> ConfirmationApplyResult:
+    """Persist a successful receipt in the caller's session transaction.
+
+    Lost-response replays return the original IDs even after the visit exits;
+    they never reopen a stay. Legacy camera/time reconciliation remains the
+    fallback for decisions accepted before receipts were enabled.
+    """
+    if not settings.ENTRY_V2_CONFIRMATION_RECEIPTS_ENABLED:
+        return _apply_confirmed_entry(db, body)
+    payload = body.model_dump(mode="json")
+    # Normalize the timestamp to the same facility wall clock used by SQL.
+    payload["entry_captured_at"] = _event_time(body).isoformat()
+    fingerprint = hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()).hexdigest()
+    receipt = db.get(EntryConfirmationReceipt, body.decision_id)
+    if receipt is not None:
+        if receipt.request_fingerprint != fingerprint:
+            raise DecisionReceiptConflict("decision_id already belongs to different confirmation content")
+        session = db.get(ParkingSession, receipt.session_id)
+        if session is None:
+            raise InvalidEntryConfirmation("receipt references a missing parking session")
+        # A receipt proves the historical commit, not that the car is still
+        # inside. The VA ACK contract suppresses identity publication on stale.
+        result = (
+            "stale_after_exit"
+            if session.exit_time is not None or session.status != "open"
+            else "duplicate"
+        )
+        return ConfirmationApplyResult(
+            result=result, plate_number=receipt.plate_number,
+            entry_log_id=receipt.entry_log_id, session_id=receipt.session_id,
+        )
+    applied = _apply_confirmed_entry(db, body)
+    db.add(EntryConfirmationReceipt(
+        decision_id=body.decision_id, request_fingerprint=fingerprint,
+        plate_number=applied.plate_number, entry_log_id=applied.entry_log_id,
+        session_id=applied.session_id, created_at=facility_now_naive(),
+    ))
+    db.flush()
+    return applied
+
+
+def _apply_confirmed_entry(
     db: Session,
     body: EntryConfirmationRequest,
 ) -> ConfirmationApplyResult:

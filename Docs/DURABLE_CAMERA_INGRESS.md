@@ -1,0 +1,13 @@
+# Durable camera intake
+
+Local implementation; production activation and acceptance are pending.
+
+With `ENTRY_V2_MODE=authoritative` and `CAMERA_INGEST_SPOOL_ENABLED=true`, the webhook checks source trust and body limits, then commits the raw body to the spool before returning queued success. Parsing, VA forwarding and SQL work happen after that boundary. A failed durable write returns 503; it does not acknowledge an in-memory-only receipt. Off/shadow modes keep the existing synchronous path.
+
+The spool directory must survive container replacement. One authoritative API owner holds a lifetime lock per spool path; a second owner fails startup. This restriction preserves replay/VMR/SSE ownership, not a one-request HTTP concurrency cap. A supervised spawned process replays records, keeping blocked SQL/inference work away from the API event loop. A wake signal starts normal replay promptly; a failed head backs off. Child notifications reach the API process through a bounded transient queue. A full notification queue can lose a transient SSE notification, but does not discard the persisted camera record or database outcome.
+
+The spool writer reserves its quota check plus file write across local threads/processes. Admission counts the encoded receipt bytes and checks the resulting free-space floor. This coordinates PMS spool writers only; unrelated snapshot writes on the same volume can still consume space. Keep operational free-space monitoring and headroom. File and directory synchronization occur before durable success.
+
+Successful processing removes the record. Nonretry rejected/error outcomes retain the unchanged raw record in quarantine and a reason sidecar; malformed spool records are also quarantined. Retryable records remain ordered at the head until success or the configured `CAMERA_INGEST_SPOOL_MAX_AGE_SECONDS` threshold, then are quarantined with the reason. Quarantine is not automatic session creation or automatic replay. It requires investigation and an explicit recovery decision; its bytes count against the spool quota. No quarantine purge is introduced.
+
+Verify the exact deployed mode, spool flag, mount, single-owner topology, database bootstrap and backlog visibility before activation. The startup marker is evidence of marker continuity, not proof of persistence across a pod replacement. Local tests cover receipt-before-processing, blocked downstream work, spawned-owner supervision, notification bridging, concurrent quota admission and rejected-payload retention. Real SQL Server outage/recovery, pod replacement, disk exhaustion, camera retries and end-to-end session reconciliation remain release checks.

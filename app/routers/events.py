@@ -97,6 +97,9 @@ async def _outcome_to_camera_response(
         evidence_id=outcome.evidence_id,
     )
     if spooled:
+        from app.services.camera_ingest_worker import wake_camera_ingest_worker
+
+        wake_camera_ingest_worker()
         logger.info(
             "[IngestSpool] acknowledged camera event that would have been a 503 "
             "(reason=%s evidence=%s) — queued for replay",
@@ -117,6 +120,44 @@ async def _outcome_to_camera_response(
         status_code=503,
         content=content,
         headers={"Retry-After": outcome.retry_after or "1"},
+    )
+
+
+async def _receipt_authoritative_camera_intake(
+    raw_body: bytes,
+    camera_ip: str,
+    content_type: str,
+):
+    """Persist trusted authoritative input before parser, VA, or SQL work."""
+    if not (
+        entry_v2_is_authoritative()
+        and settings.CAMERA_INGEST_SPOOL_ENABLED
+    ):
+        return None
+
+    persisted = await run_in_threadpool(
+        spool_camera_event,
+        raw_body,
+        camera_ip,
+        content_type,
+        "durable_intake",
+    )
+    if persisted:
+        # The replay worker lives outside this event loop. Waking it after the
+        # durable rename keeps normal receipt-to-processing latency bounded by
+        # scheduler wake-up rather than the retry backoff interval.
+        from app.services.camera_ingest_worker import wake_camera_ingest_worker
+
+        wake_camera_ingest_worker()
+        return {"status": "accepted", "detail": "queued for processing"}
+
+    logger.error(
+        "[IngestSpool] durable intake receipt failed; refusing camera acknowledgement"
+    )
+    return JSONResponse(
+        status_code=503,
+        content={"status": "retry", "detail": "camera intake unavailable"},
+        headers={"Retry-After": "1"},
     )
 
 
@@ -214,6 +255,14 @@ async def receive_camera_event(request: Request, db: Session = Depends(get_db)):
     if not raw_body:
         logger.warning(f"Ignoring empty body received from {camera_ip}")
         return {"status": "ignored", "detail": "empty body"}
+
+    receipt_response = await _receipt_authoritative_camera_intake(
+        raw_body,
+        camera_ip,
+        content_type,
+    )
+    if receipt_response is not None:
+        return receipt_response
 
     outcome = await process_camera_event(raw_body, camera_ip, content_type, db)
     return await _outcome_to_camera_response(outcome, raw_body, camera_ip, content_type)

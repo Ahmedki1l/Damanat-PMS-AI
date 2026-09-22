@@ -879,3 +879,105 @@ def test_unexpected_value_error_from_confirmation_remains_retryable(
 
     assert db.query(EntryExitLog).count() == 0
     assert db.query(ParkingSession).count() == 0
+
+
+def test_durable_receipt_survives_restart_and_replay_after_exit(tmp_path, monkeypatch):
+    from app.models.entry_confirmation_receipt import EntryConfirmationReceipt
+
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "authoritative")
+    monkeypatch.setattr(settings, "ENTRY_V2_CONFIRMATION_RECEIPTS_ENABLED", True)
+    monkeypatch.setattr(
+        "app.services.entry_confirmation_service._acquire_mssql_application_lock",
+        lambda *_args: None,
+    )
+    url = f"sqlite:///{tmp_path / 'receipts.sqlite'}"
+    first_engine = create_engine(url)
+    Base.metadata.create_all(first_engine)
+    with sessionmaker(bind=first_engine)() as first_db:
+        accepted = confirm_entry(_body(), None, first_db)
+        duplicate = confirm_entry(_body(), None, first_db)
+        assert duplicate.result == "duplicate"
+        assert duplicate.session_id == accepted.session_id
+        visit = first_db.get(ParkingSession, accepted.session_id)
+        visit.status = "closed"
+        visit.exit_time = datetime(2026, 7, 20, 13)
+        first_db.commit()
+    first_engine.dispose()
+    restarted_engine = create_engine(url)
+    try:
+        with sessionmaker(bind=restarted_engine)() as restarted_db:
+            replay = confirm_entry(_body(), None, restarted_db)
+            assert replay.result == "stale_after_exit"
+            assert replay.session_id == accepted.session_id
+            assert replay.entry_log_id == accepted.entry_log_id
+            assert restarted_db.query(EntryConfirmationReceipt).count() == 1
+            assert restarted_db.query(ParkingSession).count() == 1
+            assert restarted_db.query(EntryExitLog).count() == 1
+            assert restarted_db.get(ParkingSession, replay.session_id).status == "closed"
+    finally:
+        restarted_engine.dispose()
+
+
+def test_durable_receipt_rejects_changed_decision_content(db, monkeypatch):
+    from app.models.entry_confirmation_receipt import EntryConfirmationReceipt
+
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "authoritative")
+    monkeypatch.setattr(settings, "ENTRY_V2_CONFIRMATION_RECEIPTS_ENABLED", True)
+    accepted = confirm_entry(_body(), None, db)
+    with pytest.raises(HTTPException) as error:
+        confirm_entry(_body(canonical_plate="OTHER-99"), None, db)
+    assert error.value.status_code == 409
+    assert db.query(EntryConfirmationReceipt).count() == 1
+    assert db.query(ParkingSession).one().id == accepted.session_id
+    assert db.query(EntryExitLog).one().id == accepted.entry_log_id
+
+
+def test_receipt_and_session_rollback_together_when_commit_fails(db, monkeypatch):
+    from app.models.entry_confirmation_receipt import EntryConfirmationReceipt
+
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "authoritative")
+    monkeypatch.setattr(settings, "ENTRY_V2_CONFIRMATION_RECEIPTS_ENABLED", True)
+    with patch.object(db, "commit", side_effect=RuntimeError("commit unavailable")):
+        with pytest.raises(RuntimeError, match="commit unavailable"):
+            confirm_entry(_body(), None, db)
+    assert db.query(EntryConfirmationReceipt).count() == 0
+    assert db.query(ParkingSession).count() == 0
+    assert db.query(EntryExitLog).count() == 0
+    recovered = confirm_entry(_body(), None, db)
+    assert recovered.result == "created"
+    assert db.query(EntryConfirmationReceipt).count() == 1
+
+
+def test_receipt_migration_supports_confirmation_and_preserves_audit_history(tmp_path, monkeypatch):
+    import importlib.util
+    from pathlib import Path
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from app.models.entry_confirmation_receipt import EntryConfirmationReceipt
+
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "authoritative")
+    monkeypatch.setattr(settings, "ENTRY_V2_CONFIRMATION_RECEIPTS_ENABLED", True)
+    monkeypatch.setattr(
+        "app.services.entry_confirmation_service._acquire_mssql_application_lock",
+        lambda *_args: None,
+    )
+    migration_path = Path(__file__).parents[1] / "alembic/versions/e8a24c91d607_add_entry_confirmation_receipts.py"
+    spec = importlib.util.spec_from_file_location("receipt_migration", migration_path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    migration_engine = create_engine(f"sqlite:///{tmp_path / 'migration.sqlite'}")
+    try:
+        Base.metadata.create_all(migration_engine)
+        EntryConfirmationReceipt.__table__.drop(migration_engine)
+        with migration_engine.begin() as connection:
+            with Operations.context(MigrationContext.configure(connection)):
+                migration.upgrade()
+                migration.upgrade()
+        with sessionmaker(bind=migration_engine)() as migrated_db:
+            response = confirm_entry(_body(), None, migrated_db)
+            assert response.result == "created"
+            with pytest.raises(RuntimeError, match="audit records"):
+                migration.downgrade()
+            assert migrated_db.query(EntryConfirmationReceipt).one().session_id == response.session_id
+    finally:
+        migration_engine.dispose()

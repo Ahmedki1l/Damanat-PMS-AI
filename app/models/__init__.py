@@ -9,3 +9,4 @@ from app.models.entry_exit_log import EntryExitLog     # noqa
 from app.models.parking_session import ParkingSession  # noqa
 from app.models.camera_feed import CameraFeed
 from app.models.hik_validation import HikValidation  # noqa
+from app.models.entry_confirmation_receipt import EntryConfirmationReceipt  # noqa

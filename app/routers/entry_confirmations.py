@@ -17,6 +17,7 @@ from app.services.entry_confirmation_service import (
     StaleAfterExit,
     SupersededByNewerEntry,
     apply_confirmed_entry,
+    DecisionReceiptConflict,
     confirmation_transaction_guard,
 )
 from app.services.entry_state_lock import EntryStateLockUnavailable
@@ -126,6 +127,9 @@ def confirm_entry(
             detail="entry state is busy",
             headers={"Retry-After": "1"},
         ) from exc
+    except DecisionReceiptConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except InvalidEntryConfirmation as exc:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
