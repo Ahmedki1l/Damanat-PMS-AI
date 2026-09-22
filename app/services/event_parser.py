@@ -115,8 +115,9 @@ class ParsedCameraEvent:
     # picNum resets per vehicle; confidence is for audit / tie-break only.
     plate_confidence: Optional[int] = None  # <confidenceLevel> 0-100
     pic_num: Optional[int] = None           # <picNum> picture index within the burst
-    # V2 evidence is forwarded directly from request memory. It is deliberately
-    # not a filesystem path and is never written by the authoritative V2 flow.
+    # V2 evidence is forwarded directly from request memory, not a file path.
+    # The authoritative forwarder separately retains one entry-attempt image
+    # for the session; parsing does not perform that association.
     transient_images: tuple[TransientImage, ...] = ()
     vehicle_bbox: Optional[VehicleBoundingBox] = None
     vehicle_image_regions: tuple[VehicleImageRegion, ...] = ()
@@ -303,7 +304,7 @@ def crossing_matches_configured_entry_filter(event: ParsedCameraEvent) -> bool:
 
 
 def _is_authoritative_v2_evidence(event: ParsedCameraEvent) -> bool:
-    """Whether this event must remain memory-only in authoritative V2."""
+    """Whether V2 owns image handling instead of legacy snapshot persistence."""
     # An unresolved ANPR stays memory-only until the router applies trusted
     # alias/VMR camera identity. It is never assumed to be entry for upload.
     return settings.ENTRY_V2_MODE == "authoritative" and _is_v2_evidence(event)

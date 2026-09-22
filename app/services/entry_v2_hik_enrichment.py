@@ -42,8 +42,13 @@ from typing import Optional
 from uuid import uuid5
 
 import httpx
+from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
+from app.services.entry_attempt_snapshot_store import (
+    EntryAttemptSnapshotStorageError,
+    persist_entry_attempt_snapshot,
+)
 from app.utils.logger import get_logger
 from app.services import hikcentral
 from app.services.hikcentral import client as hik_client
@@ -228,6 +233,21 @@ async def _forward_candidate(
     }
     files = [("images", (f"hik_{guid or 'candidate'}.jpg", content, "image/jpeg"))]
     url = f"{settings.PMS_API_URL.rstrip('/')}/api/v2/entry-attempts"
+
+    if settings.ENTRY_V2_MODE == "authoritative":
+        try:
+            await run_in_threadpool(
+                persist_entry_attempt_snapshot,
+                attempt_id,
+                content,
+            )
+        except EntryAttemptSnapshotStorageError as exc:
+            logger.error(
+                "[EntryV2][Hik] Entry-image persistence failed guid=%s: %s",
+                guid,
+                exc,
+            )
+            return False
 
     try:
         response = await _post_entry_v2(

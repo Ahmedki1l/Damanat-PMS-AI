@@ -162,7 +162,18 @@ idempotent on normalized plate, entry camera, and captured time (with a narrow
 SQL Server timestamp tolerance); `entry_captured_at` must include a timezone
 offset and remain inside SQL Server's DATETIME range with room for that
 tolerance. Confirmed callbacks atomically create the entry log and open
-parking session without a snapshot. A confirmation arriving after a committed
+parking session with the saved image for the exact `attempt_id`, when available.
+In authoritative mode the first forwarded entry vehicle image is saved before
+the VA request under `detection_images/entry_attempt_<sha256(attempt_id)>.jpg`.
+The same persistence applies to PMS-forwarded HikCentral attempts. Writes are
+atomic and do not replace an existing attempt image; storage failure prevents
+forwarding and follows the existing retryable-delivery path. The existing
+snapshot directory must remain on persistent storage across service restarts.
+Callbacks without a retained attempt image leave the snapshot empty; they do
+not borrow another visit's image by plate number. Duplicate open-entry callbacks
+can fill missing image fields, and closing the stay preserves its entry image.
+This does not backfill historical images or implement durable VA decision state.
+A confirmation arriving after a committed
 exit receives a terminal `stale_after_exit` response and creates no rows.
 A strictly validated re-entry closes any older open session at the crossing
 time with `exit_camera_id=SYSTEM-REENTRY-RECONCILE`, then opens the new stay in

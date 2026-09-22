@@ -15,6 +15,7 @@ from app.services.entry_v2_forwarder import (
     resolve_entry_v2_camera_alias,
     start_entry_v2_http_client,
 )
+from app.services import entry_attempt_snapshot_store as attempt_snapshot_store
 import app.services.entry_v2_forwarder as forwarder
 from app.services.event_parser import ParsedCameraEvent, TransientImage
 
@@ -222,6 +223,74 @@ async def test_attempt_uses_frozen_multipart_contract_and_stable_id(monkeypatch)
     assert [item["role"] for item in descriptors] == ["vehicle", "vehicle"]
     assert [part[0] for part in request["files"]] == ["images", "images"]
     assert [part[1][1] for part in request["files"]] == [b"image-one", b"image-two"]
+
+
+@pytest.mark.asyncio
+async def test_authoritative_attempt_persists_first_forwarded_image_before_post(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "authoritative")
+    monkeypatch.setattr(settings, "PMS_API_URL", "http://va:8000")
+    monkeypatch.setattr(settings, "ENTRY_V2_SERVICE_KEY", "secret")
+    monkeypatch.setattr(
+        "app.services.snapshot_service.SNAPSHOT_DIR",
+        str(tmp_path),
+    )
+
+    def acknowledge(_url, request):
+        attempt_id = request["data"]["attempt_id"]
+        stored_path = attempt_snapshot_store.resolve_entry_attempt_snapshot(attempt_id)
+        assert stored_path is not None
+        assert (tmp_path / stored_path.rsplit("/", 1)[-1]).read_bytes() == b"image-one"
+        return _semantic_ack()("", request)
+
+    _install_client(monkeypatch, acknowledge)
+    result = await forward_entry_v2_event(_event())
+
+    assert result.outcome is ForwardOutcome.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_authoritative_storage_failure_retries_without_post(monkeypatch):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "authoritative")
+    monkeypatch.setattr(settings, "PMS_API_URL", "http://va:8000")
+    monkeypatch.setattr(settings, "ENTRY_V2_SERVICE_KEY", "secret")
+    calls = _install_client(monkeypatch, _semantic_ack())
+
+    def storage_failure(*_args):
+        raise attempt_snapshot_store.EntryAttemptSnapshotStorageError(
+            "disk unavailable"
+        )
+
+    monkeypatch.setattr(
+        forwarder,
+        "persist_entry_attempt_snapshot",
+        storage_failure,
+    )
+
+    result = await forward_entry_v2_event(_event())
+
+    assert result.outcome is ForwardOutcome.UNAVAILABLE
+    assert result.retryable is True
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_shadow_attempt_does_not_create_entry_snapshot(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "shadow")
+    monkeypatch.setattr(settings, "PMS_API_URL", "http://va:8000")
+    monkeypatch.setattr(settings, "ENTRY_V2_SERVICE_KEY", "secret")
+    monkeypatch.setattr(
+        "app.services.snapshot_service.SNAPSHOT_DIR",
+        str(tmp_path),
+    )
+    _install_client(monkeypatch, _semantic_ack(mode="shadow"))
+
+    result = await forward_entry_v2_event(_event())
+
+    assert result.outcome is ForwardOutcome.ACCEPTED
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_request_metadata_hashes_each_evidence_buffer_once(monkeypatch):

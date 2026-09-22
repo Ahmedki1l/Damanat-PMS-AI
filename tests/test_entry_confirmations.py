@@ -20,6 +20,7 @@ from app.routers.entry_confirmations import (
 )
 from app.schemas.entry_confirmation import EntryConfirmationRequest
 from app.services import parking_session_service
+from app.services import entry_attempt_snapshot_store as attempt_snapshot_store
 from app.services.parking_session_service import REENTRY_RECONCILIATION_CAMERA_ID
 from app.services.entry_confirmation_service import (
     _acquire_mssql_application_lock,
@@ -112,6 +113,17 @@ def test_confirmation_creates_one_log_and_session_without_snapshots(db, monkeypa
     assert session.status == "open"
 
 
+def test_crossing_only_confirmation_keeps_image_fields_empty(db, monkeypatch):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "authoritative")
+
+    response = confirm_entry(_body(attempt_id=None), None, db)
+
+    log_entry = db.get(EntryExitLog, response.entry_log_id)
+    session = db.get(ParkingSession, response.session_id)
+    assert log_entry.snapshot_path is None
+    assert session.entry_snapshot_path is None
+
+
 def test_confirmation_replay_reuses_same_rows(db, monkeypatch):
     monkeypatch.setattr(settings, "ENTRY_V2_MODE", "authoritative")
     first = confirm_entry(_body(), None, db)
@@ -123,6 +135,149 @@ def test_confirmation_replay_reuses_same_rows(db, monkeypatch):
     assert replay.entry_log_id == first.entry_log_id
     assert replay.session_id == first.session_id
     assert db.query(EntryExitLog).count() == 1
+
+
+def test_confirmation_persists_exact_attempt_image_after_restart(
+    db,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "authoritative")
+    monkeypatch.setattr(
+        "app.services.snapshot_service.SNAPSHOT_DIR",
+        str(tmp_path),
+    )
+    body = _body(canonical_plate="CORRECT-42", reported_plate="WRONG-42")
+    expected_path = attempt_snapshot_store.persist_entry_attempt_snapshot(
+        body.attempt_id,
+        b"exact-entry-image",
+    )
+
+    response = confirm_entry(body, None, db)
+
+    log_entry = db.get(EntryExitLog, response.entry_log_id)
+    session = db.get(ParkingSession, response.session_id)
+    assert log_entry.snapshot_path == expected_path
+    assert session.entry_snapshot_path == expected_path
+    assert attempt_snapshot_store.resolve_entry_attempt_snapshot(body.attempt_id) == (
+        expected_path
+    )
+    assert (
+        tmp_path / expected_path.rsplit("/", 1)[-1]
+    ).read_bytes() == b"exact-entry-image"
+
+
+def test_duplicate_confirmation_fills_missing_image_without_replacing_entry(
+    db,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "authoritative")
+    monkeypatch.setattr(
+        "app.services.snapshot_service.SNAPSHOT_DIR",
+        str(tmp_path),
+    )
+    body = _body()
+    attempt_snapshot_store.persist_entry_attempt_snapshot(
+        body.attempt_id,
+        b"exact-entry-image",
+    )
+    first = confirm_entry(body, None, db)
+    log_entry = db.get(EntryExitLog, first.entry_log_id)
+    session = db.get(ParkingSession, first.session_id)
+    log_entry.snapshot_path = "https://images.example/correct-original.jpg"
+    session.entry_snapshot_path = None
+    db.flush()
+
+    replay = confirm_entry(body, None, db)
+
+    assert replay.result == "duplicate"
+    assert log_entry.snapshot_path == "https://images.example/correct-original.jpg"
+    assert session.entry_snapshot_path == "https://images.example/correct-original.jpg"
+
+
+def test_duplicate_rebuilds_missing_session_from_existing_entry_image(
+    db,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "authoritative")
+    monkeypatch.setattr(
+        "app.services.snapshot_service.SNAPSHOT_DIR",
+        str(tmp_path),
+    )
+    body = _body()
+    first = confirm_entry(body, None, db)
+    log_entry = db.get(EntryExitLog, first.entry_log_id)
+    log_entry.snapshot_path = "https://images.example/historical-entry.jpg"
+    db.delete(db.get(ParkingSession, first.session_id))
+    db.flush()
+
+    replay = confirm_entry(body, None, db)
+
+    rebuilt = db.get(ParkingSession, replay.session_id)
+    assert replay.result == "duplicate"
+    assert rebuilt.entry_snapshot_path == "https://images.example/historical-entry.jpg"
+
+
+def test_same_plate_visits_keep_distinct_exact_attempt_images(
+    db,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "authoritative")
+    monkeypatch.setattr(
+        "app.services.snapshot_service.SNAPSHOT_DIR",
+        str(tmp_path),
+    )
+    first_body = _body()
+    second_body = _body(
+        decision_id="decision-2",
+        attempt_id="attempt-2",
+        crossing_id="crossing-2",
+        entry_captured_at=_captured_at(2026, 7, 20, 12, 5),
+    )
+    first_path = attempt_snapshot_store.persist_entry_attempt_snapshot(
+        first_body.attempt_id,
+        b"first-visit",
+    )
+    second_path = attempt_snapshot_store.persist_entry_attempt_snapshot(
+        second_body.attempt_id,
+        b"second-visit",
+    )
+
+    first = confirm_entry(first_body, None, db)
+    second = confirm_entry(second_body, None, db)
+
+    assert first_path != second_path
+    assert db.get(ParkingSession, first.session_id).entry_snapshot_path == first_path
+    assert db.get(ParkingSession, second.session_id).entry_snapshot_path == second_path
+
+
+def test_exit_image_does_not_replace_confirmed_entry_image(db, monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "ENTRY_V2_MODE", "authoritative")
+    monkeypatch.setattr(
+        "app.services.snapshot_service.SNAPSHOT_DIR",
+        str(tmp_path),
+    )
+    body = _body()
+    entry_path = attempt_snapshot_store.persist_entry_attempt_snapshot(
+        body.attempt_id,
+        b"entry-image",
+    )
+    created = confirm_entry(body, None, db)
+
+    parking_session_service.close_session(
+        db,
+        plate_number=body.canonical_plate,
+        event_time=_captured_at(2026, 7, 20, 12, 5),
+        camera_id="CAM-EXIT",
+        snapshot_path="/pms-ai/snapshots/exit.jpg",
+    )
+
+    session = db.get(ParkingSession, created.session_id)
+    assert session.entry_snapshot_path == entry_path
+    assert session.exit_snapshot_path == "/pms-ai/snapshots/exit.jpg"
     assert db.query(ParkingSession).count() == 1
 
 

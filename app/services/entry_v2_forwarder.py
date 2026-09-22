@@ -1,8 +1,10 @@
 """Transient Entry V2 evidence forwarding from PMS-AI to Video Analytics.
 
 The camera still talks only to PMS-AI. This module forwards derived in-memory
-vehicle crops without base64 encoding, filesystem persistence, or an internal
-retry queue. Shadow delivery uses one bounded, best-effort FIFO worker so VA
+vehicle crops without base64 encoding or an internal retry queue. Authoritative
+entry attempts persist their first forwarded vehicle image by exact attempt ID
+before delivery so confirmation can attach it to the session. Shadow delivery
+uses one bounded, best-effort FIFO worker so VA
 latency cannot delay the legacy camera response. In authoritative mode a
 retryable VA result is surfaced to the camera as HTTP 503 so the source request
 remains the retry boundary.
@@ -22,6 +24,10 @@ import httpx
 from starlette.concurrency import run_in_threadpool
 
 from app.config import facility_tz, settings
+from app.services.entry_attempt_snapshot_store import (
+    EntryAttemptSnapshotStorageError,
+    persist_entry_attempt_snapshot,
+)
 from app.services.event_parser import (
     ParsedCameraEvent,
     TransientImage,
@@ -723,6 +729,25 @@ async def forward_entry_v2_event(
             evidence_id=evidence_id,
             detail=detail,
         )
+
+    if is_authoritative() and is_entry_attempt(event):
+        try:
+            await run_in_threadpool(
+                persist_entry_attempt_snapshot,
+                evidence_id,
+                files[0][1][1],
+            )
+        except EntryAttemptSnapshotStorageError as exc:
+            logger.error(
+                "[EntryV2] Entry-image persistence failed evidence=%s: %s",
+                evidence_id,
+                exc,
+            )
+            return ForwardResult(
+                ForwardOutcome.UNAVAILABLE,
+                evidence_id=evidence_id,
+                detail="entry image persistence failed",
+            )
 
     try:
         response = await _post_entry_v2(
