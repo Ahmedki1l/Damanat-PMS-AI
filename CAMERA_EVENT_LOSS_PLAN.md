@@ -277,13 +277,17 @@ The free-space guard ran *before* the spool directory was created, and `shutil.d
 
 ### How to roll it out
 
-1. Set `CAMERA_INGEST_SPOOL_DIR=/app/detection_images/camera_ingest_spool` (inside the one PV — see P1).
-2. Deploy with `CAMERA_INGEST_SPOOL_ENABLED=false`. Harmless; it only starts the durability check on the next step.
-3. Set `CAMERA_INGEST_SPOOL_ENABLED=true` and restart. Read the boot line:
-   - `[IngestSpool] storage is DURABLE — marker from previous boot ... survived a restart` → done.
-   - `no marker from a previous boot` → **restart once more.** A first-ever boot and ephemeral storage look identical until the second boot. If it still says this after a restart, the path is not on the PV.
-4. Watch `/api/v1/health` → `camera_ingest_spool.depth`. It should sit at 0 and spike only during downstream trouble.
-5. Success condition: retryable `camera-facing 503` lines stop appearing, and `OPENED missed entry` falls from its current 6-14/day.
+1. Set both deployment environment values; the source default remains `false` until the first value is supplied:
+   ```
+   CAMERA_INGEST_SPOOL_ENABLED=true
+   CAMERA_INGEST_SPOOL_DIR=/app/detection_images/camera_ingest_spool
+   ```
+   The directory must be inside the `detection_images` PersistentVolume (see P1).
+2. After an authorized restart, inspect the boot line and `/api/v1/health` → `camera_ingest_spool.durability`:
+   - A marker from a previous boot is evidence that the configured directory survived that restart.
+   - No previous marker leaves persistence unverified; a first use and ephemeral storage look the same.
+3. Watch `/api/v1/health` → `camera_ingest_spool.depth`. It should sit at 0 and spike only during downstream trouble.
+4. Acceptance: during a controlled VA timeout/disconnect, the camera receives the queued acknowledgment; when VA recovers, the same evidence ID is accepted once, produces one correct session, and the spool has no unresolved backlog.
 
 ### Original analysis
 

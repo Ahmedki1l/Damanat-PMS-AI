@@ -9,10 +9,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import httpx
 from PIL import Image
 
 from app.config import settings
-from app.routers.events import receive_camera_event
+from app.routers.events import process_camera_event, receive_camera_event
+from app.services import camera_ingest_spool as ingest_spool
 import app.services.event_dispatcher as dispatcher
 from app.services.event_dispatcher import dispatch_event
 from app.services.entry_v2_forwarder import (
@@ -177,6 +179,96 @@ def _configure_authoritative_entry_parser(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(settings, "CAMERA_SERIAL_MAP", {})
     monkeypatch.setattr(settings, "CAMERAS", {"CAM-ENTRY": {"gate": "entry"}})
     monkeypatch.setattr("app.services.event_parser.SNAPSHOT_DIR", str(tmp_path))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ReadTimeout(""), httpx.ReadError("peer disconnected")],
+    ids=("timeout", "disconnect"),
+)
+async def test_retryable_transport_failure_replays_the_same_directly_identified_entry(
+    monkeypatch, tmp_path, failure
+):
+    """The spool re-enters the real parser after receipt time and VMR state move on."""
+    _configure_authoritative_entry_parser(monkeypatch, tmp_path)
+    monkeypatch.setattr(settings, "CAMERA_EVENT_ALLOWED_SOURCE_CIDRS", "10.0.0.0/24")
+    monkeypatch.setattr(settings, "PMS_API_URL", "http://va:8000")
+    monkeypatch.setattr(settings, "ENTRY_V2_SERVICE_KEY", "test-key")
+    monkeypatch.setattr(settings, "CAMERA_INGEST_SPOOL_ENABLED", True)
+    monkeypatch.setattr(
+        settings, "CAMERA_INGEST_SPOOL_DIR", str(tmp_path / "camera_ingest_spool")
+    )
+    body = _anpr_multipart(
+        _jpeg(100, 80), timestamp_xml=b"<dateTime>2026-09-22T08:57:14+03:00</dateTime>"
+    )
+    content_type = "multipart/form-data; boundary=entry-test"
+
+    async def retryable_failure_post(*_args, **_kwargs):
+        raise failure
+
+    initial_db = MagicMock()
+    with (
+        patch(
+            "app.services.entry_v2_forwarder._post_entry_v2",
+            retryable_failure_post,
+        ),
+        patch(
+            "app.routers.events.dispatch_event",
+            new_callable=AsyncMock,
+            return_value={},
+        ),
+    ):
+        response = await receive_camera_event(
+            _Request(body=body, content_type=content_type, client_host="10.0.0.10"),
+            initial_db,
+        )
+
+    assert response == {"status": "accepted", "detail": "queued for processing"}
+    initial_db.commit.assert_not_called()
+    path = next(iter(ingest_spool.iter_spooled_records()))
+    header, replay_body = ingest_spool.read_record(path)
+    assert replay_body == body
+
+    # The drainer has no request-scoped state. It runs after the original receipt
+    # time, and transient VMR identity hints may already have expired, so this
+    # verifies that replay depends only on the persisted body and direct identity.
+    dispatcher._VMR_GATE_HINTS.clear()
+    dispatcher._VMR_RECENT.clear()
+    delivered_ids = []
+
+    async def accept_post(_url, **kwargs):
+        evidence_id = kwargs["data"]["attempt_id"]
+        delivered_ids.append(evidence_id)
+        return httpx.Response(
+            201,
+            json={
+                "status": "accepted",
+                "id": evidence_id,
+                "duplicate": False,
+                "mode": "authoritative",
+            },
+        )
+
+    replay_db = MagicMock()
+    with (
+        patch("app.services.entry_v2_forwarder._post_entry_v2", accept_post),
+        patch(
+            "app.routers.events.dispatch_event",
+            new_callable=AsyncMock,
+            return_value={},
+        ),
+    ):
+        outcome = await process_camera_event(
+            replay_body,
+            header["camera_ip"],
+            header["content_type"],
+            replay_db,
+        )
+
+    assert outcome.status == "ok"
+    assert delivered_ids == [header["evidence_id"]]
+    replay_db.commit.assert_called_once()
 
 
 @pytest.mark.asyncio

@@ -451,10 +451,19 @@ def _log_retryable_delivery_warning(message: str, *args) -> None:
     if settings.ENTRY_V2_MODE != "shadow":
         logger.warning(message, *args)
         return
+
     now = monotonic()
     if now - _shadow_last_failure_log_at >= 10.0:
         _shadow_last_failure_log_at = now
         logger.warning(message, *args)
+
+
+def _delivery_exception_log_detail(exc: httpx.HTTPError) -> str:
+    """Return a bounded log-only detail when HTTPX omits its message."""
+    message = str(exc).strip()
+    if not message:
+        return type(exc).__name__
+    return f"{type(exc).__name__}: {message[:200]}"
 
 
 async def _entry_v2_shadow_worker() -> None:
@@ -760,26 +769,28 @@ async def forward_entry_v2_event(
             },
         )
     except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        failure_type = type(exc).__name__
         _log_retryable_delivery_warning(
             "[EntryV2] VA unavailable for evidence=%s: %s",
             evidence_id,
-            exc,
+            _delivery_exception_log_detail(exc),
         )
         return ForwardResult(
             ForwardOutcome.UNAVAILABLE,
             evidence_id=evidence_id,
-            detail=type(exc).__name__,
+            detail=failure_type,
         )
     except httpx.HTTPError as exc:
+        failure_type = type(exc).__name__
         _log_retryable_delivery_warning(
             "[EntryV2] HTTP failure for evidence=%s: %s",
             evidence_id,
-            exc,
+            _delivery_exception_log_detail(exc),
         )
         return ForwardResult(
             ForwardOutcome.UNAVAILABLE,
             evidence_id=evidence_id,
-            detail=type(exc).__name__,
+            detail=failure_type,
         )
 
     detail = response.text[:300]

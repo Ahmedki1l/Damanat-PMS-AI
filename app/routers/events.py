@@ -275,8 +275,9 @@ async def process_camera_event(
 
             if v2_result is not None and v2_result.retryable:
                 logger.warning(
-                    "[EntryV2] Returning camera-facing 503 for evidence=%s",
+                    "[EntryV2] VA delivery deferred evidence=%s reason=%s",
                     v2_result.evidence_id,
+                    v2_result.detail,
                 )
                 return CameraEventOutcome(
                     status="retry",

@@ -77,11 +77,13 @@ def _warn_once(key: str, message: str, *args) -> None:
     logger.error(message, *args)
 
 
-def _fsync_directory(directory: str) -> None:
+def _fsync_directory(directory: str, *, required: bool = False) -> None:
     """Persist a rename on platforms that expose directory file descriptors.
 
     Windows has no directory fd, so the rename's durability is left to the
-    filesystem there. Mirrors the behaviour of the PMS forward spool.
+    filesystem there. Callers that acknowledge a newly-created record set
+    ``required`` so a POSIX directory-sync failure cannot be reported as a
+    durable write. Cleanup paths deliberately keep their best-effort behaviour.
     """
     if os.name == "nt":
         return
@@ -90,7 +92,8 @@ def _fsync_directory(directory: str) -> None:
         fd = os.open(directory, os.O_RDONLY)
         os.fsync(fd)
     except OSError:
-        pass
+        if required:
+            raise
     finally:
         if fd is not None:
             try:
@@ -220,7 +223,10 @@ def spool_camera_event(
             os.fsync(handle.fileno())
         os.replace(temp_path, os.path.join(directory, name))
         temp_path = None
-        _fsync_directory(directory)
+        # A file fsync alone does not make the rename durable. Do not tell the
+        # camera the event is safely queued when the directory entry could not
+        # be synced; the existing record is left in place for later recovery.
+        _fsync_directory(directory, required=True)
         logger.info(
             "[IngestSpool] spooled camera event from %s (%s) — reason=%s",
             camera_ip,
