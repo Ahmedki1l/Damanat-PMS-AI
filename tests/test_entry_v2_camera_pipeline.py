@@ -2715,3 +2715,46 @@ def test_anpr_full_frame_can_be_disabled_without_a_redeploy(monkeypatch):
     assert len(prepared) == 1
     with Image.open(BytesIO(prepared[0].data)) as out:
         assert out.size == (687, 867)   # the old overlay-rect crop
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('limit', [1, 5, 7])
+@pytest.mark.parametrize('unknown_camera', [True, False])
+async def test_retry_limit_drops_failed_head_and_processes_next(monkeypatch, tmp_path, limit, unknown_camera):
+    monkeypatch.setattr(settings, 'CAMERA_INGEST_SPOOL_DIR', str(tmp_path / 'spool'))
+    monkeypatch.setattr(settings, 'CAMERA_INGEST_MAX_ATTEMPTS', limit)
+    for body in [b'blocked', b'valid']:
+        assert ingest_spool.spool_camera_event(body, '10.0.0.10', 'application/xml', 'durable_intake')
+
+    async def configured(body, *_):
+        return not (unknown_camera and body == b'blocked')
+
+    async def process(body, *_):
+        return CameraEventOutcome(status='retry' if body == b'blocked' else 'ok', detail='unavailable')
+
+    with patch('app.services.camera_ingest_worker._camera_configuration_available', side_effect=configured), \
+         patch('app.services.camera_ingest_worker.SessionLocal', return_value=MagicMock()), \
+         patch('app.services.camera_ingest_worker.process_camera_event', side_effect=process) as processor:
+        for attempt in range(1, limit):
+            assert await drain_camera_ingest_records_once() is True
+            records = list(ingest_spool.iter_spooled_records())
+            assert len(records) == 2
+            assert ingest_spool.read_record(records[0])[0]['attempts'] == attempt
+        assert await drain_camera_ingest_records_once() is False
+        assert list(ingest_spool.iter_spooled_records()) == []
+        assert processor.call_args.args[0] == b'valid'
+
+
+@pytest.mark.asyncio
+async def test_existing_exhausted_record_is_not_retried(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, 'CAMERA_INGEST_SPOOL_DIR', str(tmp_path / 'spool'))
+    monkeypatch.setattr(settings, 'CAMERA_INGEST_MAX_ATTEMPTS', 5)
+    assert ingest_spool.spool_camera_event(b'old', '10.0.0.10', 'application/xml', 'durable_intake')
+    path = next(iter(ingest_spool.iter_spooled_records()))
+    header, _ = ingest_spool.read_record(path)
+    header['attempts'] = 20865
+    ingest_spool.record_attempt(path, header)
+    with patch('app.services.camera_ingest_worker._camera_configuration_available', new_callable=AsyncMock) as resolve:
+        assert await drain_camera_ingest_records_once() is False
+        resolve.assert_not_awaited()
+    assert list(ingest_spool.iter_spooled_records()) == []

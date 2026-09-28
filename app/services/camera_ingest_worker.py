@@ -89,6 +89,14 @@ async def _drain_owned_camera_ingest_records_once() -> bool:
         except OSError:
             return False
 
+        if int(header.get("attempts") or 0) >= settings.CAMERA_INGEST_MAX_ATTEMPTS:
+            logger.warning(
+                "[IngestSpool] dropping %s: persisted attempts=%s reached limit=%s",
+                os.path.basename(path), header.get("attempts"), settings.CAMERA_INGEST_MAX_ATTEMPTS,
+            )
+            spool.remove_record(path)
+            continue
+
         camera_ip = str(header.get("camera_ip") or "")
         content_type = str(header.get("content_type") or "")
         if not await _camera_configuration_available(raw_body, camera_ip, content_type):
@@ -104,6 +112,14 @@ async def _drain_owned_camera_ingest_records_once() -> bool:
 
         if outcome.retryable:
             attempts = spool.record_attempt(path, header)
+            if attempts >= settings.CAMERA_INGEST_MAX_ATTEMPTS:
+                logger.warning(
+                    "[IngestSpool] dropping %s after %s failed attempts (limit=%s): %s",
+                    os.path.basename(path), attempts, settings.CAMERA_INGEST_MAX_ATTEMPTS,
+                    outcome.detail,
+                )
+                spool.remove_record(path)
+                continue
             age = spool.record_age_seconds(header)
             if age is not None and age >= settings.CAMERA_INGEST_SPOOL_MAX_AGE_SECONDS:
                 spool.quarantine_record(
