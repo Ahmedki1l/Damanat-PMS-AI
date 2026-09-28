@@ -828,6 +828,7 @@ class Settings(BaseSettings):
     # discard the oldest event purely for being first whenever a downstream
     # outage outlasts cap x interval. 7 days comfortably outlives the 26-hour
     # database outage this spool was written for.
+    CAMERA_INGEST_MAX_ATTEMPTS: int = Field(default=5, ge=1)
     CAMERA_INGEST_SPOOL_MAX_AGE_SECONDS: float = Field(default=7 * 24 * 3600, gt=0)
     # Retry backoff for a blocked head. New durable receipts wake the worker
     # immediately; this value is not normal camera processing latency.
