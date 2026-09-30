@@ -105,7 +105,8 @@ docker-compose logs -f backend
 | 2 | `GET/POST/DELETE` | `/api/v1/vehicles` | Vehicle CRUD (UC4) |
 | 2 | `GET` | `/api/v1/vehicles/lookup/{plate}` | Plate lookup (UC4) |
 | 2 | `POST` | `/api/v1/internal/entry-confirmations` | Authenticated VA Entry V2 decision callback |
-| Both | `GET` | `/api/v1/health` | System health check |
+| Both | `GET` | `/api/v1/health` | Process liveness; database and spool are `not_checked` |
+| Both | `GET` | `/api/v1/health/diagnostics` | Database and camera-ingest spool diagnostics; API key required when configured |
 
 ## Entry validation V2 rollout
 

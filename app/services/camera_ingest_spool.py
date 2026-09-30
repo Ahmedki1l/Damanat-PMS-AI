@@ -51,7 +51,7 @@ TEMP_SUFFIX = ".tmp"
 QUARANTINE_DIRNAME = "quarantine"
 BOOT_MARKER_NAME = "_boot_marker.json"
 
-# Set once at startup by check_spool_durability(); surfaced on /api/health so the
+# Set once at startup by check_spool_durability(); surfaced on /api/v1/health/diagnostics so the
 # answer does not depend on catching one line in the boot logs.
 _durability: dict = {"checked": False, "durable": None, "detail": "not checked"}
 
@@ -597,7 +597,7 @@ def check_spool_durability() -> dict:
 
 
 def spool_stats() -> dict:
-    """Snapshot for /api/health. Cheap enough to call on every scrape."""
+    """Snapshot for /api/v1/health/diagnostics."""
     if not settings.CAMERA_INGEST_SPOOL_ENABLED:
         return {"enabled": False, "path": spool_dir(), "depth": 0, "bytes": 0,
                 "oldest_age_seconds": None, "durability": _durability}
