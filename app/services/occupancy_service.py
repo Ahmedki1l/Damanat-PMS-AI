@@ -1,7 +1,6 @@
 # app/services/occupancy_service.py
-from datetime import datetime, UTC
 from typing import Optional
-from sqlalchemy import update, func, case, text
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 from app.models.zone_occupancy import ZoneOccupancy
 from app.models.parking_session import ParkingSession
@@ -25,6 +24,18 @@ CACHE_TTL_SECONDS = settings.EVENT_STREAM_SUPPRESS_SECONDS
 # repeatedly while a zone stays full. Key: zone_id, Value: last alert timestamp.
 _capacity_alert_cache: dict[str, float] = {}
 CAPACITY_ALERT_COOLDOWN = settings.CAPACITY_ALERT_COOLDOWN_SECONDS
+
+
+def _dedup_window_for(camera_id: str) -> float:
+    """Seconds to suppress a repeat of the same (camera, event, line).
+
+    Short for the B2 delta cameras, where a dropped event is a lost car; the
+    default 30s elsewhere, where a dropped event only skips a redundant
+    recount. See the call site in handle_occupancy_event.
+    """
+    if camera_id in settings.b2_crossing_cameras():
+        return float(settings.OCCUPANCY_CROSSING_DEDUP_SECONDS)
+    return float(CACHE_TTL_SECONDS)
 
 
 async def _real_capacity_state(db: Session, zone_id: str, floor: Optional[str]) -> tuple[int, int]:
@@ -71,32 +82,7 @@ async def _real_capacity_state(db: Session, zone_id: str, floor: Optional[str]) 
     return int(real_max), int(real_occupancy)
 
 
-async def push_db_update(db: Session, zone_id: str, delta: int):
-    """
-    Atomic 'Push' function to update the database directly.
-    FIX #3 (clamp-to-zero race): uses func.max(..., 0) so the count can never
-    go negative in a single atomic SQL statement. This eliminates the race window
-    where a concurrent +1 between a non-atomic refresh and ORM clamp would be lost.
-    """
-    stmt = (
-        update(ZoneOccupancy)
-        .where(ZoneOccupancy.zone_id == zone_id)
-        .values(
-            current_count=case(
-                (ZoneOccupancy.current_count + delta > 0, ZoneOccupancy.current_count + delta),
-                else_=0
-            )
-        )
-    )
-    db.execute(stmt)
-    db.flush()
-
-
-async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Session, snapshot_path: str = None):
-    """
-    Update a zone's occupancy count using the atomic push function.
-    """
-    # ── Primary source of truth: local zone_occupancy table ───────────────
+def _ensure_zone(db: Session, zone_id: str, camera_id: str) -> ZoneOccupancy:
     zone = db.query(ZoneOccupancy).filter(ZoneOccupancy.zone_id == zone_id).first()
     zone_meta = settings.get_zone_metadata(zone_id)
     if not zone:
@@ -121,27 +107,146 @@ async def _update_zone_count(zone_id: str, camera_id: str, delta: int, db: Sessi
             zone.max_capacity is None or zone.max_capacity == settings.DEFAULT_ZONE_CAPACITY
         ):
             zone.max_capacity = zone_meta["max_capacity"]
+    return zone
 
-    # 1. Atomic update: count = max(count + delta, 0) — never goes negative
-    await push_db_update(db, zone_id, delta)
 
-    # 2. Refresh to get the final count for logging/alerts
-    db.refresh(zone)
+def _clamp_b2(zone: ZoneOccupancy, value: int) -> int:
+    """B2 is the one delta-counted aggregate, so it is the one that can drift.
 
-    # FIX #3: removed non-atomic ORM clamp (if zone.current_count < 0: zone.current_count = 0)
-    # The atomic func.max() in push_db_update now handles this.
+    Clamp it to a physically possible range instead of letting a missed or
+    spurious crossing park the number below zero (or above the floor's size)
+    forever. A negative count is the tell-tale of a missed entrance crossing;
+    clamping at least keeps the dashboard sane until the next correction.
+    """
+    ceiling = zone.max_capacity if zone.max_capacity and zone.max_capacity > 0 else None
+    value = max(0, value)
+    return min(value, ceiling) if ceiling is not None else value
 
+
+def apply_b2_crossing(db: Session, camera_id: str, multiplier: int) -> int:
+    """Move B2 by one car and return the new count.
+
+    B2 cannot be derived from open sessions the way GARAGE-TOTAL can: a session
+    only learns its floor when VA binds it to a slot (parking_session_service
+    .bind_slot), so between the gate and the bind a car has floor=NULL and is
+    invisible to any per-floor query. The ramp cameras see the car cross
+    immediately, which is the whole point of counting them.
+
+    Each configured camera covers its OWN passage — a car going down crosses
+    exactly one of them — so every crossing counts and there is no
+    cross-camera dedup here. See Settings.B2_CROSSING_CAMERAS.
+    """
+    zone = _ensure_zone(db, settings.B2_PARKING_ZONE, camera_id)
+    before = int(zone.current_count or 0)
+    after = _clamp_b2(zone, before + multiplier)
+    zone.current_count = after
     zone.last_updated = facility_now_naive()
-    line_pct = int((zone.current_count / zone.max_capacity) * 100) if zone.max_capacity > 0 else 0
-    logger.info(f"[UC3] {zone_id} Updated via Push: {zone.current_count}/{zone.max_capacity} ({line_pct}% line-crossing)")
+    if after == before and multiplier:
+        logger.warning(
+            "[UC3] B2 crossing from %s (mult=%+d) CLAMPED at %s — a crossing was "
+            "missed or duplicated somewhere upstream",
+            camera_id, multiplier, after,
+        )
+    else:
+        logger.info(
+            "[UC3] B2 %s%+d = %s (cam=%s)", before, multiplier, after, camera_id
+        )
+    db.flush()
+    return after
 
-    # Capacity-exceeded alert — sourced from the true state (parking_slots +
-    # open parking_sessions), not the line-crossing aggregate. The aggregate
-    # is just the wake-up tick.
-    #
-    # Trigger: strict exceed. At occupancy == capacity ("full") no alert
-    # fires. An alert means there are MORE cars than slots — surplus the
-    # garage can't actually hold.
+
+def reconcile_zone_counts_from_open_sessions(
+    db: Session,
+    *,
+    camera_id: str,
+) -> dict[str, int]:
+    """Recompute GARAGE-TOTAL from open sessions, then derive B1 from it.
+
+    Three aggregates, two sources:
+
+      GARAGE-TOTAL = COUNT(open parking_sessions)
+      B2           = running delta from the ramp cameras (NOT touched here)
+      B1           = GARAGE-TOTAL - B2
+
+    GARAGE-TOTAL stays session-derived because sessions are authoritative and
+    recomputing from scratch means duplicate or missed gate events cannot
+    accumulate drift.
+
+    B1 is DERIVED rather than counted, which reproduces the physical model
+    exactly without a second counter: a car entering the garage lands on B1
+    (total +1); driving down to B2 moves it off B1 (b2 +1); coming back up
+    moves it on again (b2 -1); leaving takes it off (total -1). Anything in
+    the garage that is not in B2 is on B1.
+
+    B1 was previously COUNT(open sessions WHERE floor='B1'), which read 0
+    whenever VA's slot binds were not landing — the floor column is only ever
+    written by bind_slot, so an unbound car counted toward the total and
+    toward no floor at all.
+
+    Called by entry and exit transactions before commit, and by the crossing
+    handler after it has applied the B2 delta.
+    """
+    total_zone = _ensure_zone(db, settings.GARAGE_TOTAL_ZONE, camera_id)
+    b1_zone = _ensure_zone(db, settings.B1_PARKING_ZONE, camera_id)
+    b2_zone = _ensure_zone(db, settings.B2_PARKING_ZONE, camera_id)
+
+    total = int(
+        db.query(func.count(ParkingSession.id))
+        .filter(ParkingSession.status == "open")
+        .scalar()
+        or 0
+    )
+    stored_b2 = int(b2_zone.current_count or 0)
+    b2 = _clamp_b2(b2_zone, stored_b2)
+
+    # SELF-HEAL. B2 is the only delta-counted aggregate, so it is the only one
+    # that can drift; open sessions are authoritative for how many cars are in
+    # the garage at all. B2 can therefore never exceed the total, and when the
+    # garage empties out B2 must go to zero with it. Without this a single
+    # missed exit crossing would sit in the count until someone reset the zone
+    # by hand — which is exactly the drift the session-derived design was
+    # protecting against. This bounds it instead of banning deltas outright.
+    if b2 > total:
+        logger.warning(
+            "[UC3] B2=%s exceeds %s open sessions — a ramp crossing was missed "
+            "or double-counted; healing B2 down to %s",
+            b2, total, total,
+        )
+        b2 = total
+
+    b1 = total - b2  # non-negative by construction: b2 <= total above
+
+    now = facility_now_naive()
+    total_zone.current_count = total
+    total_zone.last_updated = now
+    b1_zone.current_count = b1
+    b1_zone.last_updated = now
+    if b2 != stored_b2:
+        b2_zone.current_count = b2
+        b2_zone.last_updated = now
+
+    logger.info(
+        "[UC3] reconciled: %s=%s (open sessions) | %s=%s (derived) | %s=%s (crossings)",
+        settings.GARAGE_TOTAL_ZONE, total,
+        settings.B1_PARKING_ZONE, b1,
+        settings.B2_PARKING_ZONE, b2,
+    )
+    db.flush()
+    return {
+        settings.GARAGE_TOTAL_ZONE: total,
+        settings.B1_PARKING_ZONE: b1,
+        settings.B2_PARKING_ZONE: b2,
+    }
+
+
+async def _check_capacity_alert(
+    db: Session,
+    zone_id: str,
+    camera_id: str,
+    snapshot_path: str = None,
+) -> None:
+    zone = _ensure_zone(db, zone_id, camera_id)
+
     real_max, real_occupancy = await _real_capacity_state(db, zone_id, zone.floor)
     if real_max > 0 and real_occupancy > real_max:
         real_pct = int((real_occupancy / real_max) * 100)
@@ -210,14 +315,21 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
         logger.debug(f"[UC3] Ignoring {event.event_type} event from {event.camera_id}: type not in {allowed_types}")
         return None
 
-    # 3. Deduplication: Ignore identical events within CACHE_TTL_SECONDS
+    # 3. Deduplication: Ignore identical events within the camera's window.
     # FIX #5: uses EVENT_STREAM_SUPPRESS_SECONDS (30s) instead of hardcoded 1s
+    #
+    # The delta cameras get a much shorter window (_dedup_window_for). Dropping
+    # a duplicate RECOUNT is free — it produces the same answer — so 30s costs
+    # nothing there. Dropping a duplicate DELTA is not: two cars down the same
+    # ramp inside the window would count as one, undercounting B2 all day. The
+    # short window only has to absorb Hikvision firing one crossing twice.
     cache_key = (event.camera_id, event.event_type, event.region_id or event.crossing_direction)
     now = facility_now_naive().timestamp()
+    dedup_window = _dedup_window_for(event.camera_id)
     if cache_key in _processed_events_cache:
         last_time = _processed_events_cache[cache_key]
-        if now - last_time < CACHE_TTL_SECONDS:
-            logger.debug(f"[UC3] {event.camera_id}: DROPPED duplicate {event.event_type} event (within {CACHE_TTL_SECONDS}s window)")
+        if now - last_time < dedup_window:
+            logger.debug(f"[UC3] {event.camera_id}: DROPPED duplicate {event.event_type} event (within {dedup_window}s window)")
             return None
     # FIX #2: Do NOT write to cache here. The caller (router or test) must call
     # record_event_in_cache(cache_key) AFTER db.commit() succeeds.
@@ -258,33 +370,32 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
         return None
     # ──────────────────────────────────────────────────────────────────────
 
-    # ── MULTI-ZONE ROUTING LOGIC ──────────────────────────────────────
-    #
-    # multiplier  = +1 →  primary / forward direction for this camera
-    # multiplier  = -1 →  reverse  direction for this camera
-    #
-    # The delta signs below are set so that the "primary" direction
-    # (mult = +1) produces the expected occupancy change per camera:
-    #
-    #   CAM-03: primary = enter garage  →  TOTAL+1, B1+1
-    #             delta: (+1 * mult)
-    #   CAM-08: primary = exit  garage  →  TOTAL-1, B1-1
-    #             delta: (-1 * mult)  ← double-negation intentional
-    #   CAM-09: primary = B1→B2        →  B1-1, B2+1
-    #             delta: (-1 * mult), (+1 * mult)
-    #   CAM-10: primary = B2→B1        →  B2-1, B1+1
-    #             delta: (-1 * mult), (+1 * mult)
-    # ───────────────────────────────────────────────────────────────────
-
-    # FIX #1 (two-zone drift): all zone updates for a single event are wrapped
-    # in a savepoint. If any update fails, the savepoint rolls back ALL zone
-    # changes for this event — preventing one zone from drifting without the other.
+    # A crossing on a B2 ramp camera moves B2 by one car; every other camera's
+    # crossing is a wake-up signal only, triggering a recount that cannot drift.
+    # Both then reconcile, which recomputes GARAGE-TOTAL and re-derives B1 from
+    # the B2 just written. All rows update in one savepoint so readers cannot
+    # observe mixed floors.
     savepoint = db.begin_nested()
     try:
+        if cam_id in settings.b2_crossing_cameras():
+            apply_b2_crossing(db, cam_id, multiplier)
+        reconcile_zone_counts_from_open_sessions(db, camera_id=cam_id)
+        for zone_id in (
+            settings.GARAGE_TOTAL_ZONE,
+            settings.B1_PARKING_ZONE,
+            settings.B2_PARKING_ZONE,
+        ):
+            await _check_capacity_alert(
+                db,
+                zone_id,
+                cam_id,
+                event.snapshot_path,
+            )
         if cam_id == "CAM-03":
-            await _update_zone_count(settings.GARAGE_TOTAL_ZONE, cam_id,  1 * multiplier, db, event.snapshot_path)
-            await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id,  1 * multiplier, db, event.snapshot_path)
-            if multiplier == 1:  # entry direction only — confirm pending ANPR
+            if (
+                multiplier == 1
+                and settings.ENTRY_V2_MODE != "authoritative"
+            ):  # legacy entry direction only — confirm pending ANPR
                 from app.services.entry_exit_service import confirm_pending_entry
                 # Pass CAM-03's own snapshot so it can be forwarded to the PMS
                 # API (under the B-entry marker) once the plate is known.
@@ -292,16 +403,6 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
                     db,
                     cam03_snapshot=event.local_snapshot_path or event.snapshot_path,
                 )
-        elif cam_id == "CAM-08":
-            await _update_zone_count(settings.GARAGE_TOTAL_ZONE, cam_id, -1 * multiplier, db, event.snapshot_path)
-            await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id, -1 * multiplier, db, event.snapshot_path)
-        elif cam_id == "CAM-09":
-            await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id, -1 * multiplier, db, event.snapshot_path)
-            await _update_zone_count(settings.B2_PARKING_ZONE,   cam_id,  1 * multiplier, db, event.snapshot_path)
-        elif cam_id == "CAM-10":
-            await _update_zone_count(settings.B2_PARKING_ZONE,   cam_id, -1 * multiplier, db, event.snapshot_path)
-            await _update_zone_count(settings.B1_PARKING_ZONE,   cam_id,  1 * multiplier, db, event.snapshot_path)
-
         savepoint.commit()
     except Exception as e:
         savepoint.rollback()
@@ -331,4 +432,3 @@ async def handle_occupancy_event(event: ParsedCameraEvent, db: Session):
         logger.info(f"[UC3] OVERALL STATUS | {' | '.join(summary_parts)}")
 
     return cache_key
-

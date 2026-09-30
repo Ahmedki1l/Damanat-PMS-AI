@@ -2,8 +2,6 @@
 # Starts SQL Server + the FastAPI backend together.
 # Usage: docker-compose up -d
 
-version: "3.9"
-
 services:
 
   pms-mssql:
@@ -57,10 +55,13 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./.env:/app/.env
+      - pms_forward_spool:/app/pms_forward_spool
     environment:
       DATABASE_URL: mssql://damanat:damanat@pms-mssql:1433
       DB_NAME: damanat_pms
+      PMS_FORWARD_SPOOL_DIR: /app/pms_forward_spool
     command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 1
 
 volumes:
   sql_data:
+  pms_forward_spool:

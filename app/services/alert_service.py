@@ -78,6 +78,18 @@ async def broadcast_event(
         }
     }
 
+    # Notification suppression. The caller has already persisted and logged the
+    # alert by the time it reaches here, so dropping the publish silences the
+    # dashboard pop-up WITHOUT losing the record — the row is still returned by
+    # GET /alerts. Keyed on the resolved alert_type so a suppressed type stays
+    # suppressed no matter which service published it.
+    if payload["alert_type"] in settings.suppressed_alert_notification_types():
+        logger.debug(
+            f"[Broadcast] SUPPRESSED {payload['alert_type']} | {description} "
+            "(alert still recorded; see SUPPRESSED_ALERT_NOTIFICATION_TYPES)"
+        )
+        return
+
     event_bus.publish(json.dumps(payload))
     logger.debug(f"[Broadcast] {event_type} | {'ALERT' if is_alert else 'INFO'} | {description}")
 
@@ -140,6 +152,15 @@ async def create_alert(
     Uses a nested savepoint for the DB insert so that a constraint failure on the
     alert table does NOT roll back the parent transaction (entry_exit_log, parking_session).
     """
+    # Fully-disabled alert types are dropped before anything is written: no DB
+    # row, no log, no stream. Distinct from SUPPRESSED_ALERT_NOTIFICATION_TYPES,
+    # which silences only the live notification but still records the row.
+    if alert_type in settings.disabled_alert_types():
+        logger.debug(
+            "[ALERT] %s is disabled (DISABLED_ALERT_TYPES) — not recorded", alert_type
+        )
+        return None
+
     try:
         severity = _resolve_severity(alert_type)
         zone_meta = settings.get_zone_metadata(zone_id)

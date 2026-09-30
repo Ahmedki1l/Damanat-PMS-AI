@@ -13,7 +13,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
-from datetime import datetime, UTC, timedelta
+from datetime import datetime, UTC, timedelta, timezone
+from time import monotonic
 from app.models.vehicle import Vehicle
 from app.services.entry_exit_service import (
     handle_anpr_event,
@@ -24,7 +25,9 @@ from app.services.entry_exit_service import (
     _entry_bursts,
     _pending_crossings,
     _recent_entries,
+    _winning_read,
     CAM03_PMS_DIRECTION,
+    SourceTimestampUnavailable,
 )
 from app.services.event_parser import ParsedCameraEvent
 from app.config import facility_now_naive
@@ -51,6 +54,36 @@ def make_anpr_event(plate="ABC-1234", gate="entry", trigger_time=None,
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "should_reject"),
+    [("off", False), ("shadow", False), ("authoritative", True)],
+)
+async def test_exit_receive_time_fallback_is_mode_scoped(
+    monkeypatch,
+    mode,
+    should_reject,
+):
+    monkeypatch.setattr(
+        "app.services.entry_exit_service.settings.ENTRY_V2_MODE",
+        mode,
+    )
+    event = make_anpr_event(gate="exit")
+    event.trigger_time_source = "pms_receive_missing"
+    db = MagicMock()
+
+    if should_reject:
+        with pytest.raises(SourceTimestampUnavailable):
+            await handle_anpr_event(event, db)
+        db.add.assert_not_called()
+    else:
+        result = await handle_anpr_event(event, db)
+        assert result is not None
+
+    if should_reject:
+        db.add.assert_not_called()
+
+
 def make_vehicle(registered=False, plate="ABC-1234"):
     v = MagicMock(spec=Vehicle)
     v.id = 42
@@ -69,7 +102,8 @@ def make_db(first_side_effect=None):
     q.filter.return_value = q
     q.order_by.return_value = q
     if first_side_effect:
-        q.first.side_effect = first_side_effect
+        results = iter(first_side_effect)
+        q.first.side_effect = lambda: next(results, None)
     else:
         q.first.return_value = None
     return db
@@ -84,9 +118,15 @@ def configure_settings(mock_settings, *, two_phase: bool):
     }
     mock_settings.ENTRY_ANTIBOUNCE_SECONDS = 0  # disabled — keeps DB queries simple
     mock_settings.ANPR_BURST_WINDOW_SECONDS = 2.5
+    mock_settings.ANPR_BURST_SAME_CAR_SECONDS = 5.0
+    mock_settings.ENTRY_PENDING_CROSSING_SECONDS = 10.0
     mock_settings.ANPR_BURST_MAX_SECONDS = 8.0
     mock_settings.ENTRY_CONFIRM_DIRECTIONS = "CAM-23:ramp-entry,CAM-03:B-entry"
     mock_settings.ENTRY_CONFIRM_MATCH_SECONDS = 30.0
+    mock_settings.ENTRY_CAM03_CAN_RESCUE = True
+    # A refused burst whose tombstone lookup comes back empty is held for this
+    # long; without a real number the drop path arithmetic fails on the mock.
+    mock_settings.HIK_REFUSAL_HOLD_SECONDS = 900.0
 
 
 def _force_idle():
@@ -98,9 +138,8 @@ def _force_idle():
 
 def _age_pending_crossings():
     """Push every pending ramp crossing past its window so the flusher reaps it."""
-    old = facility_now_naive() - timedelta(seconds=999)
     for c in _pending_crossings:
-        c["ts"] = old
+        c["expires_at_monotonic"] = monotonic() - 1.0
 
 
 # ── Test class ────────────────────────────────────────────────────────────────
@@ -212,6 +251,129 @@ class TestEntryExitService:
 
         # Two distinct bursts now exist (A closed for flush, B open).
         assert len(_entry_bursts) == 2
+
+    # ── UC1: a REPEATED picNum on the same car must not split it ───────────
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.open_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_truncated_reread_keeps_the_full_plate(self, mock_vs, mock_open, mock_alert, mock_settings, mock_pms):
+        """2026-08-09 regression. The camera read KKR-6294, then re-read the same
+        car as the truncated KKR-4 under the SAME picNum. The repeat must not
+        open a second burst (the first one would be force-flushed out of reach of
+        the ramp crossing and dropped), and the fuller, more confident read must
+        label the entry."""
+        configure_settings(mock_settings, two_phase=True)
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle(plate="KKR-6294")
+        db = make_db()
+
+        # The real spacing from the incident: trigger times 3s apart, NOT the ~0s
+        # gap a default-timestamped event produces. The camera clock is what this
+        # window is measured against, and it ran ahead of arrival order (the two
+        # reads reached PMS 1s apart). Anchored to now so the burst is not stale.
+        now = facility_now_naive()
+        await handle_anpr_event(make_anpr_event(
+            plate="KKR-6294", pic_num=3, plate_confidence=96,
+            trigger_time=now - timedelta(seconds=3),
+        ), db)
+        await handle_anpr_event(make_anpr_event(
+            plate="KKR-4", pic_num=3, plate_confidence=89,
+            trigger_time=now,
+        ), db)
+
+        assert len(_entry_bursts) == 1          # one car, not two
+        await confirm_entry_crossing(db, snapshot="ramp.jpg", source_cam="CAM-23")
+        _force_idle()
+        await flush_due_entry_bursts(db)
+
+        db.add.assert_called_once()
+        log = db.add.call_args[0][0]
+        assert log.plate_number == "KKR-6294"
+        assert log.plate_confidence == 96
+        assert "KKR-4" not in [c.args[0] for c in mock_pms.await_args_list]
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.open_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_repeated_picnum_with_unrelated_plate_still_splits(self, mock_vs, mock_open, mock_alert, mock_settings, mock_pms):
+        """The same-car exception is plate-gated: a repeated picNum carrying an
+        unrelated plate is still the next car, exactly as before."""
+        configure_settings(mock_settings, two_phase=True)
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+        db = make_db()
+
+        await handle_anpr_event(make_anpr_event(plate="KKR-6294", pic_num=3), db)
+        await handle_anpr_event(make_anpr_event(plate="ZZT-1111", pic_num=3), db)
+
+        assert len(_entry_bursts) == 2
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.open_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_repeated_picnum_with_neighbouring_plate_still_splits(self, mock_vs, mock_open, mock_alert, mock_settings, mock_pms):
+        """Same letters and the same number of digits is a genuine disagreement —
+        KKR-6294 and KKR-6295 are two cars, not one truncated read."""
+        configure_settings(mock_settings, two_phase=True)
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+        db = make_db()
+
+        await handle_anpr_event(make_anpr_event(plate="KKR-6294", pic_num=3), db)
+        await handle_anpr_event(make_anpr_event(plate="KKR-6295", pic_num=3), db)
+
+        assert len(_entry_bursts) == 2
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.open_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_a_stale_trigger_time_still_splits(self, mock_vs, mock_open, mock_alert, mock_settings, mock_pms):
+        """The same-car exception is time-bounded as well as plate-gated: a
+        compatible plate whose trigger time is far away is not this car."""
+        configure_settings(mock_settings, two_phase=True)
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+        db = make_db()
+
+        now = facility_now_naive()
+        await handle_anpr_event(make_anpr_event(
+            plate="KKR-6294", pic_num=3, trigger_time=now - timedelta(seconds=12),
+        ), db)
+        await handle_anpr_event(make_anpr_event(
+            plate="KKR-4", pic_num=3, trigger_time=now,
+        ), db)
+
+        assert len(_entry_bursts) == 2
+
+    # ── UC1: winner selection ──────────────────────────────────────────────
+
+    def test_winning_read_breaks_picnum_ties_on_confidence(self):
+        """Tied picNum used to fall through to arrival order, which is what let
+        the later, worse read label the car."""
+        early = {"pic_num": 3, "confidence": 96, "event_time": datetime(2026, 8, 9, 9, 27, 16)}
+        late = {"pic_num": 3, "confidence": 89, "event_time": datetime(2026, 8, 9, 9, 27, 19)}
+        assert _winning_read([early, late]) is early
+
+    def test_winning_read_still_prefers_a_later_picnum(self):
+        """picNum stays primary: a later frame beats a confident early one."""
+        early = {"pic_num": 1, "confidence": 99, "event_time": datetime(2026, 8, 9, 9, 27, 16)}
+        late = {"pic_num": 3, "confidence": 70, "event_time": datetime(2026, 8, 9, 9, 27, 19)}
+        assert _winning_read([early, late]) is late
+
+    def test_winning_read_tolerates_missing_confidence(self):
+        """A read with no confidenceLevel must not outrank a scored one."""
+        scored = {"pic_num": 2, "confidence": 80, "event_time": datetime(2026, 8, 9, 9, 27, 16)}
+        unscored = {"pic_num": 2, "confidence": None, "event_time": datetime(2026, 8, 9, 9, 27, 19)}
+        assert _winning_read([scored, unscored]) is scored
 
     # ── UC1: two-phase disabled — idle window alone commits ────────────────
 
@@ -491,6 +653,117 @@ class TestEntryExitService:
     @pytest.mark.asyncio
     @patch("app.services.entry_exit_service.settings")
     @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_crossing_to_anpr_uses_dedicated_window(
+        self,
+        mock_vs,
+        mock_alert,
+        mock_settings,
+    ):
+        """A crossing remains correlatable after the 2.5s read-idle debounce."""
+        configure_settings(mock_settings, two_phase=True)
+        db = make_db()
+
+        await confirm_entry_crossing(
+            db,
+            snapshot="ramp.jpg",
+            source_cam="CAM-23",
+        )
+        # The old implementation incorrectly expired this from the wall-clock
+        # age using ANPR_BURST_WINDOW_SECONDS. The dedicated monotonic deadline
+        # remains valid independently of that debounce.
+        _pending_crossings[0]["ts"] = (
+            facility_now_naive() - timedelta(seconds=5)
+        )
+        _pending_crossings[0]["expires_at_monotonic"] = monotonic() + 5.0
+
+        await handle_anpr_event(make_anpr_event(pic_num=1), db)
+
+        assert len(_pending_crossings) == 0
+        assert len(_entry_bursts) == 1
+        burst = next(iter(_entry_bursts.values()))
+        assert burst["confirmed"] is True
+        assert burst["confirm_source"] == "CAM-23"
+        mock_alert.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.monotonic", side_effect=[100.0, 110.0])
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_pending_crossing_is_valid_at_exact_deadline(
+        self,
+        mock_vs,
+        mock_alert,
+        mock_settings,
+        mock_monotonic,
+    ):
+        configure_settings(mock_settings, two_phase=True)
+        mock_settings.ENTRY_PENDING_CROSSING_SECONDS = 10.0
+        db = make_db()
+
+        await confirm_entry_crossing(db, source_cam="CAM-23")
+        await handle_anpr_event(make_anpr_event(pic_num=1), db)
+
+        assert mock_monotonic.call_count == 2
+        assert not _pending_crossings
+        assert next(iter(_entry_bursts.values()))["confirmed"] is True
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_expired_crossing_does_not_confirm_late_anpr(
+        self,
+        mock_vs,
+        mock_alert,
+        mock_settings,
+    ):
+        configure_settings(mock_settings, two_phase=True)
+        db = make_db()
+
+        await confirm_entry_crossing(
+            db,
+            snapshot="expired.jpg",
+            source_cam="CAM-23",
+        )
+        _pending_crossings[0]["expires_at_monotonic"] = monotonic() - 1.0
+        await handle_anpr_event(make_anpr_event(pic_num=1), db)
+
+        assert next(iter(_entry_bursts.values()))["confirmed"] is False
+        # The expired physical crossing is retained until the flusher records
+        # its silent-entry alert; a late ANPR webhook cannot consume it.
+        assert len(_pending_crossings) == 1
+        await flush_due_entry_bursts(db)
+        assert not _pending_crossings
+        mock_alert.assert_awaited_once()
+        assert mock_alert.call_args.kwargs["alert_type"] == "silent_entry"
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_pending_crossing_can_confirm_only_one_burst(
+        self,
+        mock_vs,
+        mock_alert,
+        mock_settings,
+    ):
+        configure_settings(mock_settings, two_phase=True)
+        db = make_db()
+
+        await confirm_entry_crossing(db, source_cam="CAM-23")
+        await handle_anpr_event(make_anpr_event(plate="CAR-A", pic_num=1), db)
+        await handle_anpr_event(make_anpr_event(plate="CAR-B", pic_num=1), db)
+
+        assert not _pending_crossings
+        bursts = list(_entry_bursts.values())
+        assert len(bursts) == 2
+        assert [burst["confirmed"] for burst in bursts] == [True, False]
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
     async def test_cam23_silent_entry_alert(self, mock_alert, mock_settings):
         """A CAM-23 ramp crossing with no buffered ANPR read becomes a
         silent-entry alert once the window elapses."""
@@ -508,16 +781,23 @@ class TestEntryExitService:
     @pytest.mark.asyncio
     @patch("app.services.entry_exit_service.settings")
     @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
-    async def test_cam03_no_burst_is_noop_not_silent(self, mock_alert, mock_settings):
-        """CAM-03 fires deep in the garage, usually after the burst already
-        flushed — finding no open burst is normal, NOT a silent entry."""
+    async def test_cam03_does_not_hold_when_hikcentral_is_off(self, mock_alert, mock_settings):
+        """CAM-03 must not queue a crossing nothing can adjudicate.
+
+        The hold exists so HikCentral can say whether the car is already
+        entered. With the layer off — the DEFAULT — that answer never comes, and
+        an unanswered hold can only expire. Queueing here would turn every
+        ordinary CAM-03 confirmation into a delayed silent-entry alert, one per
+        car. This module runs with HIK_VALIDATION_MODE unset (off).
+        """
         configure_settings(mock_settings, two_phase=True)
         db = make_db()
 
         await confirm_pending_entry(db, cam03_snapshot="cam03.jpg")
-        assert len(_pending_crossings) == 0  # CAM-03 never queues a silent crossing
-        await flush_due_entry_bursts(db)
+        assert _pending_crossings == []
 
+        _age_pending_crossings()
+        await flush_due_entry_bursts(db)
         mock_alert.assert_not_called()
 
     # ── Guard: no plate ───────────────────────────────────────────────────
@@ -569,6 +849,142 @@ class TestEntryExitService:
 
         mock_alert.assert_called_once()
         mock_broadcast.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.close_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_exit_forward_carries_original_aware_camera_timestamp(
+        self,
+        mock_vs,
+        mock_close,
+        mock_alert,
+        mock_settings,
+        mock_pms,
+    ):
+        configure_settings(mock_settings, two_phase=False)
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+        captured_at = datetime(2026, 7, 21, 9, 0, tzinfo=timezone(timedelta(hours=3)))
+
+        forward = await handle_anpr_event(
+            make_anpr_event(gate="exit", trigger_time=captured_at),
+            make_db(first_side_effect=[None, None]),
+        )
+
+        assert forward is not None
+        assert forward.captured_at == captured_at
+        await forward.deliver()
+        mock_pms.assert_awaited_once_with(
+            "ABC-1234",
+            "exit",
+            image_path=None,
+            captured_at=captured_at,
+        )
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.core_backend_client.notify_pms_anpr", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.close_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_duplicate_exit_replays_va_forward_without_repeating_pms_mutation(
+        self,
+        mock_vs,
+        mock_close,
+        mock_alert,
+        mock_settings,
+        mock_pms,
+    ):
+        """A camera retry heals a crash after exit commit but before VA delivery."""
+        configure_settings(mock_settings, two_phase=False)
+        captured_at = datetime(
+            2026,
+            7,
+            21,
+            9,
+            0,
+            tzinfo=timezone(timedelta(hours=3)),
+        )
+        event = make_anpr_event(gate="exit", trigger_time=captured_at)
+        event.local_snapshot_path = "/tmp/retried-exit.jpg"
+        db = make_db(first_side_effect=[MagicMock()])
+
+        forward = await handle_anpr_event(event, db)
+
+        assert forward is not None
+        assert forward.plate == "ABC-1234"
+        assert forward.direction == "exit"
+        assert forward.image_path == "/tmp/retried-exit.jpg"
+        assert forward.captured_at == captured_at
+        db.add.assert_not_called()
+        mock_vs.ensure_unregistered_vehicle.assert_not_called()
+        mock_close.assert_not_called()
+        mock_alert.assert_not_awaited()
+
+        await forward.deliver()
+        mock_pms.assert_awaited_once_with(
+            "ABC-1234",
+            "exit",
+            image_path="/tmp/retried-exit.jpg",
+            captured_at=captured_at,
+        )
+
+    @pytest.mark.asyncio
+    @patch("app.services.entry_exit_service.acquire_plate_transaction_lock")
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.close_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_exit_locks_plate_before_state_queries(
+        self,
+        mock_vs,
+        mock_close,
+        mock_alert,
+        mock_settings,
+        mock_lock,
+    ):
+        configure_settings(mock_settings, two_phase=False)
+        mock_settings.ENTRY_V2_MODE = "authoritative"
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+        db = make_db(first_side_effect=[None, None])
+        query = db.query
+        calls = []
+        mock_lock.side_effect = lambda *_: calls.append("lock")
+        db.query.side_effect = lambda *_: (calls.append("query"), query.return_value)[1]
+
+        await handle_anpr_event(make_anpr_event(gate="exit"), db)
+
+        mock_lock.assert_called_once_with(db, "ABC-1234")
+        assert calls[:2] == ["lock", "query"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["off", "shadow"])
+    @patch("app.services.entry_exit_service.acquire_plate_transaction_lock")
+    @patch("app.services.entry_exit_service.settings")
+    @patch("app.services.entry_exit_service.create_alert", new_callable=AsyncMock)
+    @patch("app.services.entry_exit_service.parking_session_service.close_session")
+    @patch("app.services.entry_exit_service.vehicle_service")
+    async def test_non_authoritative_exit_does_not_take_v2_plate_lock(
+        self,
+        mock_vs,
+        mock_close,
+        mock_alert,
+        mock_settings,
+        mock_lock,
+        mode,
+    ):
+        configure_settings(mock_settings, two_phase=False)
+        mock_settings.ENTRY_V2_MODE = mode
+        mock_vs.ensure_unregistered_vehicle.return_value = make_vehicle()
+
+        await handle_anpr_event(
+            make_anpr_event(gate="exit"),
+            make_db(first_side_effect=[None, None]),
+        )
+
+        mock_lock.assert_not_called()
 
     # ── UC2: Parking duration (exit path — unchanged) ─────────────────────
 

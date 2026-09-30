@@ -28,18 +28,40 @@ ANPR missed the plate entirely) → an alert is raised.
 """
 
 import asyncio
-from datetime import timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from time import monotonic
+from typing import Optional
+
 from sqlalchemy.orm import Session
+
+from app.services.entry_state_lock import acquire_plate_transaction_lock
 from app.models.entry_exit_log import EntryExitLog
+from app.models.hik_validation import HikValidation
+from app.models.parking_session import ParkingSession
+from app.services import exit_pipeline
 from app.services import parking_session_service
+from app.services import plate_correction_service
 from app.services import vehicle_service
-from app.services.event_parser import ParsedCameraEvent
+from app.services.event_parser import (
+    ParsedCameraEvent,
+    normalize_plate,
+    same_vehicle_plate,
+)
 from app.services.alert_service import create_alert
+from app.services import hikcentral
+from app.services.hikcentral import HikImages
+from app.services.hikcentral.models import to_facility_naive
+from app.services.entry_v2_forwarder import enqueue_entry_v2_shadow
 from app.config import settings, facility_now_naive, facility_tz
 from app.utils.logger import get_logger
 from app.utils import core_backend_client
 
 logger = get_logger(__name__)
+
+
+class SourceTimestampUnavailable(RuntimeError):
+    """A destructive exit cannot be ordered from a PMS receive-time fallback."""
 
 # ── ANPR entry-burst buffer ──────────────────────────────────────────────
 # Keyed by an incrementing burst id (NOT plate, NOT camera) so a tailgater's
@@ -72,6 +94,36 @@ _recent_entries: list[dict] = []
 
 # Strong refs to in-flight detached PMS forwards (see _spawn_confirm_forward).
 _background_forwards: set[asyncio.Task] = set()
+
+
+@dataclass(frozen=True)
+class AnprPostCommitForward:
+    """Legacy VA notification that must run only after the DB lock is released."""
+
+    plate: str
+    direction: str
+    image_path: Optional[str]
+    captured_at: datetime
+
+    async def deliver(self) -> None:
+        try:
+            await core_backend_client.notify_pms_anpr(
+                self.plate,
+                self.direction,
+                image_path=self.image_path,
+                captured_at=self.captured_at,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[UC1] PMS API forwarding failed for plate=%s: %s",
+                self.plate,
+                exc,
+            )
+            if (
+                settings.ENTRY_V2_MODE == "authoritative"
+                and self.direction.strip().lower() == "exit"
+            ):
+                raise
 
 
 def _confirm_direction(source_cam: str) -> str:
@@ -119,19 +171,44 @@ def _open_buffer_for(cam: str) -> dict | None:
 def _attach_pending_crossing(buf: dict) -> None:
     """If a ramp crossing arrived just before this burst started, consume the
     oldest still-valid one and mark the burst confirmed."""
-    now = facility_now_naive()
-    window = settings.ANPR_BURST_WINDOW_SECONDS
-    _pending_crossings[:] = [
-        c for c in _pending_crossings
-        if (now - c["ts"]).total_seconds() <= window
-    ]
-    if _pending_crossings:
-        c = _pending_crossings.pop(0)
+    now = monotonic()
+    valid_index = next(
+        (
+            index
+            for index, crossing in enumerate(_pending_crossings)
+            if now <= crossing["expires_at_monotonic"]
+        ),
+        None,
+    )
+    if valid_index is not None:
+        c = _pending_crossings.pop(valid_index)
         buf["confirmed"] = True
         src = c.get("source") or "CAM-23"
         if c.get("snapshot"):
             buf["confirm_snapshots"].setdefault(src, c["snapshot"])
         buf["confirm_source"] = src
+
+
+def _is_same_car_reread(buf: dict, plate: str, event_time) -> bool:
+    """True when a picNum tie is one car re-read, not the next car arriving.
+
+    `pic <= max_pic` is genuinely ambiguous — a new car whose pic 1-2 events were
+    lost also opens at 3 — so the plate has to carry the decision. A read whose
+    plate is a truncation of one already buffered (or identical to it), arriving
+    within seconds, is the same car: two cars cannot occupy one gate that close
+    together, and their plates would have to be truncations of each other on top
+    of that. Anything else still splits, exactly as before.
+    """
+    limit = settings.ANPR_BURST_SAME_CAR_SECONDS
+    for read in buf["reads"]:
+        if not same_vehicle_plate(read["plate"], plate):
+            continue
+        previous = read["event_time"]
+        if event_time is None or previous is None:
+            return True     # no usable timestamps — the plate match is the evidence
+        if abs((event_time - previous).total_seconds()) <= limit:
+            return True
+    return False
 
 
 async def _buffer_entry_read(event: ParsedCameraEvent, plate: str, event_time) -> None:
@@ -151,6 +228,17 @@ async def _buffer_entry_read(event: ParsedCameraEvent, plate: str, event_time) -
             # crossing (recognition lag) for the SAME car. Only picNum-reset (or
             # the idle gap, handled by the flusher) splits cars.
             picnum_reset = pic is not None and max_pic is not None and pic <= max_pic
+            if picnum_reset and _is_same_car_reread(buf, plate, event_time):
+                # Not a new car: the SAME plate came back truncated under a
+                # repeated picNum. Splitting here is what wrote KKR-4 for
+                # KKR-6294 on 2026-08-09 — the good read was force-flushed into
+                # a burst the ramp crossing could no longer confirm, so it was
+                # dropped as a ghost while the partial read became the entry.
+                logger.info(
+                    f"[UC1] Same-car re-read kept in burst id={buf['id']}: "
+                    f"plate={plate} pic={pic} (already buffered up to pic={max_pic})"
+                )
+                picnum_reset = False
             if picnum_reset:
                 buf["force_flush"] = True   # close it; the flusher will write it
                 buf = None
@@ -199,6 +287,12 @@ async def confirm_entry_crossing(db: Session, snapshot: str | None = None,
         Its image is then attached to the just-written entry instead.
         (allow_silent_entry=False)
 
+        It is no longer a dead end, though. When there is no open burst AND no
+        recent entry to attach to, nothing accounts for the car CAM-03 just
+        saw — CAM-23 missed the crossing and the burst was dropped — so the
+        sighting is held as a pending crossing too, and can be rescued exactly
+        like a CAM-23 one. Gated by ENTRY_CAM03_CAN_RESCUE.
+
     Both confirming cameras' snapshots are kept (one per source) and each is
     forwarded to the PMS under its own direction marker — so the PMS receives a
     ramp-top (CAM-23) AND an in-garage (CAM-03) image per car.
@@ -232,19 +326,56 @@ async def confirm_entry_crossing(db: Session, snapshot: str | None = None,
             )
         elif allow_silent_entry:
             _pending_crossings.append({
-                "ts": facility_now_naive(),
+                "ts": now,
+                "expires_at_monotonic": (
+                    monotonic() + settings.ENTRY_PENDING_CROSSING_SECONDS
+                ),
                 "snapshot": snapshot,
                 "source": source_cam,
             })
             logger.info(
-                f"[UC1] Ramp crossing from {source_cam} with no buffered ANPR "
-                "read — held as pending (burst may still arrive)"
+                f"[UC1] Crossing from {source_cam} with no buffered ANPR read "
+                "— held as pending (burst may still arrive)"
             )
         else:
             # No open burst — the entry was likely already flushed (the normal
             # CAM-03 ordering). Attach this image to that just-written entry.
+            # The image still goes to a just-written entry when there is one —
+            # that is image ROUTING, not a claim about whether the car was
+            # already entered, and it never decides the rescue below.
             to_forward = _claim_recent_entry_image(source_cam, snapshot, now)
-            if to_forward is None:
+            # Holding is worth doing only if something can later ADJUDICATE the
+            # hold. The identity answer comes from HikCentral, and only an
+            # authoritative layer may act on it, so with the layer off,
+            # unconfigured or in shadow every held crossing would expire
+            # unanswered — and the only thing an unanswered hold can produce is
+            # noise. This is a capability check, not a guess about the car.
+            if settings.ENTRY_CAM03_CAN_RESCUE and hikcentral.is_authoritative():
+                # Held unconditionally. Whether this car is already accounted
+                # for is NOT guessed here from how recently something else
+                # happened — nothing at a plateless crossing carries identity.
+                # It is answered at expiry, against HikCentral's GUID for the
+                # pass, by `_recover_silent_entry`.
+                logger.info(
+                    f"[UC1] {source_cam} crossing with no open burst — held as "
+                    "pending; HikCentral decides whether it is already entered"
+                )
+                _pending_crossings.append({
+                    "ts": now,
+                    "expires_at_monotonic": (
+                        monotonic() + settings.ENTRY_PENDING_CROSSING_SECONDS
+                    ),
+                    "snapshot": snapshot,
+                    "source": source_cam,
+                    # This crossing may RESCUE a car but must never ACCUSE one.
+                    # CAM-03 has never been a silent-entry source, and the ways
+                    # a hold goes unanswered — HikCentral unreachable mid-flight,
+                    # the record not published yet — are all failures to ask,
+                    # not evidence that a car slipped in. Alerting on them would
+                    # turn every platform hiccup into one alert per car.
+                    "may_alert": False,
+                })
+            elif to_forward is None:
                 logger.debug(
                     f"[UC1] {source_cam} crossing with no open burst and no "
                     "recent entry to attach to — no action"
@@ -281,8 +412,23 @@ def _claim_recent_entry_image(source_cam: str, snapshot: str | None, now) -> tup
 
 async def confirm_pending_entry(db: Session, cam03_snapshot: str | None = None) -> None:
     """Backward-compatible entry point used by occupancy_service when CAM-03
-    fires in the entry direction. CAM-03 is a deep/secondary confirmation, so it
-    never raises a silent-entry alert."""
+    fires in the entry direction.
+
+    CAM-03 is a deep/secondary confirmation, so it never raises a silent-entry
+    alert (`allow_silent_entry=False`).
+
+    When ENTRY_CAM03_CAN_RESCUE is on and HikCentral is authoritative it holds a
+    rescue-only pending crossing UNCONDITIONALLY — including when the image was
+    just attached to a recently written entry. That is deliberate: nothing at a
+    plateless crossing carries identity, so "was this car already entered" is
+    not guessed from how recently something else happened; it is answered at
+    expiry against HikCentral's GUID, and a redundant hold is then dropped in
+    silence by `RecoveryAttempt.pass_already_accounted`.
+
+    The cost of that choice is one HikCentral VehicleLogs lookup per CAM-03
+    entry confirmation, roughly one extra platform query per car, fired
+    ENTRY_PENDING_CROSSING_SECONDS after the crossing.
+    """
     await confirm_entry_crossing(
         db, snapshot=cam03_snapshot, source_cam="CAM-03", allow_silent_entry=False,
     )
@@ -294,6 +440,7 @@ async def flush_due_entry_bursts(db: Session) -> None:
     raises silent-entry alerts for ramp crossings that never matched a burst.
     Commits once if anything changed."""
     now = facility_now_naive()
+    now_monotonic = monotonic()
     require_confirm = settings.USE_CAM03_ENTRY_CONFIRMATION
     window = settings.ANPR_BURST_WINDOW_SECONDS
     max_age = settings.ANPR_BURST_MAX_SECONDS
@@ -318,7 +465,7 @@ async def flush_due_entry_bursts(db: Session) -> None:
 
         keep = []
         for c in _pending_crossings:
-            if (now - c["ts"]).total_seconds() > window:
+            if now_monotonic > c["expires_at_monotonic"]:
                 silent.append(c)
             else:
                 keep.append(c)
@@ -333,11 +480,1003 @@ async def flush_due_entry_bursts(db: Session) -> None:
             f"[UC1] Entry burst dropped (no ramp confirmation within {max_age:.0f}s): "
             f"cam={buf['camera_id']} reads={len(buf['reads'])}"
         )
+        # The refusal only sticks if HikCentral's record for the same pass is
+        # consumed too — otherwise the reconciler re-opens it. See
+        # _tombstone_refused_burst.
+        if await _tombstone_refused_burst(db, buf):
+            changed = True
     for c in silent:
+        # A crossing with no plate is only "silent" once HikCentral has also
+        # failed to name the car. Recovery is attempted first, never after.
+        if await _recover_silent_entry(db, c):
+            changed = True
+            continue
+        if not c.get("may_alert", True):
+            # A rescue-only crossing (see `confirm_entry_crossing`): nothing was
+            # created, but silence here is deliberate — this source is not
+            # trusted to accuse, only to save.
+            logger.info(
+                "[UC1] %s crossing at %s went unrecovered; no alert (rescue-only "
+                "source)",
+                c.get("source"),
+                c.get("ts"),
+            )
+            continue
         await _raise_silent_entry_alert(db, c.get("source"), c.get("snapshot"))
         changed = True
     if changed:
         db.commit()
+
+
+def _winning_read(reads: list[dict]) -> dict:
+    """The read that labels a burst: highest picNum, then confidence, then latest.
+
+    The entry ANPR fires several reads per car and the early ones are the bad
+    ones (plate far/small/blurry), so the burst is labeled by its last read. Kept
+    as one function because the refusal tombstone must name the same plate the
+    flush would have written — if these two ever disagreed, a refused burst would
+    tombstone one plate and the reconciler would re-open under another.
+
+    picNum stays the primary key: a later frame really is the better one. But the
+    camera repeats a picNum often enough that arrival order alone decided those
+    ties, which on 2026-08-09 labeled a car KKR-4 (conf 89) when the same burst
+    held KKR-6294 (conf 96) at the same picNum. Confidence breaks the tie before
+    arrival order does; `event_time` still settles the rest.
+    """
+    return max(
+        reads,
+        key=lambda r: (
+            r["pic_num"] if r["pic_num"] is not None else -1,
+            r["confidence"] if r["confidence"] is not None else -1,
+            r["event_time"],
+        ),
+    )
+
+
+# Refusals the gate made but could not tombstone. Each entry blocks the
+# reconciler from re-opening that pass, permanently.
+#
+# THE RULE: an ANPR read with no ramp crossing is not a car that entered. Every
+# burst in here was dropped for exactly that reason — the plate was read at the
+# gate and no CAM-23/CAM-03 crossing followed within ANPR_BURST_MAX_SECONDS — so
+# there is no entry to recover and nothing the sweep should ever open. The block
+# does not expire, because the fact it encodes does not expire.
+#
+# Measured 2026-09-02 PM: six gate reads, ZERO ramp crossings in six hours. All
+# six were passing traffic (confidences 62-96 against the morning's uniform 96);
+# one was a car the entry camera read nine seconds AFTER it exited. The single
+# one that got opened, USB-6662, became an imageless session nothing can close.
+#
+# The cost of being wrong here is deliberately asymmetric. Blocking a car that
+# really did enter costs an unmatched exit, which announces itself and closes
+# itself — ERS-7949 and EED-7286 did exactly that on 2026-09-02. Opening one
+# that did not costs a session no mechanism can ever close.
+#
+# HIK_REFUSAL_HOLD_SECONDS bounds how long we keep RETRYING the tombstone, not
+# how long the block lasts. A tombstone is the durable form of the same refusal;
+# failing to write one never weakens it.
+#
+# Deliberately in RAM and bounded. The durable alternative is a HikValidation
+# row, and that is not available here: `_catchup_watermark` reads MAX(pass_time)
+# across every row for a direction, so a synthetic tombstone would advance the
+# watermark past records nobody has processed and lose them silently. A restart
+# drops these and the reconciler may re-open one pass — the same behaviour as
+# before this guard existed, so the failure mode is unchanged, never worsened.
+#
+# (plate, event_time, retry_until)
+_UNVERIFIED_REFUSALS: list[tuple[str, datetime, datetime]] = []
+_UNVERIFIED_REFUSALS_MAX = 256
+
+
+def _remember_unverified_refusal(
+    plate: str, event_time: datetime, why: str = "HikCentral did not answer"
+) -> None:
+    # Store canonical, because the reconciler compares against
+    # `rec.canonical_plate`. The burst carries the camera's raw read.
+    plate = normalize_plate(plate) or plate
+    retry_until = facility_now_naive() + timedelta(
+        seconds=settings.HIK_REFUSAL_HOLD_SECONDS
+    )
+    logger.warning(
+        "[UC1] Refusal for plate=%s at %s could not be tombstoned (%s) — the "
+        "reconciler is blocked from this pass for good; retrying the tombstone "
+        "until %s",
+        plate, event_time, why, retry_until,
+    )
+    _UNVERIFIED_REFUSALS.append((plate, event_time, retry_until))
+    if len(_UNVERIFIED_REFUSALS) > _UNVERIFIED_REFUSALS_MAX:
+        del _UNVERIFIED_REFUSALS[:-_UNVERIFIED_REFUSALS_MAX]
+
+
+def _matches_unverified_refusal(plate: str, when: datetime, window: timedelta) -> bool:
+    """True when the gate refused this pass but could not prove it to HikCentral.
+
+    Plate comparison is `same_vehicle_plate`, not equality: the refusal is
+    recorded under the burst's winning read, and the HikCentral record may carry
+    a truncation of the same plate.
+    """
+    for refused_plate, refused_at, _hold_until in _UNVERIFIED_REFUSALS:
+        if abs((refused_at - when).total_seconds()) > window.total_seconds():
+            continue
+        if same_vehicle_plate(refused_plate, plate):
+            return True
+    return False
+
+
+async def _retry_unverified_refusals(db: Session) -> None:
+    """Try again to tombstone refusals we could not prove the first time.
+
+    Runs at the head of the reconcile sweep, so every attempt to re-open a
+    refused pass is preceded by one more chance to make the refusal durable.
+
+    Nothing here releases a pass. An entry leaves this list in exactly one way:
+    the tombstone is finally written, which is the same refusal made durable.
+    Past `retry_until` we simply stop spending HikCentral calls on it and let
+    the in-memory block stand.
+
+    Sizing the retry window by "how long until the pass ages out of the sweep's
+    reach" would not work even if we wanted it to: there is no such point.
+    `_reconcile_window` anchors on the watermark, so a stale one re-walks
+    arbitrarily far back — USB-6662 on 2026-09-02 was opened 3h27m after its
+    pass, off a 3h59m watermark gap, when the block was still time-bounded.
+    """
+    if not _UNVERIFIED_REFUSALS:
+        return
+    now = facility_now_naive()
+    still_blocked: list[tuple[str, datetime, datetime]] = []
+    for plate, event_time, retry_until in list(_UNVERIFIED_REFUSALS):
+        if now >= retry_until:
+            # Stop asking, keep blocking.
+            still_blocked.append((plate, event_time, retry_until))
+            continue
+        try:
+            guid = await hikcentral.consume_refused_entry(
+                db, plate, event_time, require_plate_match=True
+            )
+        except Exception:
+            still_blocked.append((plate, event_time, retry_until))
+            continue
+        if guid is None:
+            # Still nothing to consume. The record may simply not have reached
+            # us yet, and that is the case this guard exists for.
+            still_blocked.append((plate, event_time, retry_until))
+            continue
+        # consume_refused_entry only stages the row; the caller commits. Without
+        # this the GUID is still unconsumed when list_unconsumed_records runs
+        # immediately below, and the pass is re-opened anyway.
+        db.commit()
+        logger.info(
+            "[UC1] Refusal for plate=%s at %s tombstoned on retry (guid=%s) — "
+            "the block is now durable",
+            plate, event_time, guid,
+        )
+    _UNVERIFIED_REFUSALS[:] = still_blocked
+
+
+async def _tombstone_refused_burst(db: Session, buf: dict) -> bool:
+    """Stop the HikCentral reconciler from re-opening a burst the gate refused.
+
+    A dropped burst leaves no `EntryExitLog` on purpose. `_reconcile_missed
+    _entries` treats "HikCentral has a pass with no EntryExitLog" as a missed
+    entry, so the refusal would be silently undone a few minutes later — which is
+    exactly what produced the phantom open sessions that surface as overstays.
+    Consuming the GUID here closes that loop. Returns True when a row was added.
+    """
+    reads = buf.get("reads") or []
+    if not reads:
+        return False
+    winner = _winning_read(reads)
+    plate = winner.get("plate")
+    event_time = winner.get("event_time") or buf.get("first_event_time")
+    if not plate or event_time is None:
+        return False
+    try:
+        guid = await hikcentral.consume_refused_entry(db, plate, event_time)
+    except hikcentral.RefusalLookupFailed:
+        # We could not ask HikCentral, so we do NOT know whether a record for
+        # this pass exists. Failing open here is what re-opened SUZ-975. Hold
+        # the reconciler off this pass until a later sweep can tombstone it
+        # properly.
+        _remember_unverified_refusal(plate, event_time)
+        return False
+    except Exception as exc:  # never let a tombstone break the flusher
+        logger.warning(
+            "[UC1] Could not tombstone refused burst plate=%s: %r", plate, exc
+        )
+        _remember_unverified_refusal(plate, event_time)
+        return False
+    if guid is None:
+        # We asked and HikCentral returned nothing unconsumed for this pass.
+        # That reads like "there is nothing for the reconciler to re-open", and
+        # it was treated that way — but crossRecords lags, and the record can
+        # surface minutes later carrying a pass_time from BEFORE this refusal.
+        # The sweep then opens the very pass the gate just refused. Hold it.
+        _remember_unverified_refusal(
+            plate, event_time, why="HikCentral returned no record yet"
+        )
+        return False
+    return True
+
+
+def _recovered_burst(outcome, crossing: dict) -> dict:
+    """Shape a HikCentral recovery like an ordinary ANPR burst.
+
+    Reusing the normal flush path is the point: dedup, anti-bounce, vehicle
+    resolution, session creation, alerting and the VA forward all behave
+    identically, so a recovered entry is indistinguishable downstream from one
+    the camera labelled itself. `hik_outcome` rides along so the flush reuses the
+    record already fetched instead of looking the same car up twice.
+    """
+    event_time = outcome.pass_time_local or crossing.get("ts")
+    crossing_snapshot = crossing.get("snapshot")
+    source_cam = crossing.get("source") or "CAM-23"
+    return {
+        "id": 0,
+        # HikCentral saw this car at the entry LPR resource, so the gate camera
+        # is the honest attribution — the ramp cam only proved it moved.
+        "camera_id": "CAM-ENTRY",
+        "reads": [{
+            "plate": outcome.plate,
+            "confidence": None,
+            "pic_num": None,
+            "event_time": event_time,
+            "snapshot_path": None,
+            "local_snapshot_path": None,
+        }],
+        "first_event_time": event_time,
+        "last_read_at": facility_now_naive(),
+        "confirmed": True,
+        # One crossing carries one camera's image. Crossings are appended
+        # independently by `confirm_entry_crossing` and nothing merges two
+        # sightings of the same car into a single crossing, so there is never
+        # more than one image to forward here. (An earlier revision read a
+        # `crossing["sources"]` map for a multi-camera merge; nothing ever wrote
+        # that key, so the branch was dead and the multi-image behaviour it
+        # advertised never happened. Reinstate it only alongside a real merge.)
+        "confirm_snapshots": {source_cam: crossing_snapshot} if crossing_snapshot else {},
+        "confirm_source": source_cam,
+        "force_flush": True,
+        "hik_outcome": outcome,
+    }
+
+
+def _seed_entry_v2_identity(outcome, crossing: dict) -> None:
+    """Give Entry V3 the ANPR read the gate camera never produced.
+
+    WHY THIS EXISTS. V3 builds identities in its `anpr_identity` stage, driven
+    by a camera ANPR event. HikCentral can only *enrich* an identity that
+    already exists — `hik_sourced` appears on `identity_enriched`, never on
+    `created` — so a crossing rescued by `_recover_silent_entry` reached V3 as a
+    ramp observation with nothing to be scored against. On 2026-09-08 that was
+    both of the day's recoveries: EEB-80 and DLB-6690 were confirmed by the
+    legacy path and produced ZERO decision records, so V3 was charged with two
+    misses for entries the service had in fact recovered correctly.
+
+    Synthesising the read rather than teaching V3 a second creation path is the
+    same choice `_recovered_burst` makes one function above: the event enters
+    the ordinary shadow FIFO, so identity creation AND the stage-S2 HikCentral
+    image enrichment that fills the Re-ID gallery both run as they do for a car
+    the camera labelled itself.
+
+    CAUSALITY IS THE WHOLE TRICK. V3 discards any identity whose read follows
+    the crossing (`causal_attempt_embeddings`), and here the ramp crossing has
+    already happened. `pass_time_local` is HikCentral's own gate PassTime, which
+    genuinely precedes the ramp, so the seeded attempt is causally eligible;
+    stamping it `facility_now_naive()` would produce an identity that can never
+    match anything. The observation is still in V3's pool — its TTL outlives the
+    recovery by an order of magnitude — so it is re-evaluated against the new
+    identity on the next pass.
+
+    OBSERVATION-ONLY, AND NEVER RAISES. `enqueue_entry_v2_shadow` no-ops unless
+    ENTRY_V2_MODE is `shadow`, and a full or stopped queue drops the event. A
+    seeding failure must never cost us the legacy entry we just recovered — an
+    optional add-on that raises has crash-looped every pod in this facility once
+    already.
+    """
+    event_time = outcome.pass_time_local or crossing.get("ts")
+    if not outcome.plate or event_time is None:
+        return
+    if _seed_one_v2_attempt(outcome.plate, event_time):
+        logger.info(
+            "[EntryV2][shadow] Seeded V3 identity from HikCentral recovery: "
+            "plate=%s pass_time=%s source=%s",
+            outcome.plate, event_time, crossing.get("source"),
+        )
+
+
+def _seed_one_v2_attempt(plate: str, event_time) -> bool:
+    """Hand V3 one synthetic gate read. Returns whether it was queued."""
+    try:
+        return enqueue_entry_v2_shadow(ParsedCameraEvent(
+            # HikCentral saw this car at the entry LPR resource, so the gate
+            # camera is the honest attribution — matching `_recovered_burst`.
+            # It is also what makes `is_entry_attempt` true: CAMERAS maps
+            # CAM-ENTRY to gate="entry".
+            camera_id="CAM-ENTRY",
+            device_serial="",
+            channel_id=0,
+            event_type="ANPR",
+            detection_target="vehicle",
+            region_id=None,
+            channel_name=None,
+            trigger_time=event_time,
+            raw_xml="<hikRecoveredEntry/>",
+            # Not "camera": no camera reported this. The value must not start
+            # with "pms_receive_", or `_source_event_id` drops captured_at from
+            # the digest and two recoveries of the same pass stop deduplicating.
+            trigger_time_source="hik_recovered",
+            event_state="active",
+            event_description="HikCentral silent-entry recovery",
+            plate_number=plate,
+            gate="entry",
+        ))
+    except Exception:
+        logger.warning(
+            "[EntryV2][shadow] Could not seed identity for plate=%s; V3 will "
+            "score this crossing without it",
+            plate,
+            exc_info=True,
+        )
+        return False
+
+
+async def _seed_entry_v2_candidates(db: Session, crossing: dict) -> None:
+    """Recovery refused to choose between several cars — let Re-ID choose.
+
+    THE CASE. A car passes the gate and HikCentral logs it, but it never
+    actually enters. Another car then enters with no ANPR read at all. Both sit
+    in the same lookup window, so `recover_entry_plate` sees two candidates and
+    declines — correctly, because nothing in a timestamp says which one drove
+    down the ramp, and guessing staples a stranger's plate onto the session.
+    The real entry is then lost as a silent entry and resurfaces days later as a
+    phantom overstay.
+
+    WHAT THIS DOES INSTEAD. It seeds EVERY candidate as a V3 identity and lets
+    the ramp crossing — which is still sitting in V3's observation pool, its TTL
+    an order of magnitude longer than this path — be scored against all of them.
+    The car that actually crossed matches its own image; the one that turned
+    away does not. That is `list_entry_candidates`' stated contract ("every
+    record here is a CANDIDATE, and Re-ID over the returned images is what
+    decides") applied to the case where we have no plate to start from, and it
+    is the only evidence that separates these two cars. The barrier probe will
+    separate SOME of them by `allowResult`, but only when the platform actually
+    refused the car that turned away.
+
+    SHADOW ONLY, AND IT DECIDES NOTHING. `enqueue_entry_v2_shadow` no-ops unless
+    ENTRY_V2_MODE is `shadow`, so this writes decision-log evidence and never a
+    session. Seeding a car that did not enter is exactly the phantom-entry risk
+    that keeps this observational: the wrong candidate is an identity that lives
+    until its TTL and could compete for a later crossing. Reading a day of
+    `entry_decisions_gate_*.jsonl` is how we find out whether Re-ID picks the
+    right one often enough to be trusted with a real session.
+
+    COSTS ONE EXTRA LOOKUP, on a path where the alternative is losing the car.
+    `recover_entry_plate` already queried and threw its candidates away rather
+    than widen its return type; this runs only in the declined branch, which is
+    rare, and `recoverable_candidates` returns [] on any failure.
+    """
+    try:
+        candidates = await hikcentral.recoverable_candidates(
+            crossing.get("ts"), db
+        )
+    except Exception:
+        logger.warning("[EntryV2][shadow] Candidate lookup failed", exc_info=True)
+        return
+    # One candidate is `recover_entry_plate`'s own job and it has already run.
+    # Zero means the gate never named anything, which is stage S7's case, not
+    # an ambiguity — there is nothing here for Re-ID to choose between.
+    if len(candidates) < 2:
+        return
+
+    seeded = []
+    for record in candidates:
+        if record.pass_time is None:
+            continue
+        # Each candidate keeps its OWN PassTime, so V3's causality filter can
+        # judge them independently: a car that passed the gate after this
+        # crossing cannot have been the car that made it.
+        if _seed_one_v2_attempt(
+            record.canonical_plate, to_facility_naive(record.pass_time)
+        ):
+            seeded.append(record.canonical_plate)
+    if seeded:
+        logger.warning(
+            "[EntryV2][shadow] Recovery was ambiguous for the %s crossing at "
+            "%s (%d candidates); seeded %s for Re-ID to choose between",
+            crossing.get("source"),
+            crossing.get("ts"),
+            len(candidates),
+            ", ".join(seeded),
+        )
+
+
+async def _recover_silent_entry(db: Session, crossing: dict) -> bool:
+    """Try to rescue a plateless ramp crossing using HikCentral (Case B).
+
+    Returns True when the crossing is HANDLED — it became a real entry, or
+    HikCentral identified it as a pass already entered. False means nobody can
+    account for the car and the caller raises the silent-entry alert.
+
+    Recovery needs exactly one HikCentral candidate in the window — with two
+    cars in flight nothing says which one crossed, and guessing would staple a
+    stranger's plate onto the session.
+    """
+    attempt = await hikcentral.recover_entry_pass(
+        crossing.get("ts"),
+        crossing.get("source") or "CAM-23",
+        db,
+    )
+    if attempt.pass_already_accounted:
+        # IDENTITY, NOT PROXIMITY. Every pass around this crossing already backs
+        # a gate event, so this is a second camera's view of a car that is
+        # already inside — one vehicle pass, one GUID, however many cameras saw
+        # it. Nothing to create and nothing to report: alerting here would
+        # invent a silent entry for a car that was entered correctly.
+        logger.info(
+            "[UC1] %s crossing at %s is an already-entered pass (%d/%d records "
+            "consumed) — no second entry, no alert",
+            crossing.get("source"),
+            crossing.get("ts"),
+            attempt.already_consumed,
+            attempt.records_found,
+        )
+        return True
+
+    outcome = attempt.outcome
+    if outcome is None or not outcome.plate:
+        # Legacy still declines and the caller still raises the silent-entry
+        # alert. This only gives V3 the candidates it never got to see.
+        await _seed_entry_v2_candidates(db, crossing)
+        return False
+
+    logger.warning(
+        "[UC1] Silent entry RECOVERED from HikCentral: plate=%s guid=%s "
+        "source=%s",
+        outcome.plate, outcome.guid, crossing.get("source"),
+    )
+    await _flush_entry_burst(db, _recovered_burst(outcome, crossing))
+    # Legacy state is committed first, exactly as the router defers its own
+    # shadow enqueue until after commit: the shadow FIFO never sits in front of
+    # an entry we have already decided.
+    _seed_entry_v2_identity(outcome, crossing)
+    return True
+
+
+# ── HikCentral reconciliation (event-driven) ──────────────────────────────
+# A gate-area event (CAM-23/03/ENTRY for entries, CAM-08/EXIT for exits) is the
+# heartbeat that sweeps HikCentral for cars the edge pipeline missed ENTIRELY —
+# neither the ANPR read nor the ramp/occupancy crossing reached PMS-AI, so no
+# session exists at all. A missed exit closes a session; a missed entry opens
+# one only when HIK_RECONCILE_OPEN_ENTRIES is on (off by default — at this site
+# an uncrossed entry pass was passing traffic, not a missed car). Fire-and-forget and debounced per direction, so it never blocks the
+# camera webhook and a busy camera cannot fire a HikCentral call per frame. The
+# grace window keeps a sweep from racing a car still in the live pipeline, and
+# the hik_validations GUID makes overlapping sweeps idempotent.
+#
+# NOTE: a reconciled session has NO physical ramp confirmation (that is the
+# point — the edge missed it). HikCentral's server-side record is its only
+# evidence, recorded with plate_source="hik_polled" for audit.
+
+_last_reconcile_at: dict[str, float] = {}
+
+
+def note_gate_event(camera_id: str) -> None:
+    """Trigger a debounced HikCentral reconcile sweep for a gate-area event.
+
+    Cheap and synchronous: decides the direction, applies the debounce, and (if
+    due) spawns a background task. Safe to call from the camera webhook — it
+    never awaits, never raises, and never delays the response.
+    """
+    if not hikcentral.is_enabled():
+        return
+    if camera_id in settings.hik_reconcile_entry_trigger_cameras():
+        direction = hikcentral.DIRECTION_ENTRY
+    elif camera_id in settings.hik_reconcile_exit_trigger_cameras():
+        direction = hikcentral.DIRECTION_EXIT
+    else:
+        return
+
+    now = monotonic()
+    if now - _last_reconcile_at.get(direction, 0.0) < settings.HIK_RECONCILE_DEBOUNCE_SECONDS:
+        return
+    _last_reconcile_at[direction] = now
+
+    try:
+        asyncio.get_running_loop().create_task(_run_reconcile(direction))
+    except RuntimeError:
+        # No running loop (sync context/tests): skip rather than raise.
+        pass
+
+
+_sweep_in_flight: set[str] = set()
+
+
+async def _run_reconcile(direction: str) -> None:
+    """Background sweep with its own DB session. Never raises.
+
+    Walks from the last HikCentral pass we actually consumed up to now, so every
+    gate event heals whatever fell in the gap since the previous one. After a
+    normal quiet period that span is minutes; after an outage it is however long
+    the outage was, and the sweep closes all of it.
+    """
+    from app.database import SessionLocal
+
+    # A long catch-up can outlive the 30s debounce. Two sweeps of the same
+    # direction would re-query the same span and race each other on the same
+    # records; GUID uniqueness keeps that correct but it is wasted platform
+    # load, so the second one simply yields to the one already running.
+    if direction in _sweep_in_flight:
+        logger.info("[Hik][reconcile] %s sweep already running — skipping", direction)
+        return
+    _sweep_in_flight.add(direction)
+
+    db = SessionLocal()
+    try:
+        sweep = (
+            _reconcile_missed_entries
+            if direction == hikcentral.DIRECTION_ENTRY
+            else _reconcile_missed_exits
+        )
+        begin, end = _reconcile_window(db, direction)
+        if begin >= end:
+            return
+        # query_vehicle_logs does NOT paginate (pageNo=1, newest-first), so a
+        # window holding more than HIK_RECONCILE_PAGE_SIZE records silently
+        # drops the OLDEST — exactly what a catch-up is hunting for. Walk it.
+        chunk = timedelta(minutes=settings.HIK_CATCHUP_CHUNK_MINUTES)
+        if end - begin > chunk:
+            logger.warning(
+                "[Hik][reconcile] %s: %s gap since the last consumed pass (%s) "
+                "— sweeping it in %s chunks",
+                direction, end - begin, begin, chunk,
+            )
+        cursor = begin
+        while cursor < end:
+            upper = min(cursor + chunk, end)
+            try:
+                await sweep(db, window=(cursor, upper))
+            except Exception as exc:
+                # One bad chunk must not abandon the rest of the gap.
+                logger.warning(
+                    "[Hik][reconcile] %s chunk %s..%s failed: %r",
+                    direction, cursor, upper, exc,
+                )
+                db.rollback()
+            cursor = upper
+    except Exception as exc:  # a sweep must never escape into the event loop
+        logger.warning("[Hik][reconcile] %s sweep failed: %r", direction, exc)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    finally:
+        _sweep_in_flight.discard(direction)
+        db.close()
+
+
+async def startup_catchup() -> None:
+    """Run both sweeps once at boot, without waiting for a car to show up.
+
+    The watermark window in `_reconcile_window` already recovers an outage on
+    the first gate event after a restart — but only when one arrives. A service
+    that comes back at 02:00 would otherwise sit on the gap until the morning
+    rush, reporting overstays the whole time. Never raises: a HikCentral that is
+    unreachable at boot must not stop the service from starting.
+    """
+    if not settings.HIK_CATCHUP_ON_STARTUP or not hikcentral.is_enabled():
+        return
+    for direction in (hikcentral.DIRECTION_EXIT, hikcentral.DIRECTION_ENTRY):
+        await _run_reconcile(direction)
+
+
+def _catchup_watermark(db: Session, direction: str) -> Optional[datetime]:
+    """The newest HikCentral pass this deployment has already consumed.
+
+    `hik_validations.pass_time` is the only durable record of how far the gate
+    pipeline actually got, and the GUID uniqueness that backs it is what makes
+    re-sweeping the same span harmless. Returns None when the table holds
+    nothing for this direction — a fresh DB has no gap to close.
+    """
+    row = (
+        db.query(HikValidation.pass_time)
+        .filter(
+            HikValidation.direction == direction,
+            HikValidation.pass_time.isnot(None),
+        )
+        .order_by(HikValidation.pass_time.desc())
+        .first()
+    )
+    return row[0] if row else None
+
+
+def _reconcile_window(db: Session, direction: str) -> tuple[datetime, datetime]:
+    """[begin, grace] window in naive facility-local time, anchored on the
+    last HikCentral pass this deployment actually consumed.
+
+    A fixed lookback cannot heal downtime. On 2026-08-09 PMS-AI stopped
+    ingesting for ~4h; 25 exits landed in that hole, and when it came back the
+    15-minute window could only see the last few minutes of it. Every one of
+    those sessions stayed open and surfaced as a 24h+ overstay for cars that had
+    driven home hours earlier.
+
+    Anchoring on the watermark makes each sweep self-healing: it resumes exactly
+    where the previous one stopped, so a gap of any length is picked up by the
+    next gate event. HIK_RECONCILE_LOOKBACK_SECONDS remains the FLOOR (never ask
+    for less than that, so a fresh or stale watermark still gets normal cover)
+    and HIK_CATCHUP_MAX_HOURS the ceiling, so a DB restored from an old backup
+    cannot trigger a week-long sweep.
+    """
+    now = facility_now_naive()
+    end = now - timedelta(seconds=settings.HIK_RECONCILE_GRACE_SECONDS)
+    default_begin = now - timedelta(seconds=settings.HIK_RECONCILE_LOOKBACK_SECONDS)
+    mark = _catchup_watermark(db, direction)
+    if mark is None:
+        return (default_begin, end)
+    floor = now - timedelta(hours=settings.HIK_CATCHUP_MAX_HOURS)
+    if mark < floor:
+        logger.warning(
+            "[Hik][reconcile] %s: last consumed pass %s predates the %sh cap — "
+            "sweeping back only to %s. Older gaps need "
+            "scripts/setup/backfill_missed_exits.py.",
+            direction, mark, settings.HIK_CATCHUP_MAX_HOURS, floor,
+        )
+    return (min(default_begin, max(mark, floor)), end)
+
+
+def _gate_event_already_logged(
+    db: Session, plate: str, gate: str, when: datetime, window: timedelta
+) -> bool:
+    """True when an EntryExitLog for this plate/gate sits within ±window — i.e.
+    the edge pipeline already noticed this pass.
+
+    A truncated read of the SAME car counts as already logged. The camera files
+    both its full and its partial read with HikCentral, but the burst now merges
+    them and writes ONE entry under the fuller plate — leaving the partial record
+    unconsumed. Matching on exact plate alone, this sweep would read that
+    leftover as a car nobody logged and open a phantom session for it, which is
+    the overstay-generating failure the crossing gate exists to prevent.
+
+    Deliberately bidirectional. Two cars whose plates truncate to each other
+    passing inside the match window is vanishingly rare, and if it ever happens,
+    missing one entry (the car is still caught as an unmatched exit) is cheaper
+    than an open session that never closes.
+    """
+    logged_plates = (
+        db.query(EntryExitLog.plate_number)
+        .filter(
+            EntryExitLog.gate == gate,
+            EntryExitLog.event_time >= when - window,
+            EntryExitLog.event_time <= when + window,
+        )
+        .all()
+    )
+    return any(same_vehicle_plate(plate, row[0]) for row in logged_plates)
+
+
+async def _reconcile_missed_entries(
+    db: Session, window: Optional[tuple[datetime, datetime]] = None
+) -> None:
+    begin, end = window or _reconcile_window(db, hikcentral.DIRECTION_ENTRY)
+    # One more chance to make any unverified refusal durable BEFORE we consider
+    # re-opening anything — a tombstone written now removes the record below.
+    await _retry_unverified_refusals(db)
+    records = await hikcentral.list_unconsumed_records(
+        settings.hik_entry_resource_ids(), begin, end, db
+    )
+    match_s = timedelta(seconds=settings.HIK_RECONCILE_MATCH_SECONDS)
+    # Oldest-first. HikCentral returns newest-first (orderType=1) and each
+    # processed record consumes its GUID, which is what the watermark reads. If
+    # a record mid-way through raises, consuming the NEWEST first would leave
+    # the watermark ahead of older unprocessed records in the same chunk — no
+    # later sweep looks behind the watermark, so they would be lost silently.
+    consumed = 0
+    for rec in sorted(records, key=lambda r: hikcentral.polled_outcome(r).pass_time_local):
+        outcome = hikcentral.polled_outcome(rec)
+        pass_local = outcome.pass_time_local
+        if _gate_event_already_logged(db, rec.canonical_plate, "entry", pass_local, match_s):
+            # Nothing to repair — but consume it, or the watermark never advances
+            # on a healthy day and the next sweep re-walks this same span.
+            if hikcentral.consume_already_logged(db, rec, hikcentral.DIRECTION_ENTRY):
+                db.commit()
+                consumed += 1
+            continue
+        if _matches_unverified_refusal(rec.canonical_plate, pass_local, match_s):
+            # The gate refused this pass; we just could not prove it to
+            # HikCentral. Opening it would undo a decision the crossing gate
+            # made on real evidence, which is exactly the overstay-generating
+            # failure the tombstone exists to prevent. Leave the GUID
+            # unconsumed so a later sweep can still tombstone it properly.
+            logger.warning(
+                "[Hik][reconcile] SKIPPING plate=%s guid=%s at %s — the gate "
+                "refused this pass and the tombstone is still unverified",
+                rec.canonical_plate, rec.guid, pass_local,
+            )
+            continue
+        if not hikcentral.is_authoritative():
+            logger.warning(
+                "[Hik][reconcile] shadow: MISSED entry plate=%s guid=%s at %s "
+                "(would open a session)",
+                rec.canonical_plate, rec.guid, pass_local,
+            )
+            continue
+        if not settings.HIK_RECONCILE_OPEN_ENTRIES:
+            # No CAM-23/03 crossing backs this pass, and at this site a pass with
+            # no edge trace was traffic driving by (29 of 29 on 2026-09-15). Left
+            # unconsumed, exactly like shadow. See HIK_RECONCILE_OPEN_ENTRIES.
+            logger.warning(
+                "[Hik][reconcile] NOT opening plate=%s guid=%s at %s — no ramp "
+                "crossing backs it and HIK_RECONCILE_OPEN_ENTRIES is off",
+                rec.canonical_plate, rec.guid, pass_local,
+            )
+            continue
+        if settings.HIK_RECONCILE_REQUIRE_IMAGE and not outcome.vehicle_image_url:
+            # No image means no appearance evidence, and the plate is whatever
+            # HikCentral read. Neither the plate path nor the Re-ID fallback can
+            # ever close the resulting session, so opening it would create a
+            # permanent overstay rather than recover an entry. Left unconsumed
+            # on purpose: a later sweep may find the same pass with imagery.
+            logger.warning(
+                "[Hik][reconcile] NOT opening plate=%s guid=%s at %s — the "
+                "record carries no vehicle image, so the session could never "
+                "be closed. Review it by hand.",
+                rec.canonical_plate, rec.guid, pass_local,
+            )
+            continue
+        # Reuse the exact recovery flush: dedup, vehicle, session, image,
+        # hik_validation (which consumes the GUID) and the VA forward.
+        await _flush_entry_burst(
+            db,
+            _recovered_burst(
+                outcome, {"ts": pass_local, "source": "HIK-RECON", "snapshot": None}
+            ),
+        )
+        db.commit()  # release locks before the next record's network await
+        logger.warning(
+            "[Hik][reconcile] OPENED missed entry plate=%s guid=%s at %s",
+            rec.canonical_plate, rec.guid, pass_local,
+        )
+    if consumed:
+        logger.info(
+            "[Hik][reconcile] entry: %d pass(es) already logged by the edge — "
+            "consumed, watermark advanced to %s",
+            consumed, _catchup_watermark(db, hikcentral.DIRECTION_ENTRY),
+        )
+
+
+async def _reconcile_missed_exits(
+    db: Session, window: Optional[tuple[datetime, datetime]] = None
+) -> None:
+    """Close sessions for HikCentral exits the edge pipeline never saw.
+
+    `window` overrides the rolling [lookback, grace] window. The live sweep
+    always passes None; only the one-off backfill after an ingest outage names
+    an explicit range, because HIK_RECONCILE_LOOKBACK_SECONDS is deliberately
+    short and can never reach back across hours of downtime.
+    """
+    begin, end = window or _reconcile_window(db, hikcentral.DIRECTION_EXIT)
+    records = await hikcentral.list_unconsumed_records(
+        settings.hik_exit_resource_ids(), begin, end, db
+    )
+    match_s = timedelta(seconds=settings.HIK_RECONCILE_MATCH_SECONDS)
+    # Oldest-first. HikCentral returns newest-first (orderType=1) and each
+    # processed record consumes its GUID, which is what the watermark reads. If
+    # a record mid-way through raises, consuming the NEWEST first would leave
+    # the watermark ahead of older unprocessed records in the same chunk — no
+    # later sweep looks behind the watermark, so they would be lost silently.
+    consumed = 0
+    for rec in sorted(records, key=lambda r: hikcentral.polled_outcome(r).pass_time_local):
+        outcome = hikcentral.polled_outcome(rec)
+        pass_local = outcome.pass_time_local
+        if _gate_event_already_logged(db, rec.canonical_plate, "exit", pass_local, match_s):
+            # Nothing to repair — but consume it, or the watermark never advances
+            # on a healthy day and the next sweep re-walks this same span.
+            if hikcentral.consume_already_logged(db, rec, hikcentral.DIRECTION_EXIT):
+                db.commit()
+                consumed += 1
+            continue
+        if not hikcentral.is_authoritative():
+            logger.warning(
+                "[Hik][reconcile] shadow: MISSED exit plate=%s guid=%s at %s "
+                "(would close the open session)",
+                rec.canonical_plate, rec.guid, pass_local,
+            )
+            continue
+        images = await hikcentral.download_hik_images(outcome)
+        # The same pipeline the edge exit runs. Until this, the sweep stopped at
+        # `close_session`: an exit recovered here for a car whose ENTRY plate was
+        # misread matched nothing, closed nothing, and consumed its GUID on the
+        # way out, so no later sweep could retry it. That is SNA-226.
+        vehicle = vehicle_service.ensure_unregistered_vehicle(db, rec.canonical_plate)
+        result = await exit_pipeline.resolve(
+            db,
+            exit_pipeline.from_polled_outcome(outcome, images.vehicle_image_path),
+            vehicle=vehicle,
+            exit_image_path=images.vehicle_image_path,
+        )
+        session = result.session
+        # Before writing an audit row, ask whether the edge already wrote one for
+        # THIS pass under a different plate — the misread this record corrects.
+        # `_gate_event_already_logged` above cannot see that: it ties truncations
+        # together, not two genuinely different strings, so a corrected plate
+        # looked like a car nobody logged and earned one car a second exit row.
+        late_row = exit_pipeline.exit_row_for_late_pass(db, pass_local, match_s)
+        if late_row is not None:
+            exit_pipeline.adopt_late_plate(db, late_row, rec.canonical_plate)
+            _pair_audit_rows(db, late_row, session)
+        else:
+            _write_reconciled_exit_log(
+                db, rec.canonical_plate, pass_local, images.vehicle_image_path,
+                session=session,
+            )
+        # Consume the GUID (unique) so a later sweep never redoes this exit.
+        hikcentral.record_hik_validation(
+            db,
+            outcome=outcome,
+            direction=hikcentral.DIRECTION_EXIT,
+            images=images,
+            session_id=session.id if session else None,
+            entry_exit_log_id=late_row.id if late_row is not None else None,
+        )
+        db.commit()
+        await plate_correction_service.notify_va(result.correction)
+        logger.warning(
+            "[Hik][reconcile] %s plate=%s guid=%s at %s",
+            "CORRECTED the edge exit row" if late_row is not None
+            else "CLOSED missed exit" if session
+            else "logged exit (no open session)",
+            rec.canonical_plate, rec.guid, pass_local,
+        )
+    if consumed:
+        logger.info(
+            "[Hik][reconcile] exit: %d pass(es) already logged by the edge — "
+            "consumed, watermark advanced to %s",
+            consumed, _catchup_watermark(db, hikcentral.DIRECTION_EXIT),
+        )
+
+
+def _pair_audit_rows(
+    db: Session, exit_log: EntryExitLog, session: Optional[ParkingSession]
+) -> None:
+    """Link an exit row to the entry row of the stay it actually closed.
+
+    No-op when nothing closed, or when the pairing already happened on the exact
+    plate. Looks the entry row up through the session so a corrected plate finds
+    it — by this point `apply_correction` has already moved both onto the real
+    plate, so they agree.
+    """
+    if session is None or exit_log.matched_entry_id is not None:
+        return
+    entry_log = parking_session_service.entry_log_for(db, session)
+    if entry_log is None or entry_log.id == exit_log.id:
+        return
+    if exit_log.id is None:
+        # The edge path does not add its row until the very end, so flushing
+        # alone would not give it an id — and an id is the whole point: the
+        # pairing is two-way, and the entry row needs this row's key.
+        db.add(exit_log)
+        db.flush()
+    exit_log.matched_entry_id = entry_log.id
+    entry_log.matched_entry_id = exit_log.id
+    if exit_log.parking_duration is None:
+        exit_log.parking_duration = max(
+            0, int((exit_log.event_time - session.entry_time).total_seconds())
+        )
+
+
+def _write_reconciled_exit_log(
+    db: Session,
+    plate: str,
+    when: datetime,
+    snapshot: Optional[str],
+    session: Optional[ParkingSession] = None,
+) -> None:
+    """Write the audit exit row for a reconciled exit, matched to its open entry
+    with a computed duration — the same shape the live exit path produces.
+
+    When the pipeline resolved a stay, that stay decides the pairing: its plate
+    may differ from this pass's, and the session is the only thing that knows
+    which entry this exit actually ends. The plate-based query below is the
+    fallback for a recovered exit that closed nothing.
+    """
+    vehicle = vehicle_service.ensure_unregistered_vehicle(db, plate)
+    log_entry = EntryExitLog(
+        plate_number=plate,
+        vehicle_id=vehicle.id if vehicle else None,
+        vehicle_type=vehicle.vehicle_type if vehicle else "unknown",
+        gate="exit",
+        camera_id="CAM-EXIT",
+        event_time=when,
+        snapshot_path=snapshot,
+        created_at=facility_now_naive(),
+    )
+    matching_entry = (
+        db.query(EntryExitLog)
+        .filter(
+            EntryExitLog.plate_number == plate,
+            EntryExitLog.gate == "entry",
+            EntryExitLog.matched_entry_id.is_(None),
+            EntryExitLog.event_time <= when,
+        )
+        .order_by(EntryExitLog.event_time.desc())
+        .first()
+    )
+    db.add(log_entry)
+    db.flush()
+    if session is not None:
+        _pair_audit_rows(db, log_entry, session)
+        return
+    if matching_entry is not None:
+        entry_time = matching_entry.event_time
+        if entry_time.tzinfo is not None:
+            entry_time = entry_time.astimezone(facility_tz()).replace(tzinfo=None)
+        log_entry.parking_duration = max(0, int((when - entry_time).total_seconds()))
+        log_entry.matched_entry_id = matching_entry.id
+        matching_entry.matched_entry_id = log_entry.id
+
+
+
+def _reconcile_stale_stays_on_reentry(
+    db: Session,
+    plate: str,
+    event_time: datetime,
+) -> None:
+    """Close stays proven obsolete by this confirmed inward crossing.
+
+    The Entry V2 twin of this lives in
+    ``entry_confirmation_service._reconcile_older_open_sessions``, but that path
+    only executes under ``ENTRY_V2_MODE=authoritative`` — shadow rewrites every
+    CONFIRMED decision to ABSTAINED and PMS returns before touching the DB. The
+    legacy burst-flush path is what actually opens stays in production, so the
+    reconciliation has to exist here too.
+
+    Never raises: a stale stay that cannot be closed must not cost the caller
+    its entry. The worst case is the status quo — one stay left open.
+    """
+    if not settings.ENTRY_REENTRY_RECONCILE_ENABLED:
+        return
+
+    # DB columns are naive facility-local (see parking_session_service._naive);
+    # normalize the same way before comparing against session.entry_time.
+    boundary = event_time
+    if boundary.tzinfo is not None:
+        boundary = boundary.astimezone(facility_tz()).replace(tzinfo=None)
+    min_age = timedelta(
+        seconds=float(settings.ENTRY_REENTRY_RECONCILE_MIN_AGE_SECONDS)
+    )
+    try:
+        stale = [
+            session
+            for session in parking_session_service.get_open_sessions(db, plate)
+            if session.entry_time < boundary - min_age
+        ]
+    except Exception:
+        logger.exception(
+            "[UC1] Could not read open stays for plate=%s — entry proceeds", plate
+        )
+        return
+
+    for session in stale:
+        try:
+            parking_session_service.reconcile_open_session_for_reentry(
+                db, session, boundary
+            )
+            logger.warning(
+                "[UC1] Re-entry closed stale stay id=%s plate=%s open since %s "
+                "(%s) — its exit was never read",
+                session.id,
+                plate,
+                session.entry_time,
+                boundary - session.entry_time,
+            )
+        except Exception:
+            logger.exception(
+                "[UC1] Could not reconcile stale stay id=%s plate=%s — leaving "
+                "it open",
+                session.id,
+                plate,
+            )
+    if stale:
+        db.flush()
 
 
 async def _flush_entry_burst(db: Session, buf: dict) -> None:
@@ -349,11 +1488,7 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
     if not reads:
         return
 
-    # Winning read = last of the burst: highest picNum, then latest arrival.
-    winner = max(
-        reads,
-        key=lambda r: (r["pic_num"] if r["pic_num"] is not None else -1, r["event_time"]),
-    )
+    winner = _winning_read(reads)
     plate = winner["plate"]
     event_time = winner["event_time"]
     snapshot_path = winner["snapshot_path"]
@@ -366,6 +1501,25 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
         f"pic={winner['pic_num']} conf={confidence} reads={len(reads)} "
         f"discarded={discarded}"
     )
+
+    # ── HikCentral validation (Case A) ───────────────────────────────────
+    # CAM-23 has already confirmed the crossing by the time a burst flushes, so
+    # this is the one place a car is validated — exactly one lookup per
+    # candidate. Deliberately ABOVE every DB access: it is network I/O, and the
+    # deadlock documented further down is what happens when an await separates a
+    # write from its commit.
+    #
+    # A burst recovered from HikCentral (Case B) arrives with its record already
+    # resolved; reusing it keeps the one-lookup rule.
+    hik_outcome = buf.get("hik_outcome")
+    if hik_outcome is None:
+        hik_outcome = await hikcentral.validate_entry_plate(plate, event_time, db)
+    if hik_outcome.plate and hik_outcome.plate != plate:
+        logger.warning(
+            "[UC1] plate replaced by HikCentral: %s -> %s (guid=%s)",
+            plate, hik_outcome.plate, hik_outcome.guid,
+        )
+        plate = hik_outcome.plate
 
     # dedup / anti-bounce suppress only the PMS-side occupancy record (the
     # EntryExitLog row, the open session, the alert). They must NOT suppress the
@@ -439,6 +1593,14 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
             "sent_sources": set(confirm_snapshots.keys()),
         })
 
+    # HikCentral imagery is fetched only now that suppression has been decided,
+    # so a duplicate or anti-bounced burst — which will never become a session —
+    # never costs a download. Still above the DB writes, so no write lock is held
+    # across this network await (see the deadlock note below).
+    hik_images = HikImages()
+    if not suppress_occupancy:
+        hik_images = await hikcentral.download_hik_images(hik_outcome)
+
     # ── DB WRITES — must complete and COMMIT before any network await below.
     #
     # NEVER hold an uncommitted write across an `await` that does I/O. The DB
@@ -453,6 +1615,20 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
     # 2026-07-12 (the PMS being down stretched the forward long enough to collide
     # with the next event) and made entry_exit_log unreadable to every client.
     # Keep every network await BELOW the commit.
+    # A recovered entry has no gate image of its own (_recovered_entry_buffer
+    # sets snapshot_path=None outright — HikCentral proved the crossing, the
+    # gate camera never fired), and an Entry-V2-style flush may carry none
+    # either — fall back to HikCentral's vehicle shot so the stay is not
+    # imageless on the dashboard.
+    #
+    # Computed HERE, above the occupancy branch, because the UC4 alert below
+    # needs it too. It previously lived inside that branch and the alert used
+    # the raw `snapshot_path`, so every recovered entry produced an
+    # unknown_vehicle alert with a NULL snapshot while the entry_exit_log row
+    # for the same car carried the Hik image — operators got an evidence-less
+    # alert for a car we did in fact have a picture of.
+    entry_snapshot = snapshot_path or hik_images.vehicle_image_path
+
     vehicle = None
     if not suppress_occupancy:
         # UC4: resolve the vehicle for the WINNING plate only — so the only
@@ -467,22 +1643,38 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
             gate="entry",
             camera_id=camera_id,
             event_time=event_time,
-            snapshot_path=snapshot_path,
+            snapshot_path=entry_snapshot,
             plate_confidence=confidence,
             created_at=facility_now_naive(),
         )
         db.add(log_entry)
-        parking_session_service.open_session(
+        # A confirmed inward crossing PROVES any older open stay for this plate
+        # is obsolete — the car cannot be inside twice — so close it here,
+        # before open_session gets a chance to reuse it. Without this the stay
+        # from the missed exit absorbs the new arrival and the car reads as
+        # having never left (KXR-2538, 2026-08-23 06:12, stay open since 08-20).
+        _reconcile_stale_stays_on_reentry(db, plate, event_time)
+        session = parking_session_service.open_session(
             db,
             plate_number=plate,
             event_time=event_time,
             camera_id=camera_id,
-            snapshot_path=snapshot_path,
+            snapshot_path=entry_snapshot,
             vehicle=vehicle,
+        )
+        # open_session() flushes, so both ids are populated by now.
+        hikcentral.record_hik_validation(
+            db,
+            outcome=hik_outcome,
+            direction=hikcentral.DIRECTION_ENTRY,
+            images=hik_images,
+            session_id=session.id if session else None,
+            entry_exit_log_id=log_entry.id,
         )
         logger.info(
             f"[UC1] Entry CONFIRMED (burst flush): plate={plate} "
-            f"source={buf.get('confirm_source') or 'idle/boundary'}"
+            f"source={buf.get('confirm_source') or 'idle/boundary'} "
+            f"plate_source={hik_outcome.plate_source}"
         )
     else:
         logger.info(
@@ -507,7 +1699,7 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
             camera_id=camera_id,
             zone_id="entry",
             plate_number=plate,
-            snapshot_path=snapshot_path,
+            snapshot_path=entry_snapshot,
             triggered_at=event_time,
         )
     else:
@@ -520,7 +1712,7 @@ async def _flush_entry_burst(db: Session, buf: dict) -> None:
             event_type="AccessControllerEvent",
             description=f"Unregistered vehicle at entry gate: plate {plate}",
             plate_number=plate,
-            snapshot_path=snapshot_path,
+            snapshot_path=entry_snapshot,
         )
 
     # Release the write locks BEFORE any network I/O (see the note above). The
@@ -588,9 +1780,15 @@ async def drain_background_forwards() -> None:
     """Wait for any detached confirmation forwards to finish.
 
     Called on shutdown so a clean stop doesn't drop an in-flight image, and by
-    tests that need to observe the result of a detached forward."""
+    tests that need to observe the result of a detached forward.
+
+    Late-plate rechecks are CANCELLED rather than awaited: they sit in a
+    multi-second sleep by design, and a clean stop must not block on one. The
+    reconcile sweep re-finds anything dropped here, which is the whole reason it
+    can now adopt a late plate onto an existing exit row."""
     if _background_forwards:
         await asyncio.gather(*list(_background_forwards), return_exceptions=True)
+    await exit_pipeline.drain_late_rechecks(cancel=True)
 
 
 async def _forward_confirm_snapshot(plate: str, source_cam: str,
@@ -612,7 +1810,10 @@ async def _forward_confirm_snapshot(plate: str, source_cam: str,
         )
 
 
-async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
+async def handle_anpr_event(
+    event: ParsedCameraEvent,
+    db: Session,
+) -> Optional[AnprPostCommitForward]:
     """
     Process ANPR events to log vehicle movement, identify owners,
     and calculate parking duration for exits.
@@ -634,13 +1835,31 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         logger.debug(f"[Phase2] ANPR event with no plate from {event.camera_id} - skipped")
         return
 
+    if (
+        gate == "exit"
+        and settings.ENTRY_V2_MODE == "authoritative"
+        and event.trigger_time_source.startswith("pms_receive_")
+    ):
+        raise SourceTimestampUnavailable(
+            "exit ANPR requires a valid camera source timestamp"
+        )
+
     # Camera sends tz-aware timestamps like `2026-05-07T12:14:51+03:00`. The
     # DB convention (since 2026-05-07) is NAIVE FACILITY-LOCAL — the wall
     # clock the operator sees, NOT UTC. Convert to facility tz first, then
     # strip tzinfo, so 12:14:51+03:00 stays 12:14:51 in the column.
-    event_time = event.trigger_time or facility_now_naive()
-    if event_time.tzinfo is not None:
-        event_time = event_time.astimezone(facility_tz()).replace(tzinfo=None)
+    source_captured_at = event.trigger_time
+    if source_captured_at is None:
+        source_captured_at = facility_now_naive().replace(tzinfo=facility_tz())
+    elif (
+        source_captured_at.tzinfo is None
+        or source_captured_at.utcoffset() is None
+    ):
+        # Hikvision timestamps are normally offset-aware.  A legacy/parser test
+        # may still supply facility wall-clock time without tzinfo; its only
+        # unambiguous interpretation in PMS is the configured facility zone.
+        source_captured_at = source_captured_at.replace(tzinfo=facility_tz())
+    event_time = source_captured_at.astimezone(facility_tz()).replace(tzinfo=None)
 
     # ── ENTRY: buffer the multi-read burst — the LAST read wins. The DB write,
     # PMS forward (port 8000) and vehicle resolution all happen once, at flush
@@ -648,30 +1867,60 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
     if gate == "entry":
         await _buffer_entry_read(event, plate, event_time)
         return
+    # ── The exit plate is checked by HikCentral HERE, before anything keys off
+    # it. Dedup, the audit row, the session close, the alert and the VA forward
+    # then all agree on one string — `plate` is that string from this line on.
+    # Off/shadow/unreachable/no exit indexCode all return the edge plate, so this
+    # is a no-op wherever the layer is not authoritative.
+    exit_event = await exit_pipeline.from_camera_event(event, plate, event_time, db)
+    plate = exit_event.plate
+    exit_snapshot = exit_event.snapshot_path
+    # Build the VA notification before deduplication. If PMS committed the first
+    # delivery and then crashed before the post-commit forward could run or spool,
+    # the camera's duplicate webhook is the only recovery signal. Returning this
+    # same idempotent forward for a duplicate heals that commit-to-forward window
+    # without repeating any PMS row/session/alert mutation.
+    exit_forward = AnprPostCommitForward(
+        plate=plate,
+        direction=gate,
+        image_path=event.local_snapshot_path or event.snapshot_path,
+        captured_at=source_captured_at,
+    )
 
     # ── EXIT: a single read is reliable — log immediately. ──────────────────
+    # Only authoritative V2 has a second writer (the confirmation callback).
+    # The transaction-owned lock remains held through the router's commit, and
+    # the callback acquires the exact same normalized-plate resource. Whichever
+    # transaction wins is therefore fully visible before the other decides
+    # whether an open stay may exist. Off/shadow keep their legacy exit path and
+    # cannot acquire/fail a lock that they do not need.
+    if settings.ENTRY_V2_MODE == "authoritative":
+        acquire_plate_transaction_lock(db, plate)
+    # Keyed on the POST-HikCentral plate. The camera files both readings of a car
+    # it read twice, and an exact-plate dedup on the edge string sees two
+    # different plates and processes both — `AAA-2538` did exactly that on 8/11
+    # and 8/12. Corrected first, the two collapse to one.
     logger.debug(f"[UC1] Checking dedup for plate {plate}...")
     dedup_window = event_time - timedelta(seconds=30)
+    dedup_ceiling = event_time + timedelta(seconds=30)
     recent = (
         db.query(EntryExitLog)
         .filter(
             EntryExitLog.plate_number == plate,
             EntryExitLog.gate == gate,
             EntryExitLog.event_time >= dedup_window,
+            EntryExitLog.event_time <= dedup_ceiling,
         )
         .first()
     )
     if recent:
-        logger.debug(f"[UC1] Duplicate suppressed for plate={plate} gate={gate}")
-        return
-
-    # Forward plate + snapshot to PMS tracking API (fire-and-forget)
-    try:
-        await core_backend_client.notify_pms_anpr(
-            plate, gate, image_path=event.local_snapshot_path or event.snapshot_path,
+        logger.debug(
+            "[UC1] Duplicate PMS exit mutation suppressed for plate=%s gate=%s; "
+            "VA exit notification will be replayed",
+            plate,
+            gate,
         )
-    except Exception as e:
-        logger.warning(f"[UC1] PMS API forwarding failed for plate={plate}: {e}")
+        return exit_forward
 
     # UC4: Resolve vehicle identity via vehicle_service
     logger.debug(f"[UC4] Looking up vehicle for plate {plate}...")
@@ -687,7 +1936,7 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         gate=gate,
         camera_id=event.camera_id,
         event_time=event_time,
-        snapshot_path=event.snapshot_path,
+        snapshot_path=exit_snapshot,
         created_at=facility_now_naive(),
     )
 
@@ -697,7 +1946,8 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
         .filter(
             EntryExitLog.plate_number == plate,
             EntryExitLog.gate == "entry",
-            EntryExitLog.matched_entry_id.is_(None)
+            EntryExitLog.matched_entry_id.is_(None),
+            EntryExitLog.event_time <= event_time,
         )
         .order_by(EntryExitLog.event_time.desc())
         .first()
@@ -722,12 +1972,34 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
     else:
         logger.warning(f"[UC2] No matching entry found for vehicle {plate}")
 
-    parking_session_service.close_session(
+    # Close the stay — exact plate first, then the matcher for a stay standing
+    # under a misread entry. Same two steps the reconcile sweep now runs.
+    exit_outcome = await exit_pipeline.resolve(
         db,
-        plate_number=plate,
-        event_time=event_time,
+        exit_event,
+        vehicle=vehicle,
+        exit_image_path=event.local_snapshot_path or event.snapshot_path,
+        exit_log=log_entry,
+    )
+    closed = exit_outcome.session
+    # A stay closed under a DIFFERENT plate has no entry row this exit could
+    # match, so UC2's duration query above found nothing; take it from the stay.
+    if exit_outcome.corrected and log_entry.parking_duration is None:
+        duration = int((event_time - closed.entry_time).total_seconds())
+        log_entry.parking_duration = max(0, duration)
+    # Pair the audit rows from the RESOLVED session. UC2 above searched by the
+    # EXIT's plate, which is precisely the string that does not match when the
+    # entry was misread — so every non-exact close left `matched_entry_id` NULL
+    # and the trail could not say which entry a given exit ended.
+    _pair_audit_rows(db, log_entry, closed)
+
+    from app.services.occupancy_service import (
+        reconcile_zone_counts_from_open_sessions,
+    )
+
+    reconcile_zone_counts_from_open_sessions(
+        db,
         camera_id=event.camera_id,
-        snapshot_path=event.snapshot_path,
     )
 
     # UC4
@@ -759,3 +2031,35 @@ async def handle_anpr_event(event: ParsedCameraEvent, db: Session):
 
     if log_entry not in db.new:
         db.add(log_entry)
+
+    if log_entry.id is None:
+        db.flush()
+
+    # HikCentral held nothing for this pass when we asked, 2-3s after the car
+    # passed. Ask once more after it has had time to ingest — detached, so the
+    # gate is never made to wait for a second opinion.
+    # The ledger row for a plate HikCentral corrected at the gate. Written here
+    # rather than in `from_camera_event` because it needs the audit row's id, and
+    # that only exists once the row is flushed. Consuming the GUID also stops the
+    # reconcile sweep re-examining a pass the edge already handled.
+    if exit_event.corrected_by_hik:
+        hikcentral.record_hik_validation(
+            db,
+            outcome=exit_event.hik_outcome,
+            direction=hikcentral.DIRECTION_EXIT,
+            session_id=closed.id if closed is not None else None,
+            entry_exit_log_id=log_entry.id,
+        )
+
+    exit_pipeline.schedule_late_plate_recheck(exit_event, log_entry.id)
+
+    # VA is told about a correction only once it is durable. The router commits
+    # immediately after this returns, and the rename is idempotent, so a detached
+    # task is safe — and if it loses the race the exit sweep re-applies it.
+    if exit_outcome.correction is not None:
+        exit_pipeline.schedule_va_correction_notify(exit_outcome.correction)
+
+    # Network delivery is intentionally deferred until the router commits.
+    # SQL Server transaction-owned application locks are released by that
+    # commit, so a slow VA call cannot block a confirmation for this plate.
+    return exit_forward

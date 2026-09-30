@@ -2,17 +2,23 @@
 Service helpers for the parking_sessions read model.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
 from app.config import settings, facility_now_naive, facility_tz
 from app.models.parking_session import ParkingSession
+from app.models.entry_exit_log import EntryExitLog
 from app.models.vehicle import Vehicle
+from app.services.event_parser import plate_parts
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Existing column marker: this is an inferred upper-bound closure caused by a
+# strictly validated re-entry, not a physical exit-camera observation.
+REENTRY_RECONCILIATION_CAMERA_ID = "SYSTEM-REENTRY-RECONCILE"
 
 
 def _naive(dt: Optional[datetime]) -> datetime:
@@ -56,6 +62,187 @@ def get_latest_open_session(db: Session, plate_number: str) -> Optional[ParkingS
     )
 
 
+def get_open_sessions(db: Session, plate_number: str) -> list[ParkingSession]:
+    """Return every open stay for repair under the caller's plate lock."""
+    return (
+        db.query(ParkingSession)
+        .filter(
+            ParkingSession.plate_number == plate_number,
+            ParkingSession.status == "open",
+        )
+        .order_by(ParkingSession.entry_time.desc(), ParkingSession.id.desc())
+        .all()
+    )
+
+
+def open_stays(db: Session, exit_time: datetime) -> list[ParkingSession]:
+    """Every open stay this exit could belong to. ONE query, no age filter.
+
+    `close_session` and `exit_match_service.find_candidates` used to ask
+    different questions — the first unbounded, the second bounded to
+    `EXIT_MATCH_MAX_AGE_HOURS=72` — so the two halves of one decision disagreed
+    about which stays exist. `ABR-8000` (98h) and `KBD-6795` (120h) were visible
+    to the close and invisible to the matcher.
+
+    The only bound left is physical: a car cannot leave before it arrived. Even
+    that carries a tolerance, because the entry time comes from the entry
+    camera's clock and the exit time from the exit camera's, and two Hikvision
+    devices drift apart by seconds. Without it a car that leaves within the drift
+    of arriving finds nothing and strands its own stay.
+
+    35 slots, so this is tens of rows.
+    """
+    skew = timedelta(seconds=settings.EXIT_CLOCK_SKEW_SECONDS)
+    return (
+        db.query(ParkingSession)
+        .filter(
+            ParkingSession.status == "open",
+            ParkingSession.entry_time <= _naive(exit_time) + skew,
+        )
+        .order_by(ParkingSession.entry_time.desc(), ParkingSession.id.desc())
+        .all()
+    )
+
+
+def entry_log_for(db: Session, session: ParkingSession) -> Optional[EntryExitLog]:
+    """The entry audit row that opened this stay.
+
+    Looked up from the RESOLVED session rather than from the exit's own plate.
+    Those differ whenever the entry was misread, which is exactly when the
+    pairing matters: `handle_anpr_event` searched by the exit plate, found
+    nothing, and left `matched_entry_id` NULL on every non-exact close — so the
+    audit trail could not say which entry a given exit ended.
+
+    Flushes first for the same reason `_claim` does: the session is
+    `autoflush=False`, and by this point `apply_correction` has renamed the entry
+    row in memory but not in the database. Querying without the flush searches
+    for the corrected plate among rows that still hold the misread.
+    """
+    db.flush()
+    return (
+        db.query(EntryExitLog)
+        .filter(
+            EntryExitLog.plate_number == session.plate_number,
+            EntryExitLog.gate == "entry",
+            EntryExitLog.event_time <= _naive(session.exit_time),
+        )
+        .order_by(EntryExitLog.event_time.desc())
+        .first()
+    )
+
+
+def _claim(db: Session, session: ParkingSession, expect_status: str) -> bool:
+    """Take exclusive ownership of a close, or report that someone else has it.
+
+    Two writers can reach the same stay: the edge exit webhook and the HikCentral
+    reconcile sweep, which since Stage 1 both run the full pipeline. A stale read
+    would let the second one close an already-closed stay a second time, moving
+    its exit_time and duration to whichever finished last.
+
+    The guard is the UPDATE itself — `WHERE id = ? AND status = ?` — so the
+    database decides, not a read this transaction did earlier. rowcount 0 means
+    the row is no longer in the state we found it in, and the caller must treat
+    that as "not mine to close".
+
+    The flush is load-bearing. Both `SessionLocal` and the test sessionmaker are
+    `autoflush=False`, so an UPDATE issued while this transaction holds an
+    unflushed close would be matched against the row's PRE-close state and
+    succeed — the guard would pass precisely in the case it exists to catch.
+    """
+    db.flush()
+    claimed = (
+        db.query(ParkingSession)
+        .filter(
+            ParkingSession.id == session.id,
+            ParkingSession.status == expect_status,
+        )
+        .update(
+            {ParkingSession.updated_at: facility_now_naive()},
+            synchronize_session=False,
+        )
+    )
+    if not claimed:
+        logger.warning(
+            "[ParkingSession] refused to close id=%s plate=%s — it is no longer "
+            "%r (another writer got there first)",
+            session.id, session.plate_number, expect_status,
+        )
+    return bool(claimed)
+
+
+def _close_session_record(
+    db: Session,
+    session: ParkingSession,
+    *,
+    exit_time: datetime,
+    camera_id: str,
+    snapshot_path: Optional[str],
+    clear_vehicle_location: bool,
+    expect_status: str = "open",
+) -> Optional[ParkingSession]:
+    if not _claim(db, session, expect_status):
+        return None
+    previous_exit_time = session.exit_time
+    previous_exit_camera = session.exit_camera_id
+    session.exit_time = exit_time
+    session.exit_camera_id = camera_id
+    session.exit_snapshot_path = snapshot_path
+    session.duration_seconds = max(
+        0,
+        int((exit_time - session.entry_time).total_seconds()),
+    )
+    session.status = "closed"
+    session.updated_at = facility_now_naive()
+
+    # When a delayed real exit corrects an inferred re-entry boundary, replace
+    # the inferred slot-left timestamp too. Otherwise preserve an independently
+    # observed unbind time.
+    inferred_slot_exit = (
+        previous_exit_camera == REENTRY_RECONCILIATION_CAMERA_ID
+        and session.slot_left_at == previous_exit_time
+    )
+    if session.slot_id is not None and (
+        session.slot_left_at is None or inferred_slot_exit
+    ):
+        session.slot_left_at = exit_time
+
+    if clear_vehicle_location:
+        vehicle = _resolve_vehicle(db, session)
+        if vehicle is not None:
+            vehicle.current_slot_id = None
+            vehicle.floor = None
+            vehicle.floor_id = None
+
+    return session
+
+
+def reconcile_open_session_for_reentry(
+    db: Session,
+    session: ParkingSession,
+    reentry_time: datetime,
+) -> ParkingSession:
+    """Close one older open stay at a validated re-entry upper bound."""
+    boundary = _naive(reentry_time)
+    if session.status != "open" or session.entry_time >= boundary:
+        raise ValueError("only an older open session can be reconciled")
+
+    logger.warning(
+        "[ParkingSession] Reconciling stale open stay id=%s plate=%s at "
+        "validated re-entry %s",
+        session.id,
+        session.plate_number,
+        boundary,
+    )
+    return _close_session_record(
+        db,
+        session,
+        exit_time=boundary,
+        camera_id=REENTRY_RECONCILIATION_CAMERA_ID,
+        snapshot_path=None,
+        clear_vehicle_location=True,
+    )
+
+
 def open_session(
     db: Session,
     plate_number: str,
@@ -96,35 +283,123 @@ def close_session(
     camera_id: str,
     snapshot_path: Optional[str],
 ) -> Optional[ParkingSession]:
-    session = get_latest_open_session(db, plate_number)
-    if not session:
-        logger.warning("[ParkingSession] No open session found for plate=%s", plate_number)
-        return None
-
     exit_time = _naive(event_time)
-    session.exit_time = exit_time
-    session.exit_camera_id = camera_id
-    session.exit_snapshot_path = snapshot_path
-    session.duration_seconds = max(0, int((exit_time - session.entry_time).total_seconds()))
-    session.status = "closed"
-    session.updated_at = facility_now_naive()
-    # If the car exited while still bound to a slot (no VA unbind before the
-    # ANPR exit event), close_session is the last writer that knows when the
-    # slot was vacated. Backfill slot_left_at so historical queries can rely
-    # on `slot_left_at IS NOT NULL` for closed sessions.
-    if session.slot_id is not None and session.slot_left_at is None:
-        session.slot_left_at = exit_time
+    # `(letters, digits)` equality, not string equality. `normalize_plate` passes
+    # any dashed read through unchanged, so a digits-first `6707-SDD` never
+    # string-equals the stored `SDD-6707` and used to fall through to the fuzzy
+    # tier for a plate that was exactly right. Same pool the matcher sees.
+    wanted = plate_parts(plate_number)
+    matches = [
+        row for row in open_stays(db, exit_time)
+        if plate_parts(row.plate_number) == wanted
+    ]
+    if len(matches) > 1:
+        # A signal, not a coin flip. Two open stays under one plate means an exit
+        # was missed: the car came back and its previous stay was never closed.
+        # The newest is the one this exit ends; the older is a stranded stay that
+        # needs its own answer, so it is named here rather than silently skipped.
+        logger.warning(
+            "[ParkingSession] %d open stays for plate=%s — closing the newest "
+            "id=%s; STRANDED: %s",
+            len(matches), plate_number, matches[0].id,
+            ", ".join(f"id={row.id} entered={row.entry_time}" for row in matches[1:]),
+        )
+    if matches:
+        return _close_session_record(
+            db,
+            matches[0],
+            exit_time=exit_time,
+            camera_id=camera_id,
+            snapshot_path=snapshot_path,
+            clear_vehicle_location=True,
+        )
 
-    # The car has left the garage entirely — clear all "where is it now"
-    # mirrors on the vehicle row. Without this, the vehicles row keeps
-    # pointing at the last slot/floor indefinitely.
-    vehicle = _resolve_vehicle(db, session)
-    if vehicle is not None:
-        vehicle.current_slot_id = None
-        vehicle.floor = None
-        vehicle.floor_id = None
+    # A real exit can arrive late after a validated re-entry already closed the
+    # previous stay at an inferred upper bound. Correct that exact audit marker,
+    # but never touch a newer open stay or clear its current vehicle location.
+    skew = timedelta(seconds=settings.EXIT_CLOCK_SKEW_SECONDS)
+    reconciled = next(
+        (
+            row
+            for row in db.query(ParkingSession)
+            .filter(
+                ParkingSession.status == "closed",
+                ParkingSession.exit_camera_id == REENTRY_RECONCILIATION_CAMERA_ID,
+                ParkingSession.entry_time <= exit_time + skew,
+                ParkingSession.exit_time >= exit_time - skew,
+            )
+            .order_by(ParkingSession.entry_time.desc(), ParkingSession.id.desc())
+            .all()
+            if plate_parts(row.plate_number) == wanted
+        ),
+        None,
+    )
+    if reconciled is not None:
+        logger.info(
+            "[ParkingSession] Applying delayed real exit to reconciled stay "
+            "id=%s plate=%s",
+            reconciled.id,
+            plate_number,
+        )
+        return _close_session_record(
+            db,
+            reconciled,
+            exit_time=exit_time,
+            camera_id=camera_id,
+            snapshot_path=snapshot_path,
+            clear_vehicle_location=False,
+            # This stay is already `closed` at the inferred bound — that IS the
+            # state we expect to find, and the state the claim must guard on.
+            expect_status="closed",
+        )
 
-    return session
+    logger.warning(
+        "[ParkingSession] No temporally eligible session found for plate=%s",
+        plate_number,
+    )
+    return None
+
+
+def close_matched_session(
+    db: Session,
+    session: ParkingSession,
+    *,
+    exit_time: datetime,
+    camera_id: str,
+    snapshot_path: Optional[str],
+) -> Optional[ParkingSession]:
+    """Close ONE specific session identified by evidence other than its plate.
+
+    `close_session` looks the stay up by plate, which is exactly what fails when
+    the entry read was wrong. `exit_match_service` resolves the stay by other
+    means (digit group, truncation, appearance) and hands the row here.
+
+    The session's plate is NOT rewritten here. That is `plate_correction_service`
+    — ledger row, entry log, vehicle merge, VA gallery rename — and it is one
+    transactional unit the caller applies alongside this close.
+
+    Until 2026-08-18 the misread was deliberately KEPT on the session, as "the
+    only evidence that can later prove the match right or wrong". It is still
+    the only such evidence and it is still preserved, but in
+    `hik_validations.reported_plate` rather than on the row the dashboard reads.
+    Preserving evidence and displaying it are different jobs; doing both with one
+    field meant every fuzzy-matched exit left a car on screen that was not there.
+    `exit_camera_id` records which camera closed it.
+    """
+    logger.warning(
+        "[ParkingSession] Closing session id=%s plate=%s from an exit read as a "
+        "DIFFERENT plate — resolved by exit matching",
+        session.id,
+        session.plate_number,
+    )
+    return _close_session_record(
+        db,
+        session,
+        exit_time=_naive(exit_time),
+        camera_id=camera_id,
+        snapshot_path=snapshot_path,
+        clear_vehicle_location=True,
+    )
 
 
 def bind_slot(
@@ -211,4 +486,3 @@ def unbind_slot(
 
     db.flush()
     return session
-

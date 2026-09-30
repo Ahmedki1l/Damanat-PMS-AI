@@ -12,7 +12,7 @@ from app.services.event_parser import parse_camera_event
 class TestXMLEventParsing:
     """Phase 1: XML event parsing tests."""
 
-    def test_fielddetection_event(self):
+    def test_fielddetection_event(self, monkeypatch):
         xml = b"""<?xml version="1.0" encoding="utf-8"?>
         <EventNotificationAlert version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
           <deviceSerial>DS-2CD3681G2-001</deviceSerial>
@@ -27,7 +27,12 @@ class TestXMLEventParsing:
         </EventNotificationAlert>"""
 
         from app.config import settings
-        event = parse_camera_event(xml, settings.CAM_02_IP, "application/xml")
+        monkeypatch.setattr(
+            settings,
+            "CAMERA_SERIAL_MAP",
+            {"DS-2CD3681G2-001": "CAM-02"},
+        )
+        event = parse_camera_event(xml, "192.0.2.2", "application/xml")
         assert event.event_type == "fielddetection"
         assert event.detection_target == "vehicle"
         assert event.region_id == "restricted-vip"
@@ -96,7 +101,6 @@ class TestXMLEventParsing:
         event = parse_camera_event(xml, "10.0.0.99", "application/xml")
         assert event.camera_id == "UNKNOWN-10.0.0.99"
 
-
 class TestJSONEventParsing:
     """Phase 2: JSON/ANPR event parsing tests."""
 
@@ -124,7 +128,7 @@ class TestJSONEventParsing:
         assert event.person_name == "Ahmed"
         assert event.detection_target == "vehicle"
 
-    def test_anpr_exit_event(self):
+    def test_anpr_exit_event(self, monkeypatch):
         json_body = b"""{
             "eventType": "AccessControllerEvent",
             "dateTime": "2026-02-20T14:30:00Z",
@@ -136,7 +140,17 @@ class TestJSONEventParsing:
         }"""
 
         from app.config import settings
-        event = parse_camera_event(json_body, settings.CAM_EXIT_IP, "application/json")
+        monkeypatch.setattr(
+            settings,
+            "CAMERA_SERIAL_MAP",
+            {"ANPR-EXIT-001": "CAM-EXIT"},
+        )
+        monkeypatch.setattr(
+            settings,
+            "CAMERAS",
+            {"CAM-EXIT": {"gate": "exit"}},
+        )
+        event = parse_camera_event(json_body, "192.0.2.8", "application/json")
         assert event.event_type == "AccessControllerEvent"
         assert event.plate_number == "XYZ-5678"
         assert event.gate == "exit"
@@ -149,7 +163,6 @@ class TestJSONEventParsing:
         event = parse_camera_event(json_body, "192.168.1.104", "")
         assert event.event_type == "AccessControllerEvent"
         assert event.plate_number == "TEST-001"
-
 
 class TestPlateNormalization:
     """`_normalize_plate` stores plates exactly as before (the frontend handles
@@ -183,3 +196,39 @@ class TestPlateNormalization:
         from app.services.event_parser import _normalize_plate
         assert _normalize_plate(raw) is None
 
+
+
+class TestPlateTruncation:
+    """`plate_digits_lost` / `same_vehicle_plate` — the primitive that tells a
+    re-read of one car apart from the arrival of the next one."""
+
+    @pytest.mark.parametrize("partial,full", [
+        ("KKR-4", "KKR-6294"),      # 2026-08-09: last digit only survived
+        ("KKR-62", "KKR-6294"),     # leading digits survived
+        ("KKR-294", "KKR-6294"),    # one digit lost off the front
+    ])
+    def test_detects_a_truncated_read(self, partial, full):
+        from app.services.event_parser import plate_digits_lost
+        assert plate_digits_lost(partial, full) is True
+        assert plate_digits_lost(full, partial) is False   # direction matters
+
+    @pytest.mark.parametrize("a,b", [
+        ("KKR-6294", "KKR-6295"),   # same length → two cars, not a truncation
+        ("KKR-4", "ZZT-4"),         # different letter group
+        ("KKR-29", "KKR-6294"),     # middle substring — no camera does this
+        ("KKR-6294", "KKR-6294"),   # identical is not "digits lost"
+        ("KKR-4", None),
+        (None, "KKR-6294"),
+        ("TEST-001", "TEST-0012"),  # unparseable format → exact match only
+    ])
+    def test_rejects_everything_else(self, a, b):
+        from app.services.event_parser import plate_digits_lost
+        assert plate_digits_lost(a, b) is False
+
+    def test_same_vehicle_plate_covers_both_directions_and_equality(self):
+        from app.services.event_parser import same_vehicle_plate
+        assert same_vehicle_plate("KKR-6294", "KKR-4") is True
+        assert same_vehicle_plate("KKR-4", "KKR-6294") is True
+        assert same_vehicle_plate("KKR-6294", "KKR-6294") is True
+        assert same_vehicle_plate("KKR-6294", "KKR-6295") is False
+        assert same_vehicle_plate("KKR-6294", None) is False

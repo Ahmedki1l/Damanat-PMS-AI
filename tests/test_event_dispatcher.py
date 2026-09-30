@@ -108,7 +108,8 @@ async def test_occupancy_confirm_cam_not_double_confirmed(mock_settings, mock_co
 
 def _configure_anpr(mock_settings, cameras):
     mock_settings.CAMERAS = cameras
-    mock_settings.ANPR_BURST_MAX_SECONDS = 20.0
+    mock_settings.ANPR_BURST_MAX_SECONDS = 60.0
+    mock_settings.VMR_GATE_HINT_TTL_SECONDS = 20.0
     mock_settings.LOG_CAMERA_FILTER = ""
     mock_settings.LOG_CAMERA_EXCLUDE = ""
     mock_settings.ENTRY_CONFIRM_CAMERAS = ""
@@ -276,11 +277,11 @@ async def test_fifo_hint_is_consumed_once(mock_settings, mock_feed, mock_anpr):
 @patch("app.services.event_dispatcher.settings")
 async def test_expired_hint_never_rescues(mock_settings, mock_feed, mock_anpr):
     """A stale match result must not label a later car. Bounded by
-    ANPR_BURST_MAX_SECONDS in BOTH stores."""
+    VMR_GATE_HINT_TTL_SECONDS in BOTH stores."""
     dispatcher._VMR_GATE_HINTS.clear()
     dispatcher._VMR_RECENT.clear()
     _configure_anpr(mock_settings, {"CAM-ENTRY": {"gate": "entry"}})
-    mock_settings.ANPR_BURST_MAX_SECONDS = 0.0     # every hint is born expired
+    mock_settings.VMR_GATE_HINT_TTL_SECONDS = 0.0  # every hint is born expired
 
     await dispatch_event(make_anpr_event("CAM-ENTRY", "RGR-6466", "vehicleMatchResult"), MagicMock())
     await dispatch_event(make_anpr_event("UNKNOWN-10.1.20.60", "66466RA"), MagicMock())

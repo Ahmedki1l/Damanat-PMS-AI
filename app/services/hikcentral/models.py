@@ -1,0 +1,277 @@
+"""Value objects for the HikCentral validation layer.
+
+Pure data — no HTTP, no ORM, no DB session. Everything that crosses the package
+boundary is one of these frozen dataclasses, so HikCentral's wire format never
+leaks into the entry pipeline.
+"""
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Optional
+
+from app.config import facility_tz
+from app.services.event_parser import normalize_plate
+
+# `plate_source` values recorded on hik_validations for audit only. Nothing in
+# the pipeline branches on these — callers always receive one canonical plate.
+PLATE_SOURCE_EDGE_ANPR = "edge_anpr"
+PLATE_SOURCE_HIK_CONFIRMED = "hik_confirmed"
+PLATE_SOURCE_HIK_CORRECTED = "hik_corrected"
+PLATE_SOURCE_HIK_RECOVERED = "hik_recovered"
+# Recovered by the reconciliation poller: HikCentral saw an entry the edge
+# pipeline never noticed at all (no ANPR event, no CAM-23 crossing reached
+# PMS-AI). Distinct from hik_recovered (which is anchored to a real crossing)
+# because this session has NO physical ramp confirmation — HikCentral's record
+# is its only evidence.
+PLATE_SOURCE_HIK_POLLED = "hik_polled"
+
+# HikCentral spells its JSON in PascalCase. Kept as a table rather than inline
+# string literals so the live-probe script and the parser can never drift.
+_FIELD_GUID = "GUID"
+_FIELD_PASS_TIME = "PassTime"
+_FIELD_PLATE = "PlateLicense"
+_FIELD_VEHICLE_IMAGE = "VehicleImageUrl"
+_FIELD_PLATE_IMAGE = "PlateImageUrl"
+_FIELD_RESOURCE_ID = "ResourceID"
+_FIELD_RESOURCE_NAME = "ResourceName"
+_FIELD_DIRECTION = "VehicleDirectionType"
+_FIELD_VEHICLE_TYPE = "VehicleType"
+
+
+def _text(raw: dict, key: str) -> Optional[str]:
+    """Return a trimmed string field, or None when absent/blank."""
+    value = raw.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def to_facility_naive(moment: datetime) -> datetime:
+    """Convert a HikCentral timestamp to the DB's naive facility-local form.
+
+    HikCentral reports tz-aware times (`...+03:00`); every writer in this
+    codebase stores naive facility-local wall-clock. Mixing the two silently
+    shifts entries by the UTC offset, so this conversion is mandatory at the
+    boundary. Naive input is assumed to already be facility-local.
+    """
+    if moment.tzinfo is None:
+        return moment
+    return moment.astimezone(facility_tz()).replace(tzinfo=None)
+
+
+def from_facility_naive(moment: datetime) -> datetime:
+    """Attach the facility timezone to a naive DB/pipeline timestamp.
+
+    The inverse of to_facility_naive(). HikCentral is always queried with an
+    explicit offset so the window can never be read in the wrong timezone.
+    """
+    if moment.tzinfo is not None:
+        return moment
+    return moment.replace(tzinfo=facility_tz())
+
+
+@dataclass(frozen=True)
+class VehicleLogRecord:
+    """One HikCentral vehicle pass."""
+
+    guid: str
+    # tz-aware, exactly as HikCentral reported it. Convert with
+    # to_facility_naive() before it touches the DB.
+    pass_time: datetime
+    plate_license: str
+    # normalize_plate(plate_license): HikCentral spells plates digits-first
+    # ("5625JKA") while this DB stores letters-first ("JKA-5625").
+    canonical_plate: Optional[str]
+    vehicle_image_url: Optional[str] = None
+    plate_image_url: Optional[str] = None
+    resource_id: Optional[str] = None
+    resource_name: Optional[str] = None
+    vehicle_direction_type: Optional[str] = None
+    vehicle_type: Optional[str] = None
+
+    @classmethod
+    def from_payload(cls, raw: Any) -> Optional["VehicleLogRecord"]:
+        """Build a record from one raw HikCentral entry, or None if unusable.
+
+        A record without a GUID or a parsable PassTime cannot be matched or
+        de-duplicated, so it is dropped rather than half-trusted.
+        """
+        if not isinstance(raw, dict):
+            return None
+
+        guid = _text(raw, _FIELD_GUID)
+        raw_pass_time = _text(raw, _FIELD_PASS_TIME)
+        if not guid or not raw_pass_time:
+            return None
+        try:
+            pass_time = datetime.fromisoformat(raw_pass_time)
+        except ValueError:
+            return None
+
+        plate_license = _text(raw, _FIELD_PLATE) or ""
+        return cls(
+            guid=guid,
+            pass_time=pass_time,
+            plate_license=plate_license,
+            canonical_plate=normalize_plate(plate_license),
+            vehicle_image_url=_text(raw, _FIELD_VEHICLE_IMAGE),
+            plate_image_url=_text(raw, _FIELD_PLATE_IMAGE),
+            resource_id=_text(raw, _FIELD_RESOURCE_ID),
+            resource_name=_text(raw, _FIELD_RESOURCE_NAME),
+            vehicle_direction_type=_text(raw, _FIELD_DIRECTION),
+            vehicle_type=_text(raw, _FIELD_VEHICLE_TYPE),
+        )
+
+    @classmethod
+    def from_openapi_record(cls, raw: Any) -> Optional["VehicleLogRecord"]:
+        """Build a record from one Artemis OpenAPI `crossRecords/page` row.
+
+        The OpenAPI is the supported integration (AK/SK signed), and it spells
+        the same pass in different keys than the web `VehicleLogs` endpoint:
+        `crossRecordSyscode` is the dedup identity, `crossTime` is already a
+        clean ISO-8601 value with the correct offset (no `+6h` shift to undo),
+        and `vehiclePicUri` is the one image handle. Mapping here keeps the rest
+        of the package — matching, mode policy, storage — completely unchanged.
+        """
+        if not isinstance(raw, dict):
+            return None
+        guid = _text(raw, "crossRecordSyscode")
+        raw_cross_time = _text(raw, "crossTime")
+        if not guid or not raw_cross_time:
+            return None
+        try:
+            pass_time = datetime.fromisoformat(raw_cross_time)
+        except ValueError:
+            return None
+        plate_license = _text(raw, "plateNo") or ""
+        direction = raw.get("vehicleDirectionType")
+        vehicle_type = raw.get("vehicleType")
+        return cls(
+            guid=guid,
+            pass_time=pass_time,
+            plate_license=plate_license,
+            canonical_plate=normalize_plate(plate_license),
+            # The OpenAPI returns a single vehicle picture; the plate crop is
+            # burned into that image's overlay, so there is no separate handle.
+            vehicle_image_url=_text(raw, "vehiclePicUri"),
+            plate_image_url=None,
+            resource_id=_text(raw, "cameraIndexCode"),
+            resource_name=None,
+            vehicle_direction_type=str(direction) if direction is not None else None,
+            vehicle_type=str(vehicle_type) if vehicle_type is not None else None,
+        )
+
+
+@dataclass(frozen=True)
+class EventRecord:
+    """One VCA event HikCentral holds for a camera — a line crossing, a region
+    entrance, a region exit.
+
+    Distinct from VehicleLogRecord, which is an ANPR PASS record and carries a
+    plate. An event record carries no plate at all: it is the platform saying
+    "something crossed this line here, and here is a picture". That is exactly
+    what makes it useful for a DROPPED gate read, where there is no plate to be
+    had from the edge — and exactly why it can never name a car by itself.
+    """
+
+    event_index_code: str
+    src_index: str
+    start_time: Optional[datetime] = None
+    event_pic_uri: Optional[str] = None
+    event_type: Optional[str] = None
+
+    @property
+    def guid(self) -> str:
+        """The identity used for consumption/dedup, mirroring VehicleLogRecord."""
+        return self.event_index_code
+
+    @property
+    def vehicle_image_url(self) -> Optional[str]:
+        """Named to match VehicleLogRecord so one caller can handle both."""
+        return self.event_pic_uri
+
+    @classmethod
+    def from_openapi_record(cls, raw) -> Optional["EventRecord"]:
+        if not isinstance(raw, dict):
+            return None
+        index_code = raw.get("eventIndexCode") or raw.get("eventId")
+        src_index = raw.get("srcIndex") or raw.get("srcIndexCode") or ""
+        if not index_code:
+            return None
+        started = raw.get("startTime") or raw.get("happenTime")
+        parsed = None
+        if isinstance(started, str) and started:
+            try:
+                parsed = datetime.fromisoformat(started.replace("Z", "+00:00"))
+            except ValueError:
+                parsed = None
+        event_type = raw.get("eventType")
+        return cls(
+            event_index_code=str(index_code),
+            src_index=str(src_index),
+            start_time=parsed,
+            event_pic_uri=raw.get("eventPicUri") or raw.get("picUri") or None,
+            event_type=str(event_type) if event_type is not None else None,
+        )
+
+
+@dataclass(frozen=True)
+class HikImages:
+    """Locally persisted HikCentral imagery, as public snapshot URLs."""
+
+    # Public /snapshots URLs — what goes into the DB.
+    vehicle_image_path: Optional[str] = None
+    plate_image_path: Optional[str] = None
+    # On-disk paths, kept for local processing (e.g. forwarding to VA).
+    vehicle_local_path: Optional[str] = None
+    plate_local_path: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return bool(self.vehicle_image_path or self.plate_image_path)
+
+
+@dataclass(frozen=True)
+class HikOutcome:
+    """The single answer the entry pipeline consumes.
+
+    `plate` is the plate the caller must use — already reconciled against the
+    configured mode. Callers are not expected to inspect anything else; the
+    remaining fields exist so the decision can be persisted and audited.
+    """
+
+    plate: Optional[str]
+    plate_source: str
+    matched: bool
+    reason: str
+    record: Optional[VehicleLogRecord] = None
+    reported_plate: Optional[str] = None
+    # How many HikCentral records fell inside the lookup window. Recovery
+    # requires exactly one; this is kept so an ambiguous window is diagnosable.
+    candidates_considered: int = 0
+
+    @property
+    def guid(self) -> Optional[str]:
+        return self.record.guid if self.record else None
+
+    @property
+    def pass_time(self) -> Optional[datetime]:
+        return self.record.pass_time if self.record else None
+
+    @property
+    def pass_time_local(self) -> Optional[datetime]:
+        """PassTime as the naive facility-local value every writer stores."""
+        return to_facility_naive(self.record.pass_time) if self.record else None
+
+    @property
+    def vehicle_image_url(self) -> Optional[str]:
+        return self.record.vehicle_image_url if self.record else None
+
+    @property
+    def plate_image_url(self) -> Optional[str]:
+        return self.record.plate_image_url if self.record else None
+
+    @property
+    def has_evidence(self) -> bool:
+        """True when there is a HikCentral record worth persisting."""
+        return self.record is not None

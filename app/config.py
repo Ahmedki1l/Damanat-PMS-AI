@@ -4,11 +4,13 @@ Application configuration using Pydantic-Settings.
 All settings can be overridden via environment variables or .env file.
 """
 
+import warnings
+from ipaddress import ip_network
+from typing import Any, Literal, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from pydantic import model_validator, ConfigDict
+from pydantic import ConfigDict, Field, PrivateAttr, model_validator
 from pydantic_settings import BaseSettings
-from typing import Optional, Dict, List, Any
 
 
 # Canonical gate assignments (entry/exit) for the internal floor-to-floor and
@@ -23,6 +25,29 @@ GATE_RULES: dict[str, str] = {
     "CAM-ENTRY": "entry",
     "CAM-EXIT": "exit",
 }
+
+
+def parse_camera_source_networks(value: str) -> tuple[Any, ...]:
+    """Parse exact peer IPs or CIDRs; invalid entries fail configuration."""
+    return tuple(
+        ip_network(item.strip(), strict=False)
+        for item in value.split(",")
+        if item.strip()
+    )
+
+
+def join_resource_ids(value: str) -> str:
+    """Normalize a comma-separated HikCentral resource-ID list.
+
+    HikCentral's VehicleLogs `ResourceIDs` is a single comma-joined string, so
+    this trims blanks and de-duplicates while preserving configured order.
+    """
+    seen: list[str] = []
+    for item in (value or "").split(","):
+        item = item.strip()
+        if item and item not in seen:
+            seen.append(item)
+    return ",".join(seen)
 
 
 def apply_gate_rules(cameras: dict) -> dict:
@@ -84,6 +109,11 @@ class Settings(BaseSettings):
 
     # ── Security ──────────────────────────────────────────────────────────
     API_KEY: Optional[str] = None   # Set in .env to enable auth on API endpoints
+    CAMERA_EVENT_MAX_BODY_BYTES: int = Field(
+        default=16 * 1024 * 1024,
+        gt=0,
+    )
+    CAMERA_EVENT_ALLOWED_SOURCE_CIDRS: str = ""
 
     # ── Node.js Core Backend Integration ─────────────────────────────────
     NODEBACK_URL: str = ""          # e.g. "http://localhost:3000"; empty = disabled
@@ -92,6 +122,87 @@ class Settings(BaseSettings):
 
     # ── PMS Tracking API Integration ─────────────────────────────────────
     PMS_API_URL: str = ""           # e.g. "http://localhost:8000"; empty = disabled
+
+    # ── Entry validation V2 (PMS-AI ↔ Video Analytics) ─────────────────
+    # off:           existing burst/FIFO entry flow only (safe default)
+    # shadow:        existing flow remains authoritative; evidence is mirrored
+    # authoritative: VA confirmations are the only writer of entry log/session
+    # Enable only after the additive confirmation-receipt migration succeeds.
+    ENTRY_V2_CONFIRMATION_RECEIPTS_ENABLED: bool = False
+    ENTRY_V2_MODE: Literal["off", "shadow", "authoritative"] = "off"
+    ENTRY_V2_SERVICE_KEY: str = ""
+    ENTRY_V2_CAMERA_ALIASES: str = ""
+    ENTRY_V2_CONNECT_TIMEOUT_SECONDS: float = Field(
+        default=2.0, gt=0, allow_inf_nan=False
+    )
+    ENTRY_V2_READ_TIMEOUT_SECONDS: float = Field(
+        default=30.0, gt=0, allow_inf_nan=False
+    )
+    ENTRY_V2_WRITE_TIMEOUT_SECONDS: float = Field(
+        default=10.0, gt=0, allow_inf_nan=False
+    )
+    ENTRY_V2_POOL_TIMEOUT_SECONDS: float = Field(
+        default=2.0, gt=0, allow_inf_nan=False
+    )
+    # Shadow delivery is detached from the camera request. Bound the number of
+    # image-bearing events retained in memory while VA is slow or unavailable.
+    ENTRY_V2_SHADOW_QUEUE_CAPACITY: int = Field(default=8, gt=0, le=16)
+    ENTRY_V2_SHADOW_SHUTDOWN_TIMEOUT_SECONDS: float = Field(
+        default=5.0,
+        gt=0,
+        le=30.0,
+        allow_inf_nan=False,
+    )
+    ENTRY_V2_APPLOCK_TIMEOUT_MS: int = Field(default=1000, ge=0, le=4000)
+    ENTRY_V2_MAX_IMAGE_BYTES: int = Field(
+        default=4 * 1024 * 1024,
+        gt=0,
+        le=4 * 1024 * 1024,
+    )
+    ENTRY_V2_MAX_SOURCE_IMAGE_BYTES: int = Field(
+        default=16 * 1024 * 1024,
+        gt=0,
+        le=16 * 1024 * 1024,
+    )
+    ENTRY_V2_MAX_IMAGES: int = Field(default=4, gt=0, le=4)
+    # The first two bounds are the exact VA decoded-image intake envelope.
+    # Source images may be larger because PMS crops them before forwarding, but
+    # their decode is independently bounded to prevent compressed image bombs.
+    ENTRY_V2_MAX_DECODED_PIXELS: int = Field(
+        default=12_000_000,
+        gt=0,
+        le=12_000_000,
+    )
+    ENTRY_V2_MAX_IMAGE_DIMENSION: int = Field(default=8192, gt=0, le=8192)
+    ENTRY_V2_MAX_SOURCE_DECODED_PIXELS: int = Field(
+        default=30_000_000,
+        gt=0,
+        le=30_000_000,
+    )
+    ENTRY_V2_CROP_PADDING_RATIO: float = Field(
+        default=0.12,
+        ge=0,
+        le=0.5,
+        allow_inf_nan=False,
+    )
+    # The ANPR detection picture is a COMPOSITE frame: Hikvision paints its own
+    # plate crop and an OSD annotation band into the top-left corner, and the
+    # `vehicelRect` inside pictureInfo describes THAT overlay box - not the car in
+    # the scene. Cropping to the rectangle therefore handed VA a re-read of
+    # Hikvision's own plate output (or, when the crop clipped the band, the
+    # timestamp text) and never the vehicle itself.
+    #
+    # With this on, the ANPR overview is forwarded as a bounded full frame so VA
+    # localizes the plate with its own detector - independent evidence rather than
+    # a re-read, and immune to the camera's overlay setting being toggled off.
+    # Measured over 87 production frames: VA's LPD finds the real plate at
+    # 138-293px (median 171, ~222px after crop padding) and detection improves from
+    # 27% to 42% once the overlay stops competing for the top box. 2688x1552 is
+    # 4.2Mpx against ENTRY_V2_MAX_DECODED_PIXELS=12Mpx, so nothing is downscaled.
+    #
+    # Set False to restore the rectangle crop if field results regress.
+    ENTRY_V2_ANPR_FULL_FRAME: bool = True
+    ENTRY_V2_ONE_WAY_LINES: str = ""
 
     # ── Camera credential decryption ─────────────────────────────────────
     # Shared urlsafe-base64 Fernet key with the API Gateway. Used to decrypt
@@ -251,6 +362,80 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _build_camera_dicts(self) -> "Settings":
         """Build CAMERAS and CAMERA_IP_MAP from individual env vars."""
+        try:
+            source_networks = parse_camera_source_networks(
+                self.CAMERA_EVENT_ALLOWED_SOURCE_CIDRS
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "CAMERA_EVENT_ALLOWED_SOURCE_CIDRS contains an invalid IP/CIDR"
+            ) from exc
+        if self.ENTRY_V2_MODE == "authoritative" and not source_networks:
+            raise ValueError(
+                "CAMERA_EVENT_ALLOWED_SOURCE_CIDRS is required when "
+                "ENTRY_V2_MODE=authoritative"
+            )
+        if self.ENTRY_V2_MODE != "off":
+            base_url = self.PMS_API_URL.strip()
+            try:
+                parsed_url = urlsplit(base_url)
+                _ = parsed_url.port
+            except ValueError as exc:
+                raise ValueError(
+                    "PMS_API_URL must be a valid absolute HTTP(S) URL when "
+                    "ENTRY_V2_MODE is active"
+                ) from exc
+            if (
+                parsed_url.scheme not in {"http", "https"}
+                or not parsed_url.hostname
+                or parsed_url.username
+                or parsed_url.password
+                or parsed_url.query
+                or parsed_url.fragment
+            ):
+                raise ValueError(
+                    "PMS_API_URL must be a credential-free absolute HTTP(S) "
+                    "base URL without a query or fragment when ENTRY_V2_MODE "
+                    "is active"
+                )
+            if not self.ENTRY_V2_SERVICE_KEY.strip():
+                raise ValueError(
+                    "ENTRY_V2_SERVICE_KEY is required when ENTRY_V2_MODE is active"
+                )
+            self.PMS_API_URL = base_url.rstrip("/")
+
+        confirmation_cameras = {
+            camera.strip()
+            for camera in self.ENTRY_CONFIRM_CAMERAS.split(",")
+            if camera.strip()
+        }
+        if (
+            self.ENTRY_V2_MODE == "authoritative"
+            and "CAM-23" in confirmation_cameras
+            and not (
+                self.CAM23_ENTRY_LINE.strip()
+                or self.CAM23_ENTRY_DIRECTION.strip()
+            )
+        ):
+            raise ValueError(
+                "CAM23_ENTRY_LINE or CAM23_ENTRY_DIRECTION is required when "
+                "CAM-23 is enabled in authoritative Entry V2"
+            )
+
+        if (
+            self.ENTRY_V2_MAX_SOURCE_DECODED_PIXELS
+            < self.ENTRY_V2_MAX_DECODED_PIXELS
+        ):
+            raise ValueError(
+                "ENTRY_V2_MAX_SOURCE_DECODED_PIXELS must be greater than or "
+                "equal to ENTRY_V2_MAX_DECODED_PIXELS"
+            )
+        if self.ENTRY_V2_MAX_SOURCE_IMAGE_BYTES > self.CAMERA_EVENT_MAX_BODY_BYTES:
+            raise ValueError(
+                "ENTRY_V2_MAX_SOURCE_IMAGE_BYTES must be less than or equal to "
+                "CAMERA_EVENT_MAX_BODY_BYTES"
+            )
+
         cameras = {}
         ip_map = {}
 
@@ -334,6 +519,160 @@ class Settings(BaseSettings):
     USE_EXIT_CONFIRM_WINDOW: bool = True
     USE_CAM03_ENTRY_CONFIRMATION: bool = True
 
+    # ── Unmatched-exit resolution (UC2) ──────────────────────────────────
+    # An exit whose plate matches no open session is usually one of two things:
+    # a car whose ENTRY was lost (plate is right), or a car whose entry plate was
+    # misread (plate is wrong). exit_match_service separates them; these bound
+    # what it may consider.
+    EXIT_MATCH_ENABLED: bool = True
+    # A digit group shorter than this is too weak to nominate a match on — plenty
+    # of real plates share one or two digits.
+    EXIT_MATCH_MIN_DIGITS: int = 3
+    # How many ranked candidates to keep for logging / appearance scoring. Only
+    # ever a shortlist: the deterministic rules below decide on uniqueness, not
+    # on rank.
+    # Raised 5 -> 20 in Stage 4. The shortlist is ordered by edit distance, so a
+    # cap of 5 truncated exactly the case Re-ID exists for: a plate misread in
+    # BOTH its letters and its digits sorts to the bottom by distance and fell
+    # off the list before appearance ever saw it. 20 is VA's own ceiling
+    # (`api.py` scores `payload.plates[:20]`), so this is now the binding limit
+    # nowhere — the slot filter is what narrows the pool.
+    EXIT_MATCH_SHORTLIST: int = 20
+    # How long a car may take to get from its slot to the exit gate. A slot that
+    # went vacant inside [exit_time - this, exit_time] is evidence the car in it
+    # is the car now leaving.
+    #
+    # STARTS AT 300s AND IS NOT YET MEASURED. Re-measure against closed sessions
+    # (slot_left_at -> exit_time on stays that resolved by exact plate) before
+    # this is trusted to confirm a close on its own. Too small silently loses
+    # confirmations; too large lets a car that left the slot for an unrelated
+    # reason confirm somebody else's exit.
+    EXIT_DRIVE_OUT_SECONDS: float = Field(
+        default=120.0, gt=0, le=3600.0, allow_inf_nan=False,
+    )
+    # VA does not stamp a vacancy at the moment the car leaves. `state_machine`
+    # requires 5 confirming frames, and VA runs at roughly 0.1 fps per camera, so
+    # the recorded timestamp LAGS the physical departure. Measured over the
+    # 15 VACANT confirmations in va-logs.txt: 3.1s min, 15.6s median, 41.4s max
+    # (B9, 5 frames at 8.3s each).
+    #
+    # That lag can push a vacancy PAST the exit it belongs to — a car parked near
+    # the gate can be through the barrier before VA has finished agreeing its
+    # slot is empty. Without this lookahead the confirmation is dropped for
+    # exactly the fastest exits, which is the wrong half to lose.
+    #
+    # 45s, just above the measured maximum. It is not a second drive-out window:
+    # widening it lets a vacancy that happened AFTER this car left be read as
+    # this car's departure.
+    EXIT_SLOT_VACANCY_LAG_SECONDS: float = Field(
+        default=45.0, ge=0, le=300.0, allow_inf_nan=False,
+    )
+    # Slot evidence reads VA's tables. Off = the tier is skipped entirely and
+    # Re-ID sees every candidate, which is the pre-Stage-4 behaviour. Present so
+    # a bad EXIT_DRIVE_OUT_SECONDS can be disarmed without a redeploy.
+    EXIT_SLOT_EVIDENCE_ENABLED: bool = True
+    # Never match an exit against a session older than this. A long-abandoned
+    # phantom must not be revived by an unrelated car days later.
+    # RETIRED 2026-08-18. Bounded the matcher's candidate pool to 72h while
+    # `close_session` had no bound at all, so the two halves of one decision
+    # disagreed about which stays exist — and the sessions that most needed
+    # resolving (ABR-8000 at 98h, KBD-6795 at 120h) were exactly the ones it
+    # hid. Age is now an attribute of a candidate, not a filter on the pool.
+    # Kept as a no-op so a deployed ConfigMap still validates; remove it there.
+    EXIT_MATCH_MAX_AGE_HOURS: float = 72.0
+    # Entry time comes from the entry camera's clock, exit time from the exit
+    # camera's, so "a car cannot leave before it arrived" needs a tolerance for
+    # the drift between two Hikvision devices.
+    #
+    # 20s, derived rather than guessed. HIK_MATCH_MAX_SKEW_SECONDS below refuses
+    # to pair a HikCentral record with a gate event more than 10s apart, and all
+    # 129 entry validations in ai-logs.txt (8/10-8/16) passed that gate — so each
+    # camera sits within 10s of the platform, and two cameras within 20s of each
+    # other at worst.
+    #
+    # This is NOT a "shortest stay" allowance and must not be widened into one.
+    # The 124 matched stays in that window run 248s (4.1 min) at the shortest,
+    # p50 6.8h; not one is under 120s. Nothing real lives down here.
+    #
+    # The cost of widening is asymmetric and easy to miss. A car that exits and
+    # RE-ENTERS within the tolerance has two stays: the exit belongs to the old
+    # one, but a reconciled exit arriving late would find the NEW stay inside the
+    # window, match its plate exactly, and close a car that is sitting in the
+    # garage. Every extra second buys nothing measurable and widens that hole.
+    #
+    # To measure it properly now that HIK_EXIT_RESOURCE_IDS is configured: pull
+    # one car's entry and exit passes from HikCentral, compare each against the
+    # gate event this service recorded, and difference the two offsets. The
+    # platform is the shared clock.
+    EXIT_CLOCK_SKEW_SECONDS: float = Field(
+        default=20.0, ge=0, le=3600.0, allow_inf_nan=False,
+    )
+    # Appearance scoring (VA /api/reid/compare) for exits the plate rules cannot
+    # settle — the "both letters AND digits misread" case, where no string logic
+    # can help. VA scores, PMS-AI decides.
+    EXIT_MATCH_REID_ENABLED: bool = True
+    EXIT_MATCH_REID_TIMEOUT_SECONDS: float = 5.0
+    # Gap between the best and second-best candidate. A margin, not a threshold:
+    # absolute similarity drifts with light and viewpoint, while the gap to the
+    # runner-up is what actually carries the decision. 0.35 is the 100%-precision
+    # floor measured on the 50-identity gallery (see slot_recovery_solo_min_margin
+    # in VA). It is a starting point for a DIFFERENT geometry — entry camera vs
+    # exit camera — and should be re-measured against exits that matched on plate.
+    EXIT_MATCH_REID_MIN_MARGIN: float = 0.35
+    # Absolute backstop, NOT the primary gate. 0.0 disables it entirely.
+    #
+    # Read MIN_MARGIN above first: 0.35 is already the measured 100%-PRECISION
+    # bar (2026-07-30 leave-one-out, 50 identities / 782 refs, cross-view: 0.10
+    # -> 97.2%, 0.20 -> 98.3%, 0.30 -> 99.5%, 0.35 -> 100%; the worst WRONG
+    # answer observed carried margin 0.317). Anything that clears the margin
+    # gate has already passed the bar the data says is safe, so this floor can
+    # only ever REMOVE true positives -- it cannot raise precision further.
+    #
+    # 0.50 did exactly that and cost a real car. 2026-08-20 16:18, the exit
+    # camera read KXR-2538's plate as the garbage string "172538J": no session
+    # matched it, ReID put the correct car at score 0.410 / margin 0.421 -- past
+    # the margin bar by 0.07 -- and the 0.50 floor refused it anyway. The stay
+    # stayed open, the car re-entered on 08-23 with the stale session still
+    # open, and it sat in a pool of 4 permanently-open sessions that WERE the
+    # entire reported garage occupancy that day.
+    #
+    # 0.30 is deliberately a backstop value, not a calibrated one: there is no
+    # absolute-score precision curve to calibrate against, and there cannot
+    # easily be one -- absolute similarity drifts with light and viewpoint,
+    # which is the whole reason the decision rides on the margin. It sits 0.11
+    # BELOW the lowest correct answer ever observed (0.410) and exists only to
+    # refuse the pathological shape the margin cannot see: one mediocre score
+    # against one terrible one, e.g. best 0.15 / runner-up -0.30 / margin 0.45,
+    # where nothing in the shortlist actually resembles the car.
+    #
+    # If you raise this, raise it from the score distribution of exits that
+    # matched on PLATE (those are known-correct), and never above 0.41.
+    EXIT_MATCH_REID_MIN_SCORE: float = 0.30
+
+    # ── Stale-stay reconciliation on re-entry (UC1, legacy path) ─────────
+    # A car that leaves without a usable exit read keeps its stay open forever;
+    # when it comes back, that stay is PROVEN obsolete -- the car cannot be
+    # inside twice. Closing it at the re-entry instant is the only automatic
+    # answer a missed exit ever gets.
+    #
+    # This duplicates, for the legacy burst-flush path, what
+    # entry_confirmation_service._reconcile_older_open_sessions does for Entry
+    # V2. It has to: V2 downgrades every CONFIRMED decision to ABSTAINED unless
+    # ENTRY_V2_MODE=authoritative, so on a shadow/off deployment -- i.e. every
+    # deployment today -- that reconciliation never runs and open_session
+    # silently REUSES the stale stay instead (see its get_latest_open_session
+    # short-circuit). Measured 2026-08-23: KXR-2538 re-entered at 06:12 with its
+    # 2026-08-20 stay still open and was merged straight back into it.
+    ENTRY_REENTRY_RECONCILE_ENABLED: bool = True
+    # Minimum age of a stay before a re-entry may close it. Guards against
+    # churning a stay that was opened moments ago -- the 30s EntryExitLog dedup
+    # above already absorbs the common double-fire, and this covers the rest
+    # without ever reaching a genuinely stale stay (the real ones in production
+    # are hours to days old). Set to 0 to reconcile any strictly-older stay.
+    ENTRY_REENTRY_RECONCILE_MIN_AGE_SECONDS: float = Field(
+        default=120.0, ge=0, le=86400.0, allow_inf_nan=False,
+    )
+
     # ── ANPR entry burst aggregation (UC1) ───────────────────────────────
     # The entry ANPR camera fires several reads for one car as it approaches
     # (each <picNum> with its own <licensePlate>/<confidenceLevel>). The early
@@ -341,18 +680,63 @@ class Settings(BaseSettings):
     # write ONE entry labeled by the LAST read, committed after a short debounce
     # window (idle gap after the final read) — never the first/wrong read.
     ANPR_BURST_WINDOW_SECONDS: float = 2.5   # idle gap after last read → flush
+    # How close two reads must be for a REPEATED picNum to count as the same car
+    # re-read rather than the next car. Only consulted when the plates are also
+    # the same or one is a truncation of the other (see _is_same_car_reread), so
+    # this bounds an already plate-gated exception.
+    #
+    # Measured against the CAMERA's trigger time, not arrival time — the two are
+    # not the same clock. On 2026-08-09 the reads arrived 1s apart but carried
+    # trigger times 3s apart (09:27:16 and 09:27:19), so a 2s window would have
+    # split the car anyway and the fix would not have fixed anything. One car
+    # sits in front of the gate ANPR for several seconds; 5s covers that.
+    #
+    # It does not need to be tight. ANPR_BURST_WINDOW_SECONDS already closes a
+    # burst that goes idle, so two reads can only reach this check if they landed
+    # inside that debounce — this window just rejects a stale trigger time.
+    ANPR_BURST_SAME_CAR_SECONDS: float = 5.0
+    # A CAM-23 crossing can reach PMS-AI before Hikvision emits the associated
+    # ANPR webhook. This is a separate correlation window, not the read-idle
+    # debounce above. Keep it tight because the crossing itself has no plate.
+    ENTRY_PENDING_CROSSING_SECONDS: float = Field(
+        default=10.0,
+        gt=0,
+        le=60.0,
+        allow_inf_nan=False,
+    )
     # Hard cap on a buffer's lifetime = the max time from the FIRST plate read
     # (CAM-ENTRY) within which the ramp crossing (CAM-23) must arrive to confirm
     # the burst. Real-world read→crossing travel time is ~8s at this site, so 8s
     # dropped valid entries by ~1s; 20s covers the travel gap plus a slow driver.
-    ANPR_BURST_MAX_SECONDS: float = 20.0     # hard cap on a buffer's lifetime
+    #
+    # 20s covered TRAVEL but not WAITING. The plate is read at the barrier, so the
+    # clock starts there - a driver held at a closed barrier, queued behind another
+    # car, or paused for a pedestrian blows the cap and the entry is discarded with
+    # a perfectly good plate. Measured read->CAM-03 is already 7-20s on a car that
+    # never stops. The pre-burst path allowed 60s (PENDING_ENTRY_TTL_SECONDS) and
+    # did not have this failure, so 60s restores the tolerance the site was built
+    # around. Superseded by the no-timeout Entry V2 design once it is authoritative.
+    ANPR_BURST_MAX_SECONDS: float = 60.0     # hard cap on a buffer's lifetime
+    # The VMR->ANPR camera-identity hint is bounded SEPARATELY and deliberately
+    # stays tight. It used to borrow ANPR_BURST_MAX_SECONDS, so raising the burst
+    # cap would have silently tripled the window in which a stale hint - or the
+    # plate-independent FIFO pairing - can attach one car's gate identity AND its
+    # plate to a different car. A correctness guard, not a patience setting.
+    VMR_GATE_HINT_TTL_SECONDS: float = Field(
+        default=20.0,
+        gt=0,
+        le=60.0,
+        allow_inf_nan=False,
+    )
     # Ramp line-crossing cameras whose crossing confirms "one car physically
     # entered" — used as the entry confirmation + per-car burst boundary, and to
     # detect silent entries (a crossing with no plate read). CAM-23 is the new
     # ramp cam (line-crossing only, no ANPR); CAM-03 is the in-garage backstop.
     ENTRY_CONFIRM_CAMERAS: str = "CAM-23,CAM-03"
     # CAM-23 line id + direction meaning "into the garage" (set from real events,
-    # like OCCUPANCY_ENTRANCE_ZONES). Empty = accept any CAM-23 line-crossing.
+    # like OCCUPANCY_ENTRANCE_ZONES). At least one is required when CAM-23 is an
+    # authoritative V2 confirmation camera; both may stay empty during shadow
+    # calibration, where legacy processing remains authoritative.
     CAM23_ENTRY_LINE: str = ""
     CAM23_ENTRY_DIRECTION: str = ""
     # Per-confirmation-camera PMS `direction` marker, so the PMS can tell the
@@ -362,6 +746,44 @@ class Settings(BaseSettings):
     # How long after an entry is written a late confirmation crossing (CAM-03,
     # deep in the garage) may still attach its image to that entry.
     ENTRY_CONFIRM_MATCH_SECONDS: float = 30.0
+    # Let CAM-03 rescue a car CAM-23 missed.
+    #
+    # CAM-03 historically could only ATTACH an image to an entry that already
+    # existed: when the ramp cam missed the crossing the burst was dropped and
+    # CAM-03's own sighting of the same car did nothing. Nothing else covered
+    # that gap either — HIK_RECONCILE_OPEN_ENTRIES is off — so the car was lost.
+    #
+    # With this on, EVERY CAM-03 entry-direction crossing that finds no open
+    # burst is held as a pending crossing — including one whose image was just
+    # attached to a recently written entry. Attaching an image is routing, not
+    # proof the car was entered, and nothing at a plateless crossing carries
+    # identity, so the question is answered at expiry against HikCentral's GUID
+    # rather than guessed from recency. A redundant hold is then dropped in
+    # silence.
+    #
+    # COST: one HikCentral VehicleLogs lookup per CAM-03 entry confirmation,
+    # roughly one extra platform query per car, fired
+    # ENTRY_PENDING_CROSSING_SECONDS after the crossing. Weigh that against
+    # HikCentral's observed latency before enabling on a busy gate.
+    #
+    # Unlike a CAM-23 crossing, a CAM-03 hold is adjudication-only: a later
+    # burst can NOT claim it as its ramp confirmation. It was created because no
+    # burst existed, so letting the next car's burst consume it would confirm a
+    # different car on this car's sighting.
+    #
+    # The duplicate guard is NOT this flag and NOT a time window. One vehicle
+    # pass has one HikCentral GUID however many cameras saw it, so a second
+    # crossing of the same car resolves to an already-consumed pass and is
+    # dropped silently (`RecoveryAttempt.pass_already_accounted`). `open_session`
+    # independently refuses a second open stay per plate.
+    #
+    # REQUIRES HIK_VALIDATION_MODE=authoritative to take effect. The hold exists
+    # so HikCentral can adjudicate it; with the layer off or in shadow that
+    # answer never comes, and every ordinary CAM-03 confirmation would queue a
+    # crossing that can only expire. A held crossing is also rescue-only: it may
+    # create an entry, but never raises a silent-entry alert, because an
+    # unanswered hold means we failed to ASK, not that a car slipped in.
+    ENTRY_CAM03_CAN_RESCUE: bool = True
 
     # ── Anti-bounce on entry events (UC1) ────────────────────────────────
     # Suppress an entry-camera ANPR firing if the same plate had an exit
@@ -382,6 +804,40 @@ class Settings(BaseSettings):
     # VA acks. The drain interval is the retry cadence — the live forward stays a
     # single attempt so it never adds latency to the exit webhook / burst flusher.
     PMS_FORWARD_SPOOL_DIR: str = "./pms_forward_spool"
+
+    # ── Camera ingest spool (Stage 1) ────────────────────────────────────
+    # Hikvision push is fire-and-forget: it ignores Retry-After and never
+    # re-POSTs, so a camera-facing 503 deletes the event rather than deferring
+    # it. When enabled, authoritative trusted input is written here before
+    # processing and acknowledged with 200; an isolated replay worker drains it.
+    #
+    # PRODUCTION: this MUST point inside the one PersistentVolume that exists
+    # (detection_images), or the spool is wiped on every pod restart:
+    #   CAMERA_INGEST_SPOOL_DIR=/app/detection_images/camera_ingest_spool
+    # check_spool_durability() reports which case you are in at boot.
+    CAMERA_INGEST_SPOOL_ENABLED: bool = False
+    CAMERA_INGEST_SPOOL_DIR: str = "./camera_ingest_spool"
+    # Cap the backlog. ~280 events/day at a 377 KB mean is ~105 MB/day, so 2 GB
+    # is roughly three weeks of total outage before the cap is reached.
+    CAMERA_INGEST_SPOOL_MAX_BYTES: int = Field(default=2 * 1024 * 1024 * 1024, gt=0)
+    # The spool shares its volume with the live snapshot store, so keep a floor
+    # of free space that a backlog may never consume.
+    CAMERA_INGEST_SPOOL_MIN_FREE_BYTES: int = Field(default=512 * 1024 * 1024, ge=0)
+    # Quarantine is bounded by AGE, not by attempt count. Only the head of the
+    # queue is ever retried (ordering is preserved), so an attempt cap would
+    # discard the oldest event purely for being first whenever a downstream
+    # outage outlasts cap x interval. 7 days comfortably outlives the 26-hour
+    # database outage this spool was written for.
+    CAMERA_INGEST_MAX_ATTEMPTS: int = Field(default=5, ge=1)
+    CAMERA_INGEST_SPOOL_MAX_AGE_SECONDS: float = Field(default=7 * 24 * 3600, gt=0)
+    # Retry backoff for a blocked head. New durable receipts wake the worker
+    # immediately; this value is not normal camera processing latency.
+    CAMERA_INGEST_DRAIN_INTERVAL_SECONDS: float = Field(default=20.0, gt=0)
+    CAMERA_INGEST_NOTIFICATION_QUEUE_CAPACITY: int = Field(default=256, gt=0, le=4096)
+    # Authoritative durable intake has one replay owner per shared spool path.
+    # Run one API worker/replica for that path; this does not limit async HTTP
+    # camera receipt concurrency. A shared state/bus design is required first
+    # for multi-worker authoritative replay.
     PMS_FORWARD_DRAIN_INTERVAL_SECONDS: float = 15.0   # background re-POST cadence
     PMS_FORWARD_SPOOL_MAX_AGE_SECONDS: float = 3600.0  # drop spooled payloads older than this
 
@@ -404,6 +860,21 @@ class Settings(BaseSettings):
     OCCUPANCY_ENTRANCE_ZONES: str = "1"
     OCCUPANCY_EXIT_ZONES: str= "2"
 
+    # Cameras whose line crossings drive the B2 count as a running DELTA
+    # (+1 on the entrance-facing line, -1 on the exit-facing one). Each camera
+    # covers its own passage, so a car going down to B2 crosses exactly ONE of
+    # them and every crossing counts — do NOT add a camera here that sees the
+    # same ramp as another, or one car will be counted twice.
+    B2_CROSSING_CAMERAS: str = "CAM-09,CAM-10"
+
+    # Dedup window for the delta cameras above, in seconds. Deliberately MUCH
+    # shorter than EVENT_STREAM_SUPPRESS_SECONDS: that 30s window exists to
+    # suppress a redundant *recount*, which is free to drop. A delta is not —
+    # two cars down the same ramp 10s apart are two events that must both
+    # count, so a 30s window would silently lose the second one. This only
+    # needs to absorb Hikvision firing one physical crossing twice.
+    OCCUPANCY_CROSSING_DEDUP_SECONDS: float = 2.0
+
     # ── Storage ───────────────────────────────────────────────────────────
     STORAGE_MODE: str = "local"          # "local" or "spaces"
     DO_SPACES_KEY: str = ""
@@ -420,6 +891,286 @@ class Settings(BaseSettings):
     # ── Alert Cooldowns ───────────────────────────────────────────────────
     CAPACITY_ALERT_COOLDOWN_SECONDS: int = 5    # Min seconds between capacity_exceeded alerts per zone
 
+    # ── Alert Notification Suppression ────────────────────────────────────
+    # Comma-separated alert_type values that must NOT be pushed to the
+    # real-time SSE stream (/api/v1/alerts/stream). Suppression is
+    # notification-only: the row is still written to `alerts`, still logged,
+    # and still served by GET /api/v1/alerts — the dashboard just stops
+    # popping a live notification for it. Set to "" to notify on everything.
+    SUPPRESSED_ALERT_NOTIFICATION_TYPES: str = "silent_entry"
+    # Comma-separated alert_type values that are turned OFF entirely: no DB row,
+    # no log, no stream — create_alert() drops them before anything is written.
+    # Use this (not the notification list above) to make an alert type vanish
+    # completely, e.g. DISABLED_ALERT_TYPES=silent_entry once HikCentral
+    # recovery/reconciliation makes those alerts redundant.
+    DISABLED_ALERT_TYPES: str = ""
+
+    # ── HikCentral plate validation / recovery ────────────────────────────
+    # HikCentral is NOT the normal plate source — the ANPR camera already
+    # reports the plate. HikCentral has exactly two jobs: validate the plate
+    # the camera reported, and recover a plate when the camera reported none
+    # (~22% of cars, today lost entirely as `silent_entry`).
+    #
+    # off           — never contacted; behaviour identical to before this layer.
+    # shadow        — looked up and logged, but the ANPR plate always wins and
+    #                 no recovery session is created. Changes NO behaviour;
+    #                 exists to measure mismatch/recovery rates before trusting
+    #                 them. This is the safe rollout default.
+    # authoritative — a disagreeing HikCentral plate replaces the ANPR plate,
+    #                 and a unique HikCentral record recovers a missing plate.
+    HIK_VALIDATION_MODE: Literal["off", "shadow", "authoritative"] = "off"
+    HIK_BASE_URL: str = ""
+    # Artemis OpenAPI credentials (AppKey/AppSecret) from the HikCentral
+    # Integration Partner. Every request is HmacSHA256-signed with these — there
+    # is no login, session, or cookie. Keep HIK_APP_SECRET secret (env only).
+    HIK_APP_KEY: str = ""
+    HIK_APP_SECRET: str = ""
+    HIK_VERIFY_TLS: bool = True
+    # Parking lot ID for the /artemis/api/vehicle/v1/* namespace, which is the
+    # only place the platform reports whether the BARRIER opened. Discover it
+    # with scripts/setup/probe_hik_barrier_result.py --list-lots. Empty means
+    # the barrier probe stays idle — it is evidence for the shadow review, so
+    # an unset code costs a log field and nothing else.
+    HIK_PARKING_LOT_INDEX_CODE: str = ""
+    # Record allowResult/allowType alongside every Hik-sourced identity in
+    # entry_decisions_gate_*.jsonl. STRICTLY OBSERVATIONAL: nothing branches on
+    # the verdict, because neither the namespace's authorization nor the
+    # fields' population has been confirmed against this deployment yet.
+    ENTRY_V2_BARRIER_PROBE_ENABLED: bool = False
+    # OpenAPI camera indexCode for the entry LPR camera (e.g. "447" = ANPR-1
+    # Entry, discovered via /artemis/api/resource/v1/cameras). One code per
+    # lookup.
+    HIK_ENTRY_RESOURCE_IDS: str = ""
+    # OpenAPI camera indexCode for the exit LPR camera ("510" = ANPR-2 Exit,
+    # confirmed against /artemis/api/resource/v1/cameras on 2026-08-10).
+    # Only used by the reconciliation poller to close sessions for missed exits.
+    #
+    # This was "453" — an indexCode that exists on NO camera. crossRecords
+    # answers an unknown cameraIndexCode with HTTP 200, code=0 and an empty
+    # list, exactly like a camera that genuinely had no passes, so the exit
+    # reconciler swept and found nothing every time without ever erroring. It
+    # had never closed a single missed exit. Verify any change to this value
+    # with `backfill_missed_exits.py --list-cameras`, never by eye.
+    HIK_EXIT_RESOURCE_IDS: str = ""
+    # OpenAPI indexCodes for the RAMP cameras (CAM-23, CAM-03), used only by the
+    # Entry V2 dropped-ANPR recovery sweep. Comma-separated.
+    #
+    # EMPTY BY DEFAULT, and it must stay empty until the probe confirms real
+    # codes. An unknown indexCode returns HTTP 200 / code=0 / empty list, which
+    # is indistinguishable from a genuinely idle camera — that is precisely how
+    # HIK_EXIT_RESOURCE_IDS=453 pointed at a camera that does not exist and let
+    # the exit reconciler sweep for months without closing a single exit.
+    # A guessed value here would fail the same way, silently.
+    #
+    # Resolve real codes with:
+    #     python scripts/setup/probe_hik_camera_events.py --list-cameras
+    HIK_RAMP_RESOURCE_IDS: str = ""
+    # Scope a refusal tombstone to a record whose plate AGREES with the read the
+    # gate refused.
+    #
+    # Today, when no record in the window matches the refused plate, the
+    # tombstone falls back to the CLOSEST record — consuming a pass that belongs
+    # to a different car. That car really did enter, and consuming its GUID
+    # means the reconciler can never recover it: a lost entry, caused by
+    # suppressing the wrong record.
+    #
+    # Defaults to False, which preserves today's behaviour exactly. This is a
+    # fix to the legacy AUTHORITATIVE path, so it must not switch itself on:
+    # nothing may change production behaviour before the shadow review passes.
+    # Turning it on tombstones strictly less, which is the safe direction for
+    # entries that would otherwise be lost.
+    HIK_TOMBSTONE_REQUIRE_PLATE_MATCH: bool = False
+    # Lookup window around the anchor event (the ANPR read for a validation,
+    # the ramp crossing for a recovery). Deliberately tiny: HikCentral is asked
+    # about ONE car, never for history. Lookback covers the camera->platform
+    # ingestion delay; lookahead covers clock skew between the two systems.
+    HIK_QUERY_LOOKBACK_SECONDS: float = Field(
+        default=30.0, gt=0, le=300.0, allow_inf_nan=False,
+    )
+    HIK_QUERY_LOOKAHEAD_SECONDS: float = Field(
+        default=5.0, ge=0, le=60.0, allow_inf_nan=False,
+    )
+    # PageSize must leave room for cars that passed AFTER the anchor, because
+    # results come back newest-first and the upper bound is filtered locally.
+    HIK_QUERY_PAGE_SIZE: int = Field(default=10, gt=0, le=50)
+    # HikCentral shifts BeginTime by the facility's UTC offset applied TWICE
+    # (measured: +6h at UTC+3 — a window sent as 09:00 filtered from 15:00), and
+    # ignores EndTime entirely. The client pre-subtracts this and re-applies the
+    # upper bound locally. Configurable because it was derived by measurement,
+    # not documentation, and may differ on another platform build or timezone.
+    HIK_QUERY_TIME_SHIFT_HOURS: float = Field(
+        default=6.0, ge=-24.0, le=24.0, allow_inf_nan=False,
+    )
+    # How long after an exit read to ask HikCentral a SECOND time, when the
+    # first lookup found no record for the pass at all.
+    #
+    # Measured on ai-logs.txt (8/10-8/16): 129 entry validations, zero misses —
+    # but the entry path asks LATE. It waits for the ramp crossing and the burst
+    # debounce, so its lookups land 7-44s after the pass (p50 12s). The exit path
+    # has nothing to wait for and asks at ~2-3s, earlier than any measurement in
+    # that set: 129/129 proves the record exists by 7s, and says nothing about 2s.
+    #
+    # Widening HIK_QUERY_LOOKBACK_SECONDS cannot cover this. That window is in
+    # RECORD time — it decides which passes match, not whether the platform has
+    # written one yet. Only asking again does. 0 disables the second ask.
+    EXIT_HIK_RECHECK_SECONDS: float = Field(
+        default=15.0, ge=0, le=300.0, allow_inf_nan=False,
+    )
+    # A HikCentral record may only be paired with a gate event this far away.
+    HIK_MATCH_MAX_SKEW_SECONDS: float = Field(
+        default=10.0, gt=0, le=120.0, allow_inf_nan=False,
+    )
+    # How close a FULLER record must be to be treated as the same car's better
+    # read of a plate this camera truncated. Deliberately tighter than the match
+    # skew above: the two reads of one car are seconds apart, while a genuinely
+    # short-plated car passing near a long-plated one is a different car whose
+    # plate must not be rewritten. Effective value is capped by
+    # HIK_MATCH_MAX_SKEW_SECONDS — a candidate must clear both.
+    HIK_PARTIAL_MATCH_MAX_SKEW_SECONDS: float = Field(
+        default=5.0, gt=0, le=120.0, allow_inf_nan=False,
+    )
+    HIK_CONNECT_TIMEOUT_SECONDS: float = Field(
+        default=3.0, gt=0, le=30.0, allow_inf_nan=False,
+    )
+    HIK_READ_TIMEOUT_SECONDS: float = Field(
+        default=5.0, gt=0, le=60.0, allow_inf_nan=False,
+    )
+    # Hard cap on a single downloaded vehicle/plate image.
+    HIK_IMAGE_MAX_BYTES: int = Field(default=8 * 1024 * 1024, gt=0)
+
+    # ── Reconciliation (event-driven) ─────────────────────────────────────
+    # HikCentral is swept for gate events the edge pipeline never saw (ANPR +
+    # CAM-23/08 both missed), and they are applied: a missed ENTRY opens a
+    # recovery session, a missed EXIT closes an open one. This is NOT a timer —
+    # it is triggered by real gate-area events (below) and debounced, so it only
+    # runs when cars are actually moving. Runs in shadow (logs would-do) and
+    # authoritative (acts); off = never. GUID dedup (hik_validations) makes
+    # overlapping sweeps idempotent.
+    #
+    # Cameras whose events trigger an entry/exit sweep. Any event from one of
+    # these acts as the heartbeat for that direction.
+    HIK_RECONCILE_ENTRY_TRIGGER_CAMERAS: str = "CAM-23,CAM-03,CAM-ENTRY"
+    HIK_RECONCILE_EXIT_TRIGGER_CAMERAS: str = "CAM-08,CAM-EXIT"
+    # Minimum gap between sweeps of the same direction, so a busy camera does
+    # not fire a HikCentral call on every frame. Event-driven, just debounced.
+    HIK_RECONCILE_DEBOUNCE_SECONDS: float = Field(
+        default=30.0, ge=0, le=600.0, allow_inf_nan=False,
+    )
+    # Only reconcile records OLDER than this, so the live edge pipeline (burst
+    # buffer + pending-crossing timeout) has already had its chance — the sweep
+    # never races an in-flight car.
+    HIK_RECONCILE_GRACE_SECONDS: float = Field(
+        default=120.0, gt=0, le=3600.0, allow_inf_nan=False,
+    )
+    # How far back each poll looks. Overlaps are safe (GUID dedup), so this is
+    # generous enough to survive a poll or two being skipped.
+    HIK_RECONCILE_LOOKBACK_SECONDS: float = Field(
+        default=900.0, gt=0, le=86400.0, allow_inf_nan=False,
+    )
+    # A HikCentral pass counts as "already noticed" if an EntryExitLog for the
+    # same plate/gate sits within this many seconds of it.
+    HIK_RECONCILE_MATCH_SECONDS: float = Field(
+        default=60.0, gt=0, le=600.0, allow_inf_nan=False,
+    )
+    # How long a refusal the gate could not tombstone holds the reconciler off
+    # that pass.
+    #
+    # An empty lookup at refusal time does NOT mean HikCentral holds no record —
+    # crossRecords lags, and the record can surface minutes later. Measured on
+    # 2026-09-02: three refusals logged "no unconsumed record to tombstone" and
+    # the sweep then opened all three, 3m52s (TXR-4857), 6m27s (RGR-6666) and
+    # 44m55s (RLR-2714) later, every pass_time PREDATING its own refusal.
+    # RGR-6666 became a duplicate session for a car already admitted as
+    # RGR-6466 and fired a second unregistered-vehicle alert on it.
+    #
+    # How long to keep RETRYING the tombstone for a refusal we could not prove.
+    # It does NOT bound the block — see _UNVERIFIED_REFUSALS. A dropped burst is
+    # an ANPR read with no ramp crossing, which is not a car that entered, so
+    # the reconciler is blocked from that pass permanently. This value only
+    # decides how long we keep spending HikCentral calls trying to make the
+    # refusal durable.
+    #
+    # It was briefly used as the block duration, at 900s, on the reasoning that
+    # a pass ages out of the sweep's reach after the lookback. That is wrong
+    # twice over. `_reconcile_window` returns min(now - lookback, watermark), so
+    # HIK_RECONCILE_LOOKBACK_SECONDS is a FLOOR on coverage and never a ceiling
+    # on reach — a stale watermark drags the window back without limit. And
+    # more basically, "the car did not enter" is not a fact that expires.
+    #
+    # USB-6662 on 2026-09-02 is the proof of both. Refused 12:49:15 with an
+    # empty lookup, block released at 13:04:15, opened at 16:15:55 off a
+    # "3:59:21 gap since the last consumed pass" sweep. Zero ramp crossings
+    # existed in the whole six-hour window; no car entered. A timed block turned
+    # a phantom into a slower phantom.
+    HIK_REFUSAL_HOLD_SECONDS: float = Field(
+        default=900.0, ge=0, le=604800.0, allow_inf_nan=False,
+    )
+    # Max records pulled per camera per poll (crossRecords pageSize, ≤ 500).
+    HIK_RECONCILE_PAGE_SIZE: int = Field(default=100, gt=0, le=500)
+
+    # Refuse to open a recovered entry that carries no vehicle image.
+    #
+    # A session with no appearance evidence cannot be closed by ANY mechanism:
+    # the plate is whatever HikCentral read (often a misread nothing will
+    # present at the exit), and with no image the exit Re-ID fallback has
+    # nothing to match. Measured on 2026-08-30/31: every HIK-RECON entry
+    # carried `pic=None conf=None` and every one of them was still open days
+    # later, accruing stay time and competing in the exit gallery against real
+    # cars. Losing the entry is recoverable; an immortal session is not.
+    #
+    # Set False to restore the old behaviour of opening it regardless.
+    HIK_RECONCILE_REQUIRE_IMAGE: bool = True
+
+    # Whether the entry sweep may OPEN a session from a HikCentral pass alone.
+    #
+    # Off by default, because the sweep's premise does not hold at this site.
+    # It reads "an entry-LPR pass with no edge trace" as a car the edge missed,
+    # but that camera also sees traffic that drives past the barrier and never
+    # goes down the ramp. The crossing gate's refusal is supposed to cover those,
+    # and it cannot when the edge read was lost, the refusal lived only in RAM
+    # across a restart, or HikCentral spelled the plate differently from the edge.
+    # Measured 2026-09-15: 29 of 31 overstays were HIK-RECON sessions, and every
+    # one of the 29 was confirmed by image review to be a car passing by.
+    #
+    # With this off the sweep still logs every pass it WOULD open (as shadow
+    # does) and the exit sweep is untouched. A crossing with no plate is still
+    # rescued by `_recover_silent_entry`, which starts from a CAM-23/03 crossing.
+    # A genuinely missed entry costs an unmatched exit; a wrong one costs an
+    # overstay nothing can close.
+    HIK_RECONCILE_OPEN_ENTRIES: bool = False
+
+    # ── Restart catch-up ──────────────────────────────────────────────────
+    # The rolling sweep above is near-sighted by design (it runs on every gate
+    # event), so it cannot heal downtime: a 4h outage on 2026-08-09 stranded 25
+    # exits that a 15-minute window could never reach. On startup, sweep from
+    # the last HikCentral pass actually consumed (hik_validations.pass_time)
+    # through to now instead of a fixed lookback.
+    HIK_CATCHUP_ON_STARTUP: bool = True
+    # Upper bound on how far back a catch-up will reach, so a DB restored from
+    # an old backup cannot trigger a week-long sweep. Older gaps are a
+    # deliberate operator decision: scripts/setup/backfill_missed_exits.py.
+    HIK_CATCHUP_MAX_HOURS: float = Field(default=24.0, gt=0, le=168.0)
+    # The gap is walked in chunks because query_vehicle_logs does NOT paginate
+    # (pageNo=1, newest-first): a window holding more than
+    # HIK_RECONCILE_PAGE_SIZE records silently drops the OLDEST ones, which are
+    # exactly what a catch-up is looking for. Keep chunk * peak-arrival-rate
+    # comfortably under the page size.
+    HIK_CATCHUP_CHUNK_MINUTES: float = Field(default=30.0, gt=0, le=1440.0)
+
+    # ── VA slot recovery ──────────────────────────────────────────────────
+    # Opens a session for a car Video Analytics finds parked with no record of it
+    # entering — the entry was missed entirely (no ANPR, no HikCentral, no ramp
+    # crossing). OFF by default: it creates sessions from evidence that never
+    # passed the gate, so it is opt-in per deployment.
+    SLOT_RECOVERY_ENABLED: bool = False
+    # PMS-AI's own bar, applied on top of VA's. Deliberately duplicated rather than
+    # trusted: the two services deploy independently, and this is the side that
+    # owns parking_sessions. Defaults match VA's measured floors — verified-correct
+    # answers scored 0.620-0.909 with margins 0.102-0.483 on the live fleet
+    # (2026-07-30), while an unenrolled car scores 0.218-0.339 against everything.
+    SLOT_RECOVERY_MIN_REID_SCORE: float = Field(default=0.55, ge=0.0, le=1.0)
+    SLOT_RECOVERY_MIN_REID_MARGIN: float = Field(default=0.10, ge=0.0, le=1.0)
+
     # ── Logging ───────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 
@@ -427,6 +1178,151 @@ class Settings(BaseSettings):
 
     LOG_CAMERA_FILTER: str = ""
     LOG_CAMERA_EXCLUDE: str = ""
+
+    # Set when an active HIK_VALIDATION_MODE was forced to "off" because the
+    # layer was misconfigured. Startup logs it; see _validate_hikcentral.
+    _hik_disabled_reason: str = PrivateAttr(default="")
+
+    def hik_disabled_reason(self) -> str:
+        """Why HikCentral was force-disabled at startup, or "" if it wasn't."""
+        return self._hik_disabled_reason
+
+    def _hikcentral_config_error(self) -> Optional[str]:
+        """Why the HikCentral layer cannot run, or None when it is usable."""
+        base_url = self.HIK_BASE_URL.strip()
+        if not base_url:
+            return "HIK_BASE_URL is required"
+        try:
+            parsed_url = urlsplit(base_url)
+            _ = parsed_url.port
+        except ValueError:
+            return f"HIK_BASE_URL={base_url!r} is not a valid URL"
+        if parsed_url.scheme not in {"http", "https"}:
+            return (
+                f"HIK_BASE_URL={base_url!r} has no http:// or https:// scheme "
+                f"(use e.g. 'https://{base_url}')"
+            )
+        if (
+            not parsed_url.hostname
+            or parsed_url.username
+            or parsed_url.password
+            or parsed_url.query
+            or parsed_url.fragment
+        ):
+            return (
+                f"HIK_BASE_URL={base_url!r} must be a credential-free base URL "
+                "with no query or fragment"
+            )
+        # The OpenAPI signs every request with these, so both are required for
+        # any non-off mode. A missing one degrades to off (below), never raises.
+        if not self.HIK_APP_KEY.strip():
+            return "HIK_APP_KEY is required"
+        if not self.HIK_APP_SECRET.strip():
+            return "HIK_APP_SECRET is required"
+        if not self.hik_entry_resource_ids():
+            return "HIK_ENTRY_RESOURCE_IDS is required"
+        return None
+
+    @model_validator(mode="after")
+    def _validate_hikcentral(self) -> "Settings":
+        """Disable the HikCentral layer when it is on but unconfigured.
+
+        This deliberately does NOT mirror the ENTRY_V2_MODE guard, which raises.
+        The difference is what "off" means for each. Entry V2 owns the entry
+        path, so a misconfigured one has no safe fallback and must stop the
+        process. HikCentral is purely additive — `off` is exactly the behaviour
+        that shipped before this layer existed — so degrading to it is both
+        correct and survivable.
+
+        Raising here instead cost a production outage on 2026-07-27: a deployed
+        `HIK_BASE_URL` without its scheme crash-looped every worker at import
+        time, taking down the whole backend for a feature nothing depends on.
+        A validation add-on must never be able to stop the app from booting.
+        """
+        if self.HIK_VALIDATION_MODE == "off":
+            return self
+
+        reason = self._hikcentral_config_error()
+        if reason:
+            requested = self.HIK_VALIDATION_MODE
+            self.HIK_VALIDATION_MODE = "off"
+            message = (
+                f"HIK_VALIDATION_MODE={requested} was requested but the layer "
+                f"is misconfigured: {reason}. Falling back to "
+                "HIK_VALIDATION_MODE=off. Plate validation and recovery are "
+                "DISABLED. Nothing else is affected."
+            )
+            self._hik_disabled_reason = message
+            # app.utils.logger imports this module, so no logger exists yet;
+            # startup re-emits this at ERROR once logging is configured.
+            warnings.warn(f"[Hik] {message}", RuntimeWarning, stacklevel=2)
+            return self
+
+        self.HIK_BASE_URL = self.HIK_BASE_URL.strip().rstrip("/")
+
+        # The reconcile sweep must never see a pass the burst buffer is still
+        # deciding about. A refused burst only becomes invisible to the sweep once
+        # it has been dropped (at ANPR_BURST_MAX_SECONDS) and its HikCentral GUID
+        # consumed — so a grace shorter than that lets the sweep re-open an entry
+        # the crossing gate was about to refuse. Clamp rather than raise: this
+        # layer is additive and must not stop the app from booting.
+        min_grace = self.ANPR_BURST_MAX_SECONDS + 30.0
+        if self.HIK_RECONCILE_GRACE_SECONDS < min_grace:
+            warnings.warn(
+                f"[Hik] HIK_RECONCILE_GRACE_SECONDS="
+                f"{self.HIK_RECONCILE_GRACE_SECONDS} is below "
+                f"ANPR_BURST_MAX_SECONDS={self.ANPR_BURST_MAX_SECONDS} + 30s "
+                f"margin; raising it to {min_grace} so the reconcile sweep "
+                "cannot re-open an entry the crossing gate refused.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self.HIK_RECONCILE_GRACE_SECONDS = min_grace
+        return self
+
+    def hik_entry_resource_ids(self) -> str:
+        """Entry LPR camera indexCode."""
+        return join_resource_ids(self.HIK_ENTRY_RESOURCE_IDS)
+
+    def hik_exit_resource_ids(self) -> str:
+        """Exit LPR camera indexCode (reconciliation only)."""
+        return join_resource_ids(self.HIK_EXIT_RESOURCE_IDS)
+
+    def hik_reconcile_entry_trigger_cameras(self) -> set[str]:
+        """Cameras whose events trigger an entry reconcile sweep."""
+        return {
+            c.strip()
+            for c in self.HIK_RECONCILE_ENTRY_TRIGGER_CAMERAS.split(",")
+            if c.strip()
+        }
+
+    def hik_reconcile_exit_trigger_cameras(self) -> set[str]:
+        """Cameras whose events trigger an exit reconcile sweep."""
+        return {
+            c.strip()
+            for c in self.HIK_RECONCILE_EXIT_TRIGGER_CAMERAS.split(",")
+            if c.strip()
+        }
+
+    def suppressed_alert_notification_types(self) -> set[str]:
+        """alert_type values excluded from the real-time SSE stream."""
+        return {
+            t.strip()
+            for t in self.SUPPRESSED_ALERT_NOTIFICATION_TYPES.split(",")
+            if t.strip()
+        }
+
+    def disabled_alert_types(self) -> set[str]:
+        """alert_type values turned off entirely (no DB row, no stream)."""
+        return {
+            t.strip()
+            for t in self.DISABLED_ALERT_TYPES.split(",")
+            if t.strip()
+        }
+
+    def b2_crossing_cameras(self) -> set[str]:
+        """Camera ids whose line crossings move the B2 count by a delta."""
+        return {c.strip() for c in self.B2_CROSSING_CAMERAS.split(",") if c.strip()}
 
     def get_zone_metadata(self, zone_id: Optional[str]) -> dict[str, Any]:
         """Return canonical metadata for a logical zone or gate."""

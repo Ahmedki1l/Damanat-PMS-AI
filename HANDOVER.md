@@ -182,7 +182,8 @@ MONITORED_INTRUSION_ZONES = {
 | PUT | `/api/v1/violations/{id}/resolve` | Mark violation as resolved |
 | GET | `/api/v1/intrusions` | Intrusion alerts (UC6) |
 | GET | `/api/v1/alerts` | All alerts — filterable by `alert_type` and `is_resolved` |
-| GET | `/api/v1/health` | System health — backend, database, cameras |
+| GET | `/api/v1/health` | Process liveness; database and spool are `not_checked` |
+| GET | `/api/v1/health/diagnostics` | Database and camera-ingest spool diagnostics |
 
 **Full interactive docs:** `http://127.0.0.1:8080/docs`
 
