@@ -283,10 +283,10 @@ The free-space guard ran *before* the spool directory was created, and `shutil.d
    CAMERA_INGEST_SPOOL_DIR=/app/detection_images/camera_ingest_spool
    ```
    The directory must be inside the `detection_images` PersistentVolume (see P1).
-2. After an authorized restart, inspect the boot line and `/api/v1/health` → `camera_ingest_spool.durability`:
+2. After an authorized restart, inspect the boot line and `/api/v1/health/diagnostics` → `camera_ingest_spool.durability`:
    - A marker from a previous boot is evidence that the configured directory survived that restart.
    - No previous marker leaves persistence unverified; a first use and ephemeral storage look the same.
-3. Watch `/api/v1/health` → `camera_ingest_spool.depth`. It should sit at 0 and spike only during downstream trouble.
+3. Watch `/api/v1/health/diagnostics` → `camera_ingest_spool.depth`. It should sit at 0 and spike only during downstream trouble.
 4. Acceptance: during a controlled VA timeout/disconnect, the camera receives the queued acknowledgment; when VA recovers, the same evidence ID is accepted once, produces one correct session, and the spool has no unresolved backlog.
 
 ### Original analysis

@@ -264,22 +264,22 @@ class TestHealthExposure:
     The helper was first inserted BETWEEN @router.get("/health") and
     health_check, so the decorator bound the route to the helper instead of the
     real handler. The suite still passed, because nothing asserted that /health
-    returns a health payload. Then the field was filtered out entirely by
-    response_model=HealthResponse until it was declared on the schema.
+    returns a health payload. The spool field was then filtered out entirely by
+    response_model=HealthResponse until it was declared on the schema. Spool
+    diagnostics now live at /health/diagnostics.
     """
 
-    def test_health_returns_the_real_handler_payload_with_the_spool_block(self):
+    def test_diagnostics_returns_the_real_handler_payload_with_the_spool_block(self):
         from fastapi.testclient import TestClient
 
         import app.main as main_module
 
-        with TestClient(main_module.app) as client:
-            response = client.get("/api/v1/health")
+        response = TestClient(main_module.app).get("/api/v1/health/diagnostics")
         assert response.status_code == 200
         body = response.json()
         # If the decorator ever binds to the wrong function again, these vanish.
         for key in ("status", "backend", "database", "cameras"):
-            assert key in body, f"/health lost {key} — is the decorator on the right function?"
+            assert key in body, f"/health/diagnostics lost {key} — is the decorator on the right function?"
         assert "camera_ingest_spool" in body, "declare it on HealthResponse or it is filtered out"
         assert "depth" in body["camera_ingest_spool"]
         assert "durability" in body["camera_ingest_spool"]
@@ -289,10 +289,8 @@ class TestReviewRegressions:
     """Bugs found by code review of the first Stage 1 commit."""
 
     def test_listing_never_reads_a_body_off_disk(self, monkeypatch):
-        """spool_stats() runs on every /health probe. Records carry raw image
-        bodies (max 1.2 MB), so listing must parse headers only — otherwise a
-        k8s probe reads the whole backlog and times out during exactly the
-        outage the spool exists to survive."""
+        """spool_stats() runs on diagnostic requests. Records carry raw image
+        bodies (max 1.2 MB), so listing must parse headers only."""
         _respond(_retryable(), body=b"x" * (2 * 1024 * 1024))
 
         def _fail(*a, **k):
